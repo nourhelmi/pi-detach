@@ -1,0 +1,179 @@
+/**
+ * Drives the real extension entry point with a stand-in host so the tool
+ * bodies — auto-promote, cwd resolution, dedupe wording — are exercised
+ * exactly as pi would call them.
+ */
+
+import assert from "node:assert/strict";
+import { tmpdir } from "node:os";
+import { test } from "node:test";
+import type {
+	AgentToolResult,
+	ExtensionAPI,
+	ExtensionContext,
+	ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+import registerDetachExtension from "../extensions/index.ts";
+
+type AnyTool = ToolDefinition<any, any, any>;
+
+interface Sent {
+	content: string;
+	options: { triggerTurn?: boolean; deliverAs?: string } | undefined;
+}
+
+function host(options: { idle?: boolean; cwd?: string } = {}) {
+	const tools = new Map<string, AnyTool>();
+	const sent: Sent[] = [];
+	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => void>();
+
+	const pi = {
+		registerTool: (tool: AnyTool) => tools.set(tool.name, tool),
+		on: (event: string, handler: (e: unknown, c: ExtensionContext) => void) =>
+			handlers.set(event, handler),
+		sendMessage: (message: { content: string }, opts?: Sent["options"]) =>
+			sent.push({ content: message.content, options: opts }),
+	} as unknown as ExtensionAPI;
+
+	registerDetachExtension(pi);
+
+	const ctx = {
+		cwd: options.cwd ?? tmpdir(),
+		isIdle: () => options.idle ?? true,
+	} as ExtensionContext;
+
+	handlers.get("session_start")?.({}, ctx);
+
+	const call = async (
+		name: string,
+		params: unknown,
+		signal?: AbortSignal,
+	): Promise<AgentToolResult<any>> => {
+		const tool = tools.get(name);
+		assert.ok(tool, `tool ${name} is not registered`);
+		return tool.execute("test-call", params as never, signal, undefined, ctx);
+	};
+
+	const shutdown = () => handlers.get("session_shutdown")?.({}, ctx);
+
+	return { tools, sent, call, shutdown };
+}
+
+const text = (result: AgentToolResult<any>): string =>
+	result.content.map((part) => ("text" in part ? part.text : "")).join("");
+
+test("registers the full toolset", () => {
+	const { tools, shutdown } = host();
+	assert.deepEqual(
+		[...tools.keys()].sort(),
+		["bg_list", "bg_output", "bg_run", "bg_stop", "bg_watch"],
+	);
+	shutdown();
+});
+
+test("bg_run returns inline when the command finishes in time", async () => {
+	const { call, sent, shutdown } = host();
+	const result = await call("bg_run", { command: "echo inline-result" });
+	assert.equal(result.details.promoted, false);
+	assert.equal(result.details.exitCode, 0);
+	assert.match(text(result), /inline-result/);
+	assert.equal(sent.length, 0);
+	shutdown();
+});
+
+test("bg_run detaches once it outruns the promote threshold", async () => {
+	const { call, sent, shutdown } = host();
+	const result = await call("bg_run", {
+		command: "sleep 0.4; echo late-result",
+		promoteAfterMs: 50,
+	});
+	assert.equal(result.details.promoted, true);
+	assert.equal(result.details.status, "running");
+	assert.match(text(result), /detached to the background/);
+	assert.match(text(result), new RegExp(result.details.runId));
+
+	await new Promise((r) => setTimeout(r, 700));
+	assert.equal(sent.length, 1);
+	assert.match(sent[0]?.content ?? "", /late-result/);
+	assert.equal(sent[0]?.options?.triggerTurn, true);
+	shutdown();
+});
+
+test("a detached run steers into a busy session instead of interrupting idle", async () => {
+	const { call, sent, shutdown } = host({ idle: false });
+	await call("bg_run", { command: "sleep 0.3", promoteAfterMs: 50 });
+	await new Promise((r) => setTimeout(r, 600));
+	assert.equal(sent[0]?.options?.deliverAs, "steer");
+	shutdown();
+});
+
+test("aborting the turn detaches the run rather than killing it", async () => {
+	const { call, shutdown } = host();
+	const controller = new AbortController();
+	const pending = call("bg_run", { command: "sleep 2" }, controller.signal);
+	setTimeout(() => controller.abort(), 50);
+	const result = await pending;
+	assert.equal(result.details.promoted, true);
+	shutdown();
+});
+
+test("bg_run resolves a relative cwd against the session directory", async () => {
+	const { call, shutdown } = host({ cwd: "/usr" });
+	const result = await call("bg_run", { command: "pwd", cwd: "bin" });
+	assert.match(text(result), /\/usr\/bin/);
+	shutdown();
+});
+
+test("bg_watch returns immediately and bg_list reports it", async () => {
+	const { call, shutdown } = host();
+	const started = await call("bg_watch", { command: "sleep 5", label: "fake-dev" });
+	assert.match(text(started), /Watching as/);
+
+	const listed = await call("bg_list", {});
+	assert.match(text(listed), /fake-dev/);
+	assert.match(text(listed), /running/);
+
+	const stopped = await call("bg_stop", { runId: started.details.runId });
+	assert.equal(stopped.details.stopped, true);
+	shutdown();
+});
+
+test("bg_watch reuses an identical run in the same directory", async () => {
+	const { call, shutdown } = host();
+	const first = await call("bg_watch", { command: "sleep 5" });
+	const second = await call("bg_watch", { command: "sleep 5" });
+	assert.equal(second.details.deduped, true);
+	assert.equal(second.details.runId, first.details.runId);
+	assert.match(text(second), /Reusing it/);
+	shutdown();
+});
+
+test("bg_watch treats a different worktree as a separate run", async () => {
+	const { call, shutdown } = host();
+	const first = await call("bg_watch", { command: "sleep 5", cwd: tmpdir() });
+	const second = await call("bg_watch", { command: "sleep 5", cwd: "/usr" });
+	assert.equal(second.details.deduped, false);
+	assert.notEqual(second.details.runId, first.details.runId);
+	shutdown();
+});
+
+test("bg_output reads a finished run and reports unknown ids", async () => {
+	const { call, shutdown } = host();
+	const run = await call("bg_run", { command: "printf 'one\\ntwo\\n'" });
+	const output = await call("bg_output", { runId: run.details.runId, grep: "two" });
+	assert.match(text(output), /two/);
+	assert.doesNotMatch(text(output).split("\n\n")[1] ?? "", /one/);
+
+	const missing = await call("bg_output", { runId: "nope00" });
+	assert.match(text(missing), /No run with id/);
+	shutdown();
+});
+
+test("shutdown terminates everything still running", async () => {
+	const { call, shutdown } = host();
+	const watch = await call("bg_watch", { command: "sleep 30" });
+	shutdown();
+	await new Promise((r) => setTimeout(r, 100));
+	const listed = await call("bg_list", {});
+	assert.doesNotMatch(text(listed), new RegExp(`${watch.details.runId} · watch · running`));
+});

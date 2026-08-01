@@ -1,0 +1,57 @@
+{
+  "name": "pi-detach",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Background shell runs for pi that wake the session on completion — no polling, no token burn while waiting",
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "pi-coding-agent",
+    "background",
+    "shell",
+    "agent"
+  ],
+  "license": "MIT",
+  "author": "Nour Helmi",
+  "homepage": "https://github.com/nourhelmi/pi-detach",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nourhelmi/pi-detach.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nourhelmi/pi-detach/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "extensions/",
+    "src/",
+    "tsconfig.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "check": "bun run typecheck && bun run test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.75.3 <1",
+    "@earendil-works/pi-tui": ">=0.75.3 <1"
+  },
+  "dependencies": {
+    "typebox": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.22.3",
+    "typescript": "^5.6.0"
+  }
+}
