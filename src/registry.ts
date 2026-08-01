@@ -1,10 +1,12 @@
 /**
- * @file registry.ts — owns the lifecycle of every spawned run.
+ * @file registry.ts — owns the lifecycle of every run, regardless of backend.
  *
- * Processes are spawned into their own process group (`detached: true`) so a
- * kill reaches the whole tree — a dev server's child workers die with it.
- * Output is streamed to a log file on disk and mirrored into a bounded
- * in-memory tail so notifications never have to read the file back.
+ * The registry keeps records, dedupe, logs, tails, and exit/error handlers;
+ * where the process actually lives is a driver's concern. The built-in local
+ * driver spawns a detached process group; the herdr driver (injected when pi
+ * runs inside a herdr pane) hosts the run in a visible pane instead. A herdr
+ * start that fails falls back to the local driver so `bg_run` never breaks
+ * just because the multiplexer hiccupped.
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
@@ -12,7 +14,16 @@ import { createWriteStream, mkdirSync, type WriteStream } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { RunRecord, RunSummary, StartOptions, StartResult } from "./types.ts";
+import type {
+	DriverHandle,
+	DriverOutcome,
+	DriverStart,
+	RunController,
+	RunRecord,
+	RunSummary,
+	StartOptions,
+	StartResult,
+} from "./types.ts";
 
 const TAIL_LINES = 500;
 
@@ -20,24 +31,23 @@ const RUNS_DIR = join(homedir(), ".pi", "detach", "runs");
 
 interface LiveRun {
 	record: RunRecord;
-	child: ChildProcess;
+	handle: DriverHandle;
 	stream: WriteStream;
 	tail: string[];
 	pending: string;
 	completion: Promise<RunRecord>;
 	resolve: (record: RunRecord) => void;
-	/** Fires when a watch run emits a line matching its error pattern. */
-	onErrorLine?: (record: RunRecord, line: string) => void;
 }
 
 export interface Registry {
-	start(options: StartOptions): StartResult;
+	start(options: StartOptions): Promise<StartResult>;
 	get(id: string): RunRecord | undefined;
 	list(): RunSummary[];
 	tail(id: string, lines: number): string;
 	readLog(id: string, options: { lines: number; grep?: string }): Promise<string>;
 	stop(id: string): RunRecord | undefined;
-	stopAll(): void;
+	/** "shutdown" leaves herdr panes running — they are visible and user-owned. */
+	stopAll(mode?: "stop" | "shutdown"): void;
 	markPromoted(id: string): void;
 	onExit(handler: (record: RunRecord) => void): void;
 	onErrorLine(handler: (record: RunRecord, line: string) => void): void;
@@ -55,10 +65,14 @@ function summarize(record: RunRecord): RunSummary {
 	return {
 		id: record.id,
 		kind: record.kind,
+		backend: record.backend,
 		label: record.label,
 		command: record.command,
 		cwd: record.cwd,
 		status: record.status,
+		...(record.paneId !== undefined ? { paneId: record.paneId } : {}),
+		...(record.agentName !== undefined ? { agentName: record.agentName } : {}),
+		...(record.agentState !== undefined ? { agentState: record.agentState } : {}),
 		...(record.exitCode !== undefined ? { exitCode: record.exitCode } : {}),
 		startedAt: record.startedAt,
 		...(record.endedAt !== undefined ? { endedAt: record.endedAt } : {}),
@@ -66,7 +80,67 @@ function summarize(record: RunRecord): RunSummary {
 	};
 }
 
-export function createRegistry(): Registry {
+function grepLines(all: string[], grep: string | undefined): string[] {
+	if (!grep) return all;
+	let test: (line: string) => boolean;
+	try {
+		const re = new RegExp(grep, "i");
+		test = (line) => re.test(line);
+	} catch {
+		const needle = grep.toLowerCase();
+		test = (line) => line.toLowerCase().includes(needle);
+	}
+	return all.filter(test);
+}
+
+/** The built-in driver: a detached local process group with streamed output. */
+const localDriver: DriverStart = (options, controller) => {
+	const { record } = controller;
+	const child: ChildProcess = spawn(options.command, {
+		cwd: options.cwd,
+		shell: true,
+		detached: true,
+		stdio: ["ignore", "pipe", "pipe"],
+		env: { ...process.env, PI_DETACH_RUN_ID: record.id },
+	});
+	record.pid = child.pid;
+
+	child.stdout?.setEncoding("utf8");
+	child.stderr?.setEncoding("utf8");
+	child.stdout?.on("data", (chunk: string) => controller.emitOutput(chunk));
+	child.stderr?.on("data", (chunk: string) => controller.emitOutput(chunk));
+
+	const finish = (code: number | null, termSignal: NodeJS.Signals | null): void => {
+		controller.finish({
+			exitCode: code ?? undefined,
+			termSignal: termSignal ?? undefined,
+			killed: termSignal !== null,
+		});
+	};
+	child.on("exit", finish);
+	child.on("error", (error) => {
+		controller.emitOutput(`\n[detach] spawn failed: ${error.message}\n`);
+		finish(127, null);
+	});
+
+	const kill = (): void => {
+		const pid = child.pid;
+		if (pid === undefined || record.status !== "running") return;
+		try {
+			process.kill(-pid, "SIGTERM");
+		} catch {
+			try {
+				child.kill("SIGTERM");
+			} catch {
+				// Process already gone.
+			}
+		}
+	};
+
+	return Promise.resolve({ pid: child.pid, stop: kill });
+};
+
+export function createRegistry(herdrDriver?: DriverStart): Registry {
 	const runs = new Map<string, LiveRun>();
 	const active = new Map<string, string>();
 	const exitHandlers: ((record: RunRecord) => void)[] = [];
@@ -79,7 +153,7 @@ export function createRegistry(): Registry {
 		live.pending = parts.pop() ?? "";
 		for (const line of parts) {
 			live.tail.push(line);
-			if (live.record.errorPattern) {
+			if (live.record.errorPattern && live.record.status === "running") {
 				let matched = false;
 				try {
 					matched = new RegExp(live.record.errorPattern, "i").test(line);
@@ -96,13 +170,15 @@ export function createRegistry(): Registry {
 		}
 	}
 
-	function start(options: StartOptions): StartResult {
+	async function start(options: StartOptions): Promise<StartResult> {
 		const key = dedupeKey(options.cwd, options.command);
-		const existingId = active.get(key);
-		if (existingId) {
-			const existing = runs.get(existingId);
-			if (existing && existing.record.status === "running") {
-				return { record: existing.record, completion: existing.completion, deduped: true };
+		if (options.kind !== "agent") {
+			const existingId = active.get(key);
+			if (existingId) {
+				const existing = runs.get(existingId);
+				if (existing && existing.record.status === "running") {
+					return { record: existing.record, completion: existing.completion, deduped: true };
+				}
 			}
 		}
 
@@ -118,20 +194,14 @@ export function createRegistry(): Registry {
 			cwd: options.cwd,
 			label: options.label ?? options.command.slice(0, 40),
 			status: "running",
+			backend: herdrDriver ? "herdr" : "local",
 			startedAt: Date.now(),
+			// Watches are announced from birth; runs and agents only after their
+			// tool call detaches.
 			promoted: options.kind === "watch",
 			logPath,
 			...(options.errorPattern ? { errorPattern: options.errorPattern } : {}),
 		};
-
-		const child = spawn(options.command, {
-			cwd: options.cwd,
-			shell: true,
-			detached: true,
-			stdio: ["ignore", "pipe", "pipe"],
-			env: { ...process.env, PI_DETACH_RUN_ID: id },
-		});
-		record.pid = child.pid;
 
 		let resolve!: (value: RunRecord) => void;
 		const completion = new Promise<RunRecord>((r) => {
@@ -140,7 +210,7 @@ export function createRegistry(): Registry {
 
 		const live: LiveRun = {
 			record,
-			child,
+			handle: { stop: () => {} },
 			stream: createWriteStream(logPath, { flags: "a" }),
 			tail: [],
 			pending: "",
@@ -148,52 +218,63 @@ export function createRegistry(): Registry {
 			resolve,
 		};
 
-		child.stdout?.setEncoding("utf8");
-		child.stderr?.setEncoding("utf8");
-		child.stdout?.on("data", (chunk: string) => absorb(live, chunk));
-		child.stderr?.on("data", (chunk: string) => absorb(live, chunk));
-
-		const finish = (code: number | null, termSignal: NodeJS.Signals | null): void => {
-			if (record.status !== "running") return;
-			if (live.pending) {
-				absorb(live, "\n");
-			}
-			record.status = termSignal ? "killed" : "exited";
-			record.exitCode = code ?? undefined;
-			record.termSignal = termSignal ?? undefined;
-			record.endedAt = Date.now();
-			active.delete(key);
-			// Announce only once the log file is flushed, so a notified reader
-			// calling bg_output immediately cannot see a truncated log.
-			live.stream.end(() => {
-				resolve(record);
-				for (const handler of exitHandlers) handler(record);
-			});
+		const controller: RunController = {
+			record,
+			emitOutput: (chunk) => absorb(live, chunk),
+			finish: (outcome: DriverOutcome) => {
+				if (record.status !== "running") return;
+				if (live.pending) absorb(live, "\n");
+				if (outcome.note) absorb(live, `[detach] ${outcome.note}\n`);
+				record.status = outcome.killed ? "killed" : "exited";
+				record.exitCode = outcome.exitCode;
+				record.termSignal = outcome.termSignal;
+				if (outcome.agentState) record.agentState = outcome.agentState;
+				record.endedAt = Date.now();
+				active.delete(key);
+				// Announce only once the log file is flushed, so a notified reader
+				// calling bg_output immediately cannot see a truncated log.
+				live.stream.end(() => {
+					resolve(record);
+					for (const handler of exitHandlers) handler(record);
+				});
+			},
 		};
 
-		child.on("exit", finish);
-		child.on("error", (error) => {
-			absorb(live, `\n[detach] spawn failed: ${error.message}\n`);
-			finish(127, null);
-		});
-
+		// Claim the dedupe slot before any async work so a parallel fan-out of
+		// the same command converges on one run.
 		runs.set(id, live);
-		active.set(key, id);
-		return { record, completion, deduped: false };
-	}
+		if (options.kind !== "agent") active.set(key, id);
 
-	function kill(live: LiveRun): void {
-		const pid = live.child.pid;
-		if (pid === undefined || live.record.status !== "running") return;
+		let handle: DriverHandle;
 		try {
-			process.kill(-pid, "SIGTERM");
-		} catch {
-			try {
-				live.child.kill("SIGTERM");
-			} catch {
-				// Process already gone.
+			if (herdrDriver) {
+				handle = await herdrDriver(options, controller);
+			} else {
+				if (options.kind === "agent") {
+					throw new Error("bg_agent requires pi to be running inside a herdr pane");
+				}
+				handle = await localDriver(options, controller);
+			}
+		} catch (error) {
+			if (herdrDriver && options.kind !== "agent" && record.status === "running") {
+				// Herdr refused (server down, split failed): degrade to the local
+				// backend rather than failing the run.
+				record.backend = "local";
+				record.fallbackReason = error instanceof Error ? error.message : String(error);
+				handle = await localDriver(options, controller);
+			} else {
+				runs.delete(id);
+				if (active.get(key) === id) active.delete(key);
+				live.stream.end();
+				throw error;
 			}
 		}
+		live.handle = handle;
+		record.pid = handle.pid ?? record.pid;
+		record.paneId = handle.paneId ?? record.paneId;
+		record.agentName = handle.agentName ?? record.agentName;
+
+		return { record, completion, deduped: false };
 	}
 
 	return {
@@ -209,6 +290,16 @@ export function createRegistry(): Registry {
 		async readLog(id, { lines, grep }) {
 			const live = runs.get(id);
 			if (!live) return "";
+			// A running pane-hosted run has no streamed log; read the pane live.
+			if (live.record.status === "running" && live.handle.readLive) {
+				try {
+					const text = await live.handle.readLive(Math.max(lines * 2, 200));
+					const all = grepLines(text.replace(/\n+$/, "").split("\n"), grep);
+					return all.slice(-lines).join("\n");
+				} catch {
+					// Fall through to whatever made it into the log.
+				}
+			}
 			let content: string;
 			try {
 				content = await readFile(live.record.logPath, "utf8");
@@ -216,28 +307,25 @@ export function createRegistry(): Registry {
 				content = live.tail.join("\n");
 			}
 			if (!content) return "";
-			let all = content.replace(/\n+$/, "").split("\n");
-			if (grep) {
-				let test: (line: string) => boolean;
-				try {
-					const re = new RegExp(grep, "i");
-					test = (line) => re.test(line);
-				} catch {
-					const needle = grep.toLowerCase();
-					test = (line) => line.toLowerCase().includes(needle);
-				}
-				all = all.filter(test);
-			}
+			const all = grepLines(content.replace(/\n+$/, "").split("\n"), grep);
 			return all.slice(-lines).join("\n");
 		},
 		stop(id) {
 			const live = runs.get(id);
 			if (!live) return undefined;
-			kill(live);
+			if (live.record.status === "running") live.handle.stop();
 			return live.record;
 		},
-		stopAll() {
-			for (const live of runs.values()) kill(live);
+		stopAll(mode = "stop") {
+			for (const live of runs.values()) {
+				if (live.record.status !== "running") continue;
+				if (mode === "shutdown" && live.handle.detach) {
+					// Herdr panes are visible and survive pi on purpose.
+					live.handle.detach();
+				} else {
+					live.handle.stop();
+				}
+			}
 		},
 		markPromoted(id) {
 			const live = runs.get(id);

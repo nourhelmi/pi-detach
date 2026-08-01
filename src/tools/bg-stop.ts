@@ -29,8 +29,14 @@ export function registerBgStopTool(pi: ExtensionAPI, registry: Registry): void {
 					details: { runId: params.runId, stopped: false },
 				};
 			}
+			const how =
+				record.backend === "herdr"
+					? record.kind === "agent"
+						? `Sent esc to agent ${record.agentName} in pane ${record.paneId}; the agent stays alive there.`
+						: `Sent ctrl+c to pane ${record.paneId}; the pane stays open with its output.`
+					: `Sent SIGTERM to ${record.id} · ${record.label}.`;
 			return {
-				content: [{ type: "text", text: `Sent SIGTERM to ${record.id} · ${record.label}.` }],
+				content: [{ type: "text", text: how }],
 				details: { runId: record.id, stopped: true },
 			};
 		},

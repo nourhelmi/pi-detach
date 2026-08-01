@@ -14,6 +14,7 @@ import type { RunRecord } from "./types.ts";
 
 const TAIL_ON_SUCCESS = 25;
 const TAIL_ON_FAILURE = 80;
+const TAIL_ON_AGENT = 120;
 const ERROR_LINE_COOLDOWN_MS = 60_000;
 
 const CONTINUE_HINT =
@@ -22,6 +23,10 @@ const CONTINUE_HINT =
 export interface Notifier {
 	runFinished(record: RunRecord): void;
 	watchErrorLine(record: RunRecord, line: string): void;
+}
+
+function paneHint(record: RunRecord): string[] {
+	return record.paneId ? [`  pane: ${record.paneId} (visible in herdr)`] : [];
 }
 
 export function createNotifier(
@@ -39,17 +44,55 @@ export function createNotifier(
 		);
 	}
 
+	function agentFinished(record: RunRecord): void {
+		const tail = registry.tail(record.id, TAIL_ON_AGENT);
+		const state = record.agentState ?? "unknown";
+		const headlineByState: Record<string, string> = {
+			done: "finished its task",
+			idle: "finished and is idle",
+			blocked: "is BLOCKED waiting for input",
+			stalled: "did not visibly start working — the prompt may not have registered",
+			unknown: "settled in an unknown state",
+		};
+		const lines = [
+			`[detach] agent ${record.id} · ${record.label} (${record.agentName ?? "?"}) ${headlineByState[state] ?? state}`,
+			...paneHint(record),
+		];
+		if (tail.trim()) {
+			lines.push("", tail.trimEnd());
+		}
+		lines.push("");
+		if (state === "blocked") {
+			lines.push(
+				`It needs an answer. Reply with bg_agent({ name: "${record.agentName}", prompt: "…" }), ` +
+					`or use the herdr CLI (\`herdr pane run ${record.paneId} "…"\` / \`herdr pane send-keys ${record.paneId} <key>\`) for menu-style prompts.`,
+			);
+		} else {
+			lines.push(
+				`Full transcript: bg_output({ runId: "${record.id}" }). ` +
+					`Follow up with bg_agent({ name: "${record.agentName}", prompt: "…" }) — the agent is still alive in its pane.`,
+			);
+		}
+		lines.push(CONTINUE_HINT);
+		deliver("detach_agent_settled", lines.join("\n"), record);
+	}
+
 	return {
 		runFinished(record) {
-			// Not promoted: the originating bg_run call is still awaiting it inline.
+			// Not promoted: the originating call is still awaiting it inline.
 			// Killed: someone asked for this via bg_stop or shutdown, so it is not news.
 			if (!record.promoted || record.status === "killed") return;
+			if (record.kind === "agent") {
+				agentFinished(record);
+				return;
+			}
 			const ok = succeeded(record);
 			const tail = registry.tail(record.id, ok ? TAIL_ON_SUCCESS : TAIL_ON_FAILURE);
 			const lines = [
 				`[detach] ${runHeadline(record)}`,
 				`$ ${record.command}`,
 				`  cwd: ${record.cwd}`,
+				...paneHint(record),
 			];
 			if (tail.trim()) {
 				lines.push("", tail.trimEnd());
@@ -65,6 +108,7 @@ export function createNotifier(
 			lastErrorNotice.set(record.id, now);
 			const content = [
 				`[detach] watch ${record.id} · ${record.label} matched its error pattern:`,
+				...paneHint(record),
 				"",
 				line.trim(),
 				"",

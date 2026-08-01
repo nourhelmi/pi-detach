@@ -1,13 +1,15 @@
 {
   "name": "pi-detach",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
-  "description": "Background shell runs for pi that wake the session on completion — no polling, no token burn while waiting",
+  "description": "Background runs for pi that wake the session on completion — visible herdr panes when inside herdr, detached processes otherwise",
   "keywords": [
     "pi",
     "pi-package",
     "pi-extension",
     "pi-coding-agent",
+    "herdr",
+    "multiplexer",
     "background",
     "shell",
     "agent"

@@ -66,7 +66,7 @@ test("registers the full toolset", () => {
 	const { tools, shutdown } = host();
 	assert.deepEqual(
 		[...tools.keys()].sort(),
-		["bg_list", "bg_output", "bg_run", "bg_stop", "bg_watch"],
+		["bg_agent", "bg_list", "bg_output", "bg_run", "bg_stop", "bg_watch"],
 	);
 	shutdown();
 });

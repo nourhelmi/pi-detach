@@ -31,7 +31,10 @@ export function registerBgListTool(pi: ExtensionAPI, registry: Registry): void {
 									run.status === "running"
 										? `running ${formatDuration(run.durationMs)}`
 										: `${run.status}${run.exitCode !== undefined ? ` ${run.exitCode}` : ""} after ${formatDuration(run.durationMs)}`;
-								return `${run.id} · ${run.kind} · ${state} · ${run.label} · ${run.cwd}`;
+								const where = run.paneId
+									? ` · pane ${run.paneId}${run.agentName ? ` (${run.agentName})` : ""}`
+									: "";
+								return `${run.id} · ${run.kind} · ${state} · ${run.label} · ${run.cwd}${where}`;
 							})
 							.join("\n");
 			return { content: [{ type: "text", text }], details: { runs } };

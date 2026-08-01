@@ -5,11 +5,20 @@
  * so completions arriving outside a turn can still ask whether the agent is
  * idle, and tears everything down on `/reload` so a stale registry never
  * outlives its tools.
+ *
+ * When pi itself is running inside a herdr pane (HERDR_ENV=1), runs are
+ * hosted in visible herdr panes via the herdr driver; otherwise everything
+ * uses the local detached-process backend, exactly as before.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { createHerdrCli } from "../src/herdr/cli.ts";
+import { detectHerdrContext } from "../src/herdr/context.ts";
+import { createHerdrDriver } from "../src/herdr/driver.ts";
+import { createPaneManager } from "../src/herdr/panes.ts";
 import { createNotifier } from "../src/notify.ts";
 import { createRegistry } from "../src/registry.ts";
+import { registerBgAgentTool } from "../src/tools/bg-agent.ts";
 import { registerBgListTool } from "../src/tools/bg-list.ts";
 import { registerBgOutputTool } from "../src/tools/bg-output.ts";
 import { registerBgRunTool } from "../src/tools/bg-run.ts";
@@ -29,7 +38,18 @@ export default function registerDetachExtension(pi: ExtensionAPI): void {
 		}
 	}
 
-	const registry = createRegistry();
+	const herdrCtx = detectHerdrContext();
+	let herdrDriver: ReturnType<typeof createHerdrDriver> | undefined;
+	if (herdrCtx) {
+		const cli = createHerdrCli();
+		herdrDriver = createHerdrDriver({
+			cli,
+			ctx: herdrCtx,
+			panes: createPaneManager(cli, herdrCtx),
+		});
+	}
+
+	const registry = createRegistry(herdrDriver);
 	let currentCtx: ExtensionContext | undefined;
 	const notifier = createNotifier(pi, registry, () => currentCtx);
 
@@ -38,6 +58,7 @@ export default function registerDetachExtension(pi: ExtensionAPI): void {
 
 	registerBgRunTool(pi, registry);
 	registerBgWatchTool(pi, registry);
+	registerBgAgentTool(pi, registry);
 	registerBgOutputTool(pi, registry);
 	registerBgListTool(pi, registry);
 	registerBgStopTool(pi, registry);
@@ -54,10 +75,12 @@ export default function registerDetachExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_shutdown", (_event, ctx) => {
 		currentCtx = ctx;
-		registry.stopAll();
+		// Local runs die with the session; herdr panes stay visible and keep
+		// running — the user owns them from here.
+		registry.stopAll("shutdown");
 	});
 
 	globalStore[CLEANUP_KEY] = () => {
-		registry.stopAll();
+		registry.stopAll("shutdown");
 	};
 }

@@ -70,7 +70,7 @@ export function registerBgRunTool(pi: ExtensionAPI, registry: Registry): void {
 					: resolve(ctx.cwd, params.cwd)
 				: ctx.cwd;
 
-			const { record, completion, deduped } = registry.start({
+			const { record, completion, deduped } = await registry.start({
 				kind: "run",
 				command: params.command,
 				cwd,
@@ -99,12 +99,19 @@ export function registerBgRunTool(pi: ExtensionAPI, registry: Registry): void {
 			if (outcome === "promote") {
 				registry.markPromoted(record.id);
 				const waited = formatDuration(Date.now() - record.startedAt);
+				const where =
+					record.backend === "herdr"
+						? `Running visibly in herdr pane ${record.paneId}.\n`
+						: record.fallbackReason
+							? `(herdr unavailable — ran as a local process instead: ${record.fallbackReason})\n`
+							: "";
 				return {
 					content: [
 						{
 							type: "text",
 							text:
 								`Still running after ${waited} — detached to the background as ${record.id}.\n` +
+								where +
 								`You will be notified when it finishes. Do not poll it; continue with other work.\n` +
 								`$ ${record.command}\n  cwd: ${cwd}`,
 						},

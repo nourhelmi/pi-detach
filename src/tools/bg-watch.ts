@@ -58,7 +58,7 @@ export function registerBgWatchTool(pi: ExtensionAPI, registry: Registry): void 
 					: resolve(ctx.cwd, params.cwd)
 				: ctx.cwd;
 
-			const { record, deduped } = registry.start({
+			const { record, deduped } = await registry.start({
 				kind: "watch",
 				command: params.command,
 				cwd,
@@ -66,9 +66,10 @@ export function registerBgWatchTool(pi: ExtensionAPI, registry: Registry): void 
 				...(params.errorPattern ? { errorPattern: params.errorPattern } : {}),
 			});
 
+			const where = record.paneId ? `\n  pane: ${record.paneId} (visible in herdr)` : "";
 			const text = deduped
 				? `Already watching this command in ${cwd} as ${record.id}. Reusing it.`
-				: `Watching as ${record.id}: $ ${record.command}\n  cwd: ${cwd}\n` +
+				: `Watching as ${record.id}: $ ${record.command}\n  cwd: ${cwd}${where}\n` +
 					`Silent while healthy. Read output with bg_output({ runId: "${record.id}" }), stop with bg_stop.`;
 
 			return {
