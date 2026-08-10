@@ -1,11 +1,13 @@
 /**
- * @file driver.ts — hosts runs in visible herdr panes.
+ * @file driver.ts — hosts watches and agents in visible herdr panes.
  *
- * Command runs (`bg_run`/`bg_watch`) are typed into a pane and completion is
- * detected via the sentinel + a blocking `herdr wait output` child. Ctrl+C in
- * the pane kills the sentinel along with the command, so a slow supervisor
- * poll watches process-info and settles the run as killed when the shell is
- * back at its prompt without a sentinel having matched.
+ * bg_run commands never come through here — they are invisible local
+ * processes (a promoted one gets a viewer pane, see viewer.ts). Watches
+ * (`bg_watch`) are typed into a pane and completion is detected via the
+ * sentinel + a blocking `herdr wait output` child. Ctrl+C in the pane kills
+ * the sentinel along with the command, so a slow supervisor poll watches
+ * process-info and settles the run as killed when the shell is back at its
+ * prompt without a sentinel having matched.
  *
  * Agent runs (`bg_agent`) start a real agent with `herdr agent start`, submit
  * the prompt with `pane run`, confirm the agent went `working`, then race

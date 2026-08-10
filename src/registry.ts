@@ -2,11 +2,11 @@
  * @file registry.ts — owns the lifecycle of every run, regardless of backend.
  *
  * The registry keeps records, dedupe, logs, tails, and exit/error handlers;
- * where the process actually lives is a driver's concern. The built-in local
- * driver spawns a detached process group; the herdr driver (injected when pi
- * runs inside a herdr pane) hosts the run in a visible pane instead. A herdr
- * start that fails falls back to the local driver so `bg_run` never breaks
- * just because the multiplexer hiccupped.
+ * where the process actually lives is a driver's concern. bg_run commands are
+ * always local, invisible processes — a viewer pane is attached only if one
+ * is promoted to the background (see onPromoted). Watches and agents are
+ * hosted in visible herdr panes from birth when the herdr driver is present,
+ * with watch starts degrading to the local driver if herdr refuses.
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
@@ -140,7 +140,15 @@ const localDriver: DriverStart = (options, controller) => {
 	return Promise.resolve({ pid: child.pid, stop: kill });
 };
 
-export function createRegistry(herdrDriver?: DriverStart): Registry {
+export interface RegistryOptions {
+	/** Hosts watch and agent runs in herdr panes. bg_run never uses it. */
+	herdrDriver?: DriverStart;
+	/** Called when a local run is promoted to the background — attaches a viewer pane. */
+	onPromoted?: (record: RunRecord, completion: Promise<RunRecord>) => void;
+}
+
+export function createRegistry(options: RegistryOptions = {}): Registry {
+	const { herdrDriver, onPromoted } = options;
 	const runs = new Map<string, LiveRun>();
 	const active = new Map<string, string>();
 	const exitHandlers: ((record: RunRecord) => void)[] = [];
@@ -194,7 +202,10 @@ export function createRegistry(herdrDriver?: DriverStart): Registry {
 			cwd: options.cwd,
 			label: options.label ?? options.command.slice(0, 40),
 			status: "running",
-			backend: herdrDriver ? "herdr" : "local",
+			// bg_run commands are foreground work: always local and invisible,
+			// like Claude Code's shell tool. Only watches and agents live in
+			// panes from birth.
+			backend: options.kind !== "run" && herdrDriver ? "herdr" : "local",
 			startedAt: Date.now(),
 			// Watches are announced from birth; runs and agents only after their
 			// tool call detaches.
@@ -247,16 +258,16 @@ export function createRegistry(herdrDriver?: DriverStart): Registry {
 
 		let handle: DriverHandle;
 		try {
-			if (herdrDriver) {
-				handle = await herdrDriver(options, controller);
-			} else {
+			if (options.kind === "run" || !herdrDriver) {
 				if (options.kind === "agent") {
 					throw new Error("bg_agent requires pi to be running inside a herdr pane");
 				}
 				handle = await localDriver(options, controller);
+			} else {
+				handle = await herdrDriver(options, controller);
 			}
 		} catch (error) {
-			if (herdrDriver && options.kind !== "agent" && record.status === "running") {
+			if (herdrDriver && options.kind === "watch" && record.status === "running") {
 				// Herdr refused (server down, split failed): degrade to the local
 				// backend rather than failing the run.
 				record.backend = "local";
@@ -329,7 +340,13 @@ export function createRegistry(herdrDriver?: DriverStart): Registry {
 		},
 		markPromoted(id) {
 			const live = runs.get(id);
-			if (live) live.record.promoted = true;
+			if (!live) return;
+			live.record.promoted = true;
+			// The run just became genuine background work — now it earns a
+			// visible surface.
+			if (live.record.kind === "run" && live.record.status === "running") {
+				onPromoted?.(live.record, live.completion);
+			}
 		},
 		onExit(handler) {
 			exitHandlers.push(handler);

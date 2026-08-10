@@ -14,11 +14,21 @@ bg_run("bun test")
   → [detach] a3f9k · bun test — exit 0 in 2m14s
 ```
 
-Launch pi from inside herdr and the same call becomes a pane: the command runs
-visibly next to your session, the pane is renamed `▶ api tests · a3f9k` while it
-runs and `✓ api tests · a3f9k` when it's done, a toast pops in the herdr UI, and
-pi is woken with the result exactly as before. Nothing about how you use the
-tools changes — the backend is picked per-session by detecting `HERDR_ENV`.
+Launch pi from inside herdr and background work becomes visible — with Claude
+Code's semantics: **foreground stays invisible, only real background work gets
+a surface, and the surface disappears when the work is done.**
+
+- A quick `bg_run` (a grep, a 2s build) runs as an invisible local process and
+  returns inline. It never touches your layout.
+- A `bg_run` that crosses the 30s promote threshold — genuine background work —
+  gets a **live viewer pane** tailing its output. On success the pane closes
+  itself, like a task chip completing; on failure it stays, renamed `✗`, for
+  inspection (and is recycled by the next promoted run).
+- `bg_watch` (dev servers) and `bg_agent` (helper agents) are panes from
+  birth — those are the things you actually want on screen.
+
+Nothing about how you use the tools changes — the backend is picked
+per-session by detecting `HERDR_ENV`.
 
 ## Install
 
@@ -54,7 +64,8 @@ detached-process backend.
 ```
 
 Returns output inline if the command finishes before the threshold. Otherwise
-returns a run id and notifies later. Aborting the turn (Esc) detaches the run
+returns a run id and notifies later — and, inside herdr, opens a live viewer
+pane for the now-background run. Aborting the turn (Esc) detaches the run
 rather than killing it.
 
 ### `bg_watch`
@@ -102,9 +113,14 @@ detaching everything.
 
 **Fan-out is just parallel tool calls.** Issue several `bg_run`/`bg_agent`
 calls in one message and they execute concurrently, each detaching on its own
-schedule. In herdr mode the panes stack next to your session — the first run
-splits the caller's pane (right when wide, down when tall), later ones split
-off the newest run pane.
+schedule. In herdr mode panes stack next to your session — the first split off
+the caller's pane (right when wide, down when tall), later ones off the newest
+run pane.
+
+**Visibility follows backgroundness.** Commands don't get panes; *background
+tasks* do. A pane appears only when a run is promoted, a watch starts, or an
+agent starts — so a session full of quick shell calls leaves your layout
+exactly as it was.
 
 **Completions interrupt, deliberately.** When the agent is idle the completion
 starts a fresh turn (`triggerTurn`). When it is mid-stream the completion is
@@ -117,29 +133,32 @@ the same directory reuses the first process instead of fighting over the port.
 Running `bun dev` in three different worktrees starts three servers. Agent runs
 never dedupe.
 
-**Panes are recycled, not accumulated.** When a herdr run finishes, its pane
-returns to a pool and the next run reuses it (verified against process-info
-first — if you started typing in it, it's left alone). A ten-command session
-uses one or two panes, not ten.
+**Panes are recycled, not accumulated.** Successful viewer panes close
+themselves; failure panes and dead-watch panes return to a pool and the next
+background task reuses them (verified against process-info first — if you
+started typing in one, it's left alone).
 
-**Completion in a pane is sentinel-based.** A pane is a shared terminal, not a
-child process, so commands are bracketed with printed markers and a blocking
-`herdr wait output` child detects the exit marker — along with the exit code.
-The body runs in a subshell, so `exit`, `cd`, and exports can't take down or
-pollute the pane's shell. If you ctrl+c a run directly in its pane, the marker
-never prints; a slow supervisor poll notices the shell is back at its prompt
-and settles the run as killed.
+**Watch completion in a pane is sentinel-based.** A pane is a shared terminal,
+not a child process, so watch commands are bracketed with printed markers and
+a blocking `herdr wait output` child detects the exit marker — along with the
+exit code. The body runs in a subshell, so `exit`, `cd`, and exports can't
+take down or pollute the pane's shell. If you ctrl+c a watch directly in its
+pane, the marker never prints; a slow supervisor poll notices the shell is
+back at its prompt and settles the run as killed.
 
 ## Herdr behavior notes
 
-- Herdr-hosted runs **survive pi**. On session shutdown or `/reload`, local
-  runs are terminated as before, but panes are left running — they're visible
-  and yours. Close them in herdr when you're done.
-- `bg_output` on a running pane run reads the pane live; after completion the
-  extracted output is persisted to `~/.pi/detach/runs/<runId>/output.log` like
-  local runs. Pane scrollback limits apply to very chatty commands.
-- If herdr refuses a start (server down, split failed), `bg_run`/`bg_watch`
-  fall back to the local backend and say so. `bg_agent` fails loudly instead.
+- Pane-hosted work (**watches and agents**) survives pi. On session shutdown
+  or `/reload` their panes keep running — they're visible and yours. Close
+  them in herdr when you're done. `bg_run` processes are local and die with
+  the session as before; a viewer pane orphaned by a hard exit just shows the
+  final tail and can be closed by hand.
+- `bg_output` on a running watch or agent reads its pane live; local runs read
+  their streamed log at `~/.pi/detach/runs/<runId>/output.log`. Pane
+  scrollback limits apply to very chatty watch commands.
+- If herdr refuses a start (server down, split failed), `bg_watch` falls back
+  to the local backend and says so. `bg_agent` fails loudly instead. `bg_run`
+  never depends on herdr at all.
 - Config: `PI_DETACH_NO_HERDR=1` forces the local backend even inside herdr;
   `PI_DETACH_HERDR_TOAST=0` disables the herdr UI toasts.
 

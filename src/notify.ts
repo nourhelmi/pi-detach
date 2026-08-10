@@ -26,7 +26,10 @@ export interface Notifier {
 }
 
 function paneHint(record: RunRecord): string[] {
-	return record.paneId ? [`  pane: ${record.paneId} (visible in herdr)`] : [];
+	if (!record.paneId) return [];
+	// A successful run's viewer pane closes itself right after this message.
+	if (record.kind === "run" && record.status === "exited" && record.exitCode === 0) return [];
+	return [`  pane: ${record.paneId} (visible in herdr)`];
 }
 
 export function createNotifier(

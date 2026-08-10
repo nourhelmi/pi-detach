@@ -5,6 +5,7 @@ import type { CliResult, HerdrCli, Waiter } from "../src/herdr/cli.ts";
 import { createHerdrDriver } from "../src/herdr/driver.ts";
 import { createPaneManager } from "../src/herdr/panes.ts";
 import { startMarker } from "../src/herdr/sentinel.ts";
+import { createViewerManager } from "../src/herdr/viewer.ts";
 import { createRegistry } from "../src/registry.ts";
 
 const cwd = tmpdir();
@@ -68,6 +69,7 @@ function createFakeCli(): {
 		{ prefix: "pane run", handler: () => ok(undefined) },
 		{ prefix: "pane send-keys", handler: () => ok({ result: { type: "ok" } }) },
 		{ prefix: "pane read", handler: () => ok(undefined, "") },
+		{ prefix: "pane close", handler: () => ok({ result: { type: "ok" } }) },
 		{ prefix: "notification show", handler: () => ok({ result: { shown: false } }) },
 		{
 			prefix: "pane process-info",
@@ -121,13 +123,15 @@ function createFakeCli(): {
 
 function herdrRegistry(fake: ReturnType<typeof createFakeCli>) {
 	const ctx = { paneId: "w1:p1" };
+	const panes = createPaneManager(fake.cli, ctx);
 	const driver = createHerdrDriver({
 		cli: fake.cli,
 		ctx,
-		panes: createPaneManager(fake.cli, ctx),
+		panes,
 		env: { PI_DETACH_HERDR_TOAST: "0" },
 	});
-	return createRegistry(driver);
+	const viewer = createViewerManager(fake.cli, panes);
+	return createRegistry({ herdrDriver: driver, onPromoted: viewer.attach });
 }
 
 function waitOutcome(id: string, exitCode: number, body: string): CliResult {
@@ -146,66 +150,122 @@ function waitOutcome(id: string, exitCode: number, body: string): CliResult {
 	});
 }
 
-test("a herdr run completes through the sentinel wait", async () => {
+test("bg_run stays local and invisible even inside herdr", async () => {
 	const fake = createFakeCli();
 	const registry = herdrRegistry(fake);
 	const { record, completion } = await registry.start({
 		kind: "run",
-		command: "bun test",
+		command: "echo fast-and-quiet",
 		cwd,
-		label: "api tests",
+	});
+	assert.equal(record.backend, "local");
+	const finished = await completion;
+	assert.equal(finished.exitCode, 0);
+	assert.equal(finished.paneId, undefined);
+	assert.equal(fake.execCalls.length, 0, "no herdr calls for a foreground run");
+	assert.match(registry.tail(record.id, 5), /fast-and-quiet/);
+});
+
+test("a promoted run gets a viewer pane that closes itself on success", async () => {
+	const fake = createFakeCli();
+	const registry = herdrRegistry(fake);
+	const { record, completion } = await registry.start({
+		kind: "run",
+		command: "echo viewer-ok; sleep 0.8",
+		cwd,
+		label: "slow build",
+	});
+	registry.markPromoted(record.id);
+	await new Promise((r) => setTimeout(r, 150));
+	assert.equal(record.paneId, "w1:p2", "viewer pane attached");
+	const tailRun = fake.execCalls.find((args) => args[0] === "pane" && args[1] === "run");
+	assert.match(tailRun?.[3] ?? "", /tail -n \+1 -f/);
+	assert.match(tailRun?.[3] ?? "", new RegExp(record.id));
+
+	await completion;
+	await new Promise((r) => setTimeout(r, 600));
+	assert.ok(
+		fake.execCalls.some((args) => args[0] === "pane" && args[1] === "close"),
+		"viewer pane closed after success",
+	);
+	assert.equal(record.paneId, undefined, "closed pane is no longer referenced");
+});
+
+test("a promoted run that fails keeps its viewer pane for inspection", async () => {
+	const fake = createFakeCli();
+	const registry = herdrRegistry(fake);
+	const { record, completion } = await registry.start({
+		kind: "run",
+		command: "echo bad; sleep 0.5; exit 3",
+		cwd,
+		label: "failing tests",
+	});
+	registry.markPromoted(record.id);
+	await completion;
+	await new Promise((r) => setTimeout(r, 600));
+	assert.ok(!fake.execCalls.some((args) => args[0] === "pane" && args[1] === "close"));
+	assert.equal(record.paneId, "w1:p2");
+	const rename = fake.execCalls.filter((args) => args[0] === "pane" && args[1] === "rename").at(-1);
+	assert.match(rename?.[3] ?? "", /^✗ failing tests/);
+});
+
+test("a run promoted after finishing gets no viewer pane", async () => {
+	const fake = createFakeCli();
+	const registry = herdrRegistry(fake);
+	const { record, completion } = await registry.start({ kind: "run", command: "true", cwd });
+	await completion;
+	registry.markPromoted(record.id);
+	await new Promise((r) => setTimeout(r, 50));
+	assert.equal(fake.execCalls.length, 0);
+});
+
+test("a watch is pane-hosted and completes through the sentinel wait", async () => {
+	const fake = createFakeCli();
+	const registry = herdrRegistry(fake);
+	const { record, completion } = await registry.start({
+		kind: "watch",
+		command: "bun dev",
+		cwd,
+		label: "web dev",
 	});
 	assert.equal(record.backend, "herdr");
 	assert.equal(record.paneId, "w1:p2");
 
 	const paneRun = fake.execCalls.find((args) => args[0] === "pane" && args[1] === "run");
-	assert.ok(paneRun, "typed the command into the pane");
-	assert.match(paneRun?.[3] ?? "", /bun test/);
+	assert.match(paneRun?.[3] ?? "", /bun dev/);
 	assert.match(paneRun?.[3] ?? "", new RegExp(`<<pi-detach:${record.id}:start>>`));
 
 	const waiter = fake.waiters.find((w) => w.args[0] === "wait" && w.args[1] === "output");
 	assert.ok(waiter, "spawned a blocking output wait");
-	waiter?.resolveWith(waitOutcome(record.id, 0, "42 tests passed"));
+	waiter?.resolveWith(waitOutcome(record.id, 1, "EADDRINUSE: port taken"));
 
 	const finished = await completion;
 	assert.equal(finished.status, "exited");
-	assert.equal(finished.exitCode, 0);
-	assert.match(registry.tail(record.id, 10), /42 tests passed/);
-	const rename = fake.execCalls.filter((args) => args[0] === "pane" && args[1] === "rename").at(-1);
-	assert.match(rename?.[3] ?? "", /^✓ api tests/);
+	assert.equal(finished.exitCode, 1);
+	assert.match(registry.tail(record.id, 10), /EADDRINUSE/);
 });
 
-test("a failing herdr run carries its exit code", async () => {
+test("a second watch reuses the dead watch's pane and prepends cd", async () => {
 	const fake = createFakeCli();
 	const registry = herdrRegistry(fake);
-	const { record, completion } = await registry.start({ kind: "run", command: "false", cwd });
-	fake.waiters[0]?.resolveWith(waitOutcome(record.id, 3, "boom"));
-	const finished = await completion;
-	assert.equal(finished.exitCode, 3);
-	assert.equal(finished.status, "exited");
-});
-
-test("a second run reuses the finished pane and prepends cd", async () => {
-	const fake = createFakeCli();
-	const registry = herdrRegistry(fake);
-	const first = await registry.start({ kind: "run", command: "true", cwd });
+	const first = await registry.start({ kind: "watch", command: "bun dev", cwd });
 	fake.waiters[0]?.resolveWith(waitOutcome(first.record.id, 0, ""));
 	await first.completion;
 
-	const second = await registry.start({ kind: "run", command: "bun lint", cwd: "/somewhere" });
+	const second = await registry.start({ kind: "watch", command: "bun preview", cwd: "/somewhere" });
 	assert.equal(second.record.paneId, first.record.paneId);
 	const splits = fake.execCalls.filter((args) => args[0] === "pane" && args[1] === "split");
 	assert.equal(splits.length, 1, "no second split for the reused pane");
 	const paneRuns = fake.execCalls.filter((args) => args[0] === "pane" && args[1] === "run");
-	assert.match(paneRuns[1]?.[3] ?? "", /cd '\/somewhere' && bun lint/);
+	assert.match(paneRuns[1]?.[3] ?? "", /cd '\/somewhere' && bun preview/);
 	fake.waiters[1]?.resolveWith(waitOutcome(second.record.id, 0, ""));
 	await second.completion;
 });
 
-test("stopping a herdr run sends ctrl+c and settles as killed", async () => {
+test("stopping a watch sends ctrl+c to its pane and settles as killed", async () => {
 	const fake = createFakeCli();
 	const registry = herdrRegistry(fake);
-	const { record, completion } = await registry.start({ kind: "run", command: "sleep 999", cwd });
+	const { record, completion } = await registry.start({ kind: "watch", command: "bun dev", cwd });
 	registry.stop(record.id);
 	const finished = await completion;
 	assert.equal(finished.status, "killed");
@@ -213,13 +273,13 @@ test("stopping a herdr run sends ctrl+c and settles as killed", async () => {
 	assert.deepEqual(keys?.slice(2), [record.paneId, "ctrl+c"]);
 });
 
-test("falls back to the local backend when herdr refuses to split", async () => {
+test("a watch falls back to the local backend when herdr refuses to split", async () => {
 	const fake = createFakeCli();
 	fake.respond("pane layout", () => failed("not_found"));
 	fake.respond("pane split", () => failed("not_found", "pane not found"));
 	const registry = herdrRegistry(fake);
 	const { record, completion } = await registry.start({
-		kind: "run",
+		kind: "watch",
 		command: "echo local-fallback",
 		cwd,
 	});

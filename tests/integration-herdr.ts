@@ -17,6 +17,7 @@ import assert from "node:assert/strict";
 import { createHerdrCli } from "../src/herdr/cli.ts";
 import { createHerdrDriver } from "../src/herdr/driver.ts";
 import { createPaneManager } from "../src/herdr/panes.ts";
+import { createViewerManager } from "../src/herdr/viewer.ts";
 import { createRegistry } from "../src/registry.ts";
 
 if (process.env.HERDR_INTEGRATION !== "1") {
@@ -33,73 +34,93 @@ if (!paneId || !process.env.HERDR_SOCKET_PATH) {
 const cli = createHerdrCli();
 const ctx = { paneId };
 const panes = createPaneManager(cli, ctx);
-const registry = createRegistry(
-	createHerdrDriver({ cli, ctx, panes, env: { PI_DETACH_HERDR_TOAST: "0" } }),
-);
+const viewer = createViewerManager(cli, panes);
+const registry = createRegistry({
+	herdrDriver: createHerdrDriver({ cli, ctx, panes, env: { PI_DETACH_HERDR_TOAST: "0" } }),
+	onPromoted: viewer.attach,
+});
 
 function step(name: string): void {
 	console.log(`— ${name}`);
 }
 
+async function paneExists(id: string): Promise<boolean> {
+	const info = await cli.exec(["pane", "process-info", "--pane", id]);
+	return info.ok;
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 try {
-	step("run completes with exit 0 and captured output");
-	const okRun = await registry.start({
+	step("a fast bg_run touches no panes");
+	const fast = await registry.start({
 		kind: "run",
-		command: "echo integration-ok; sleep 1; echo tail-line",
+		command: "echo fast-and-quiet",
 		cwd: process.cwd(),
-		label: "integration ok",
+		label: "fast run",
 	});
-	assert.equal(okRun.record.backend, "herdr");
-	assert.ok(okRun.record.paneId, "run is hosted in a pane");
-	const okDone = await okRun.completion;
-	assert.equal(okDone.exitCode, 0);
-	assert.match(registry.tail(okDone.id, 20), /integration-ok/);
-	assert.match(registry.tail(okDone.id, 20), /tail-line/);
+	const fastDone = await fast.completion;
+	assert.equal(fastDone.backend, "local");
+	assert.equal(fastDone.paneId, undefined);
+	assert.match(registry.tail(fastDone.id, 5), /fast-and-quiet/);
 
-	step("failing run reuses the pane and reports its exit code");
-	const failRun = await registry.start({
+	step("a promoted run gets a live viewer pane that closes on success");
+	const promoted = await registry.start({
 		kind: "run",
-		command: "echo about-to-fail; exit 7",
+		command: "echo live-visible; sleep 7",
 		cwd: process.cwd(),
-		label: "integration fail",
+		label: "promoted ok",
 	});
-	assert.equal(failRun.record.paneId, okDone.paneId, "pane was recycled");
-	const failDone = await failRun.completion;
-	assert.equal(failDone.exitCode, 7);
-	assert.match(registry.tail(failDone.id, 20), /about-to-fail/);
+	registry.markPromoted(promoted.record.id);
+	// Generous: pane shell startup can take a couple of seconds before tail runs.
+	await sleep(4000);
+	const viewerPane = promoted.record.paneId;
+	assert.ok(viewerPane, "viewer pane attached after promotion");
+	const live = await cli.exec([
+		"pane", "read", viewerPane as string, "--source", "recent-unwrapped", "--lines", "50", "--format", "text",
+	]);
+	assert.match(live.stdout, /live-visible/, "viewer pane tails the log");
+	await promoted.completion;
+	await sleep(1500);
+	assert.equal(promoted.record.paneId, undefined, "record no longer points at a pane");
+	assert.equal(await paneExists(viewerPane as string), false, "viewer pane closed on success");
 
-	step("a watch that dies on its own resolves as exited");
+	step("a promoted run that fails keeps its viewer pane");
+	const failing = await registry.start({
+		kind: "run",
+		command: "echo bad-news; sleep 2; exit 5",
+		cwd: process.cwd(),
+		label: "promoted fail",
+	});
+	registry.markPromoted(failing.record.id);
+	const failDone = await failing.completion;
+	assert.equal(failDone.exitCode, 5);
+	await sleep(1200);
+	assert.ok(failing.record.paneId, "failure pane kept");
+	assert.equal(await paneExists(failing.record.paneId as string), true);
+
+	step("a watch is pane-hosted and its death is detected");
 	const watch = await registry.start({
 		kind: "watch",
-		command: "sleep 2; echo watch-died",
+		command: "echo watch-alive; sleep 2; echo watch-died",
 		cwd: process.cwd(),
 		label: "integration watch",
 	});
+	assert.ok(watch.record.paneId, "watch runs in a pane from birth");
 	const watchDone = await watch.completion;
 	assert.equal(watchDone.status, "exited");
+	assert.match(registry.tail(watchDone.id, 10), /watch-died/);
 
-	step("stop sends ctrl+c and settles as killed");
-	const longRun = await registry.start({
-		kind: "run",
+	step("stopping a watch sends ctrl+c and settles as killed");
+	const longWatch = await registry.start({
+		kind: "watch",
 		command: "sleep 120",
 		cwd: process.cwd(),
 		label: "integration stop",
 	});
-	registry.stop(longRun.record.id);
-	const stopped = await longRun.completion;
+	registry.stop(longWatch.record.id);
+	const stopped = await longWatch.completion;
 	assert.equal(stopped.status, "killed");
-
-	step("bg_output live read works while a run is going");
-	const liveRun = await registry.start({
-		kind: "run",
-		command: "echo live-visible; sleep 4",
-		cwd: process.cwd(),
-		label: "integration live",
-	});
-	await new Promise((r) => setTimeout(r, 1500));
-	const live = await registry.readLog(liveRun.record.id, { lines: 50 });
-	assert.match(live, /live-visible/);
-	await liveRun.completion;
 
 	console.log("PASS: all integration steps succeeded");
 	for (const pane of panes.created()) {

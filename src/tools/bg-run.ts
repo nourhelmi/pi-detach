@@ -12,6 +12,7 @@ import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-ag
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { formatDuration, outcomeLabel } from "../format.ts";
+import { detectHerdrContext } from "../herdr/context.ts";
 import type { Registry } from "../registry.ts";
 import type { RunRecord } from "../types.ts";
 
@@ -99,12 +100,9 @@ export function registerBgRunTool(pi: ExtensionAPI, registry: Registry): void {
 			if (outcome === "promote") {
 				registry.markPromoted(record.id);
 				const waited = formatDuration(Date.now() - record.startedAt);
-				const where =
-					record.backend === "herdr"
-						? `Running visibly in herdr pane ${record.paneId}.\n`
-						: record.fallbackReason
-							? `(herdr unavailable — ran as a local process instead: ${record.fallbackReason})\n`
-							: "";
+				const where = detectHerdrContext()
+					? "A live viewer pane is opening in herdr; it closes itself on success.\n"
+					: "";
 				return {
 					content: [
 						{
