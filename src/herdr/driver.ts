@@ -280,7 +280,37 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			const argv = tokenize(options.command);
 			if (argv.length === 0) throw new Error("agent command is empty");
 			name = agentName(record.label, record.id);
-			const direction = await splitDirectionFor(cli, ctx.paneId);
+
+			// Agents live in their own tab, not a split: the herdr sidebar lists
+			// them per-tab, and the caller's layout stays untouched.
+			let startArgs: string[] | undefined;
+			let leftoverRootPane: string | undefined;
+			const tab = await cli.exec([
+				"tab",
+				"create",
+				...(ctx.workspaceId ? ["--workspace", ctx.workspaceId] : []),
+				"--cwd",
+				options.cwd,
+				"--label",
+				name,
+				"--no-focus",
+			]);
+			if (tab.ok) {
+				const tabId = findString((tab.json as { result?: { tab?: unknown } }).result?.tab, "tab_id");
+				leftoverRootPane = findString(
+					(tab.json as { result?: { root_pane?: unknown } }).result?.root_pane,
+					"pane_id",
+				);
+				if (tabId) {
+					startArgs = ["--tab", tabId];
+				}
+			}
+			if (!startArgs) {
+				// Tab creation refused — degrade to the old split-next-to-caller.
+				const direction = await splitDirectionFor(cli, ctx.paneId);
+				startArgs = ["--split", direction];
+				leftoverRootPane = undefined;
+			}
 			const started = await cli.exec(
 				[
 					"agent",
@@ -288,8 +318,8 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 					name,
 					"--cwd",
 					options.cwd,
-					"--split",
-					direction,
+					...(ctx.workspaceId ? ["--workspace", ctx.workspaceId] : []),
+					...startArgs,
 					"--no-focus",
 					"--",
 					...argv,
@@ -302,6 +332,11 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 				);
 			}
 			paneId = findString(started.json, "pane_id") ?? "";
+			// `agent start --tab` splits inside the tab; drop the empty root shell
+			// so the agent has the tab to itself.
+			if (leftoverRootPane && leftoverRootPane !== paneId) {
+				void cli.exec(["pane", "close", leftoverRootPane]);
+			}
 		}
 		if (!paneId) throw new Error("herdr did not report a pane id for the agent");
 		record.paneId = paneId;

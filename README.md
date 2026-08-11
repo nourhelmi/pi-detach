@@ -24,7 +24,6 @@ a surface, and the surface disappears when the work is done.**
   gets a **live viewer pane** tailing its output. On success the pane closes
   itself, like a task chip completing; on failure it stays, renamed `✗`, for
   inspection (and is recycled by the next promoted run).
-- `bg_watch` (dev servers) and `bg_agent` (helper agents) are panes from
   birth — those are the things you actually want on screen.
 
 Nothing about how you use the tools changes — the backend is picked

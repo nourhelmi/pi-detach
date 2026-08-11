@@ -1,6 +1,6 @@
 {
   "name": "pi-detach",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "description": "Background runs for pi that wake the session on completion — visible herdr panes when inside herdr, detached processes otherwise",
   "keywords": [

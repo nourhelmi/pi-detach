@@ -66,6 +66,17 @@ function createFakeCli(): {
 			},
 		},
 		{ prefix: "pane rename", handler: () => ok({ result: { type: "pane_info" } }) },
+		{
+			prefix: "tab create",
+			handler: () =>
+				ok({
+					result: {
+						tab: { tab_id: "w1:t9" },
+						root_pane: { pane_id: "w1:p8" },
+						type: "tab_created",
+					},
+				}),
+		},
 		{ prefix: "pane run", handler: () => ok(undefined) },
 		{ prefix: "pane send-keys", handler: () => ok({ result: { type: "ok" } }) },
 		{ prefix: "pane read", handler: () => ok(undefined, "") },
@@ -307,6 +318,16 @@ test("an agent run settles when its status wait fires", async () => {
 	assert.equal(record.paneId, "w1:p7");
 	assert.match(record.agentName ?? "", /^reviewer-/);
 
+	const tabCreate = fake.execCalls.find((args) => args[0] === "tab" && args[1] === "create");
+	assert.ok(tabCreate, "agents get their own tab");
+	assert.equal(tabCreate?.[tabCreate.indexOf("--label") + 1], record.agentName);
+	const started = fake.execCalls.find((args) => args[0] === "agent" && args[1] === "start");
+	assert.equal(started?.[started.indexOf("--tab") + 1], "w1:t9", "agent starts inside its tab");
+	assert.ok(
+		fake.execCalls.some((args) => args[0] === "pane" && args[1] === "close" && args[2] === "w1:p8"),
+		"empty tab root shell is closed",
+	);
+
 	const prompted = fake.execCalls.find((args) => args[0] === "pane" && args[1] === "run");
 	assert.equal(prompted?.[3], "Review the diff.");
 
@@ -372,6 +393,7 @@ test("reusing a live agent by name skips agent start", async () => {
 	});
 	assert.equal(record.agentName, "reviewer-abc");
 	assert.ok(!fake.execCalls.some((args) => args[0] === "agent" && args[1] === "start"));
+	assert.ok(!fake.execCalls.some((args) => args[0] === "tab" && args[1] === "create"));
 	fake.waiters.find((w) => w.args.includes("working"))?.resolveWith(ok({}));
 	await new Promise((r) => setTimeout(r, 20));
 	fake.waiters.find((w) => w.args.includes("idle"))?.resolveWith(ok({}));
