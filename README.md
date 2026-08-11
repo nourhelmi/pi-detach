@@ -24,7 +24,9 @@ a surface, and the surface disappears when the work is done.**
   gets a **live viewer pane** tailing its output. On success the pane closes
   itself, like a task chip completing; on failure it stays, renamed `✗`, for
   inspection (and is recycled by the next promoted run).
-  birth — those are the things you actually want on screen.
+- `bg_watch` (dev servers) runs in a pane from birth; `bg_agent` (helper
+  agents) gets its **own tab**, so agents appear in herdr's sidebar agent
+  list without splitting your current layout.
 
 Nothing about how you use the tools changes — the backend is picked
 per-session by detecting `HERDR_ENV`.
