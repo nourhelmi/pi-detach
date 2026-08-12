@@ -66,17 +66,6 @@ function createFakeCli(): {
 			},
 		},
 		{ prefix: "pane rename", handler: () => ok({ result: { type: "pane_info" } }) },
-		{
-			prefix: "tab create",
-			handler: () =>
-				ok({
-					result: {
-						tab: { tab_id: "w1:t9" },
-						root_pane: { pane_id: "w1:p8" },
-						type: "tab_created",
-					},
-				}),
-		},
 		{ prefix: "pane run", handler: () => ok(undefined) },
 		{ prefix: "pane send-keys", handler: () => ok({ result: { type: "ok" } }) },
 		{ prefix: "pane read", handler: () => ok(undefined, "") },
@@ -133,7 +122,7 @@ function createFakeCli(): {
 }
 
 function herdrRegistry(fake: ReturnType<typeof createFakeCli>) {
-	const ctx = { paneId: "w1:p1" };
+	const ctx = { paneId: "w1:p1", tabId: "w1:t7", workspaceId: "w1" };
 	const panes = createPaneManager(fake.cli, ctx);
 	const driver = createHerdrDriver({
 		cli: fake.cli,
@@ -314,19 +303,19 @@ test("an agent run settles when its status wait fires", async () => {
 		cwd,
 		label: "reviewer",
 		prompt: "Review the diff.",
+		closeOnSettle: true,
 	});
 	assert.equal(record.paneId, "w1:p7");
 	assert.match(record.agentName ?? "", /^reviewer-/);
 
-	const tabCreate = fake.execCalls.find((args) => args[0] === "tab" && args[1] === "create");
-	assert.ok(tabCreate, "agents get their own tab");
-	assert.equal(tabCreate?.[tabCreate.indexOf("--label") + 1], record.agentName);
-	const started = fake.execCalls.find((args) => args[0] === "agent" && args[1] === "start");
-	assert.equal(started?.[started.indexOf("--tab") + 1], "w1:t9", "agent starts inside its tab");
 	assert.ok(
-		fake.execCalls.some((args) => args[0] === "pane" && args[1] === "close" && args[2] === "w1:p8"),
-		"empty tab root shell is closed",
+		!fake.execCalls.some((args) => args[0] === "tab" && args[1] === "create"),
+		"agent does not create another tab",
 	);
+	const started = fake.execCalls.find((args) => args[0] === "agent" && args[1] === "start");
+	assert.equal(started?.[started.indexOf("--tab") + 1], "w1:t7", "agent stays in caller tab");
+	assert.equal(started?.[started.indexOf("--split") + 1], "right", "wide advisor splits right");
+	assert.ok(started?.includes("--no-focus"), "advisor retains focus");
 
 	const prompted = fake.execCalls.find((args) => args[0] === "pane" && args[1] === "run");
 	assert.equal(prompted?.[3], "Review the diff.");
@@ -344,8 +333,46 @@ test("an agent run settles when its status wait fires", async () => {
 	assert.equal(finished.agentState, "done");
 	assert.equal(finished.status, "exited");
 	assert.match(registry.tail(record.id, 10), /I finished the review/);
+	assert.ok(
+		fake.execCalls.some((args) => args[0] === "pane" && args[1] === "close" && args[2] === "w1:p7"),
+		"successful agent pane closes after its transcript is captured",
+	);
 	const blocked = fake.waiters.find((w) => w.args.includes("blocked"));
 	assert.equal(blocked?.killedByDriver, true, "loser waits are cancelled");
+});
+
+test("a Pi agent retries Enter when a multiline prompt remains idle", async () => {
+	const fake = createFakeCli();
+	fake.respond("agent start", () =>
+		ok({ result: { agent: { pane_id: "w1:p7" }, type: "agent_started" } }),
+	);
+	fake.respond("agent get", () =>
+		ok({ result: { agent: { pane_id: "w1:p7", agent_status: "idle" }, type: "agent_info" } }),
+	);
+	fake.respond("pane read", () => ok(undefined, "role task finished"));
+	const registry = herdrRegistry(fake);
+	const { completion } = await registry.start({
+		kind: "agent",
+		command: "pi --model gpt-5.6-sol",
+		cwd,
+		prompt: "/skill:advisor-role-scout ROLE: scout\n\nTASK: inspect",
+	});
+	await new Promise((complete) => setTimeout(complete, 1_600));
+	assert.ok(
+		fake.execCalls.some(
+			(args) =>
+				args[0] === "pane" &&
+				args[1] === "send-keys" &&
+				args[2] === "w1:p7" &&
+				args[3] === "enter",
+		),
+		"idle Pi editor receives one Enter retry",
+	);
+	fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+	await new Promise((complete) => setTimeout(complete, 20));
+	fake.waiters.find((waiter) => waiter.args.includes("idle"))?.resolveWith(ok({}));
+	const finished = await completion;
+	assert.equal(finished.agentState, "idle");
 });
 
 test("a blocked agent is reported as blocked", async () => {
@@ -360,6 +387,7 @@ test("a blocked agent is reported as blocked", async () => {
 		command: "codex",
 		cwd,
 		prompt: "Clean the build.",
+		closeOnSettle: true,
 	});
 	fake.waiters.find((w) => w.args.includes("working"))?.resolveWith(ok({}));
 	await new Promise((r) => setTimeout(r, 20));
@@ -367,6 +395,10 @@ test("a blocked agent is reported as blocked", async () => {
 	const finished = await completion;
 	assert.equal(finished.agentState, "blocked");
 	assert.match(registry.tail(record.id, 5), /rm -rf dist/);
+	assert.ok(
+		!fake.execCalls.some((args) => args[0] === "pane" && args[1] === "close" && args[2] === "w1:p7"),
+		"blocked agent pane stays visible for input",
+	);
 });
 
 test("bg_agent without herdr fails loudly instead of falling back", async () => {

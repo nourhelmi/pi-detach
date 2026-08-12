@@ -44,6 +44,8 @@ export interface StartOptions {
 	prompt?: string;
 	/** Agent runs: reuse this live herdr agent instead of starting a new one. */
 	reuseName?: string;
+	/** Agent runs: close the dedicated pane after a successful done/idle settlement. */
+	closeOnSettle?: boolean;
 }
 
 export interface StartResult {

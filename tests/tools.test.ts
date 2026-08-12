@@ -35,7 +35,15 @@ function host(options: { idle?: boolean; cwd?: string } = {}) {
 			sent.push({ content: message.content, options: opts }),
 	} as unknown as ExtensionAPI;
 
-	registerDetachExtension(pi);
+	// Unit tests must never inherit a developer's live Herdr session and create real panes.
+	const previousNoHerdr = process.env.PI_DETACH_NO_HERDR;
+	process.env.PI_DETACH_NO_HERDR = "1";
+	try {
+		registerDetachExtension(pi);
+	} finally {
+		if (previousNoHerdr === undefined) delete process.env.PI_DETACH_NO_HERDR;
+		else process.env.PI_DETACH_NO_HERDR = previousNoHerdr;
+	}
 
 	const ctx = {
 		cwd: options.cwd ?? tmpdir(),

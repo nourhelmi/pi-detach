@@ -24,9 +24,9 @@ a surface, and the surface disappears when the work is done.**
   gets a **live viewer pane** tailing its output. On success the pane closes
   itself, like a task chip completing; on failure it stays, renamed `✗`, for
   inspection (and is recycled by the next promoted run).
-- `bg_watch` (dev servers) runs in a pane from birth; `bg_agent` (helper
-  agents) gets its **own tab**, so agents appear in herdr's sidebar agent
-  list without splitting your current layout.
+- `bg_watch` (dev servers) runs in a pane from birth; `bg_agent` starts Pi in
+  a sibling pane in the caller's tab, so the worker stays visible beside the
+  advisor. Successful panes close automatically; blocked and failed panes stay.
 
 Nothing about how you use the tools changes — the backend is picked
 per-session by detecting `HERDR_ENV`.
@@ -53,7 +53,7 @@ detached-process backend.
 | --- | --- |
 | `bg_run` | Run a command. Blocks, then auto-detaches after `promoteAfterMs` (default 30s). |
 | `bg_watch` | Start a process that never exits — dev server, file watcher, log tail. Silent while healthy. |
-| `bg_agent` | Start a helper coding agent (codex, claude, …) in a herdr pane; wakes you when it settles. |
+| `bg_agent` | Start a visible Pi role agent beside the caller in the same Herdr tab; wakes you when it settles. |
 | `bg_output` | Read a run's captured log — live from the pane while running, from disk after. |
 | `bg_list` | Show every run from this session, its status, and its pane. |
 | `bg_stop` | Stop a run: SIGTERM locally, ctrl+c to a pane, esc to an agent. |
@@ -80,29 +80,94 @@ dies on its own or prints a line matching `errorPattern` — at most once a minu
 per run. Stopping it with `bg_stop` is silent. In herdr mode the server runs in
 its own pane, so you can just look at it.
 
-### `bg_agent` (herdr only)
+### `bg_agent` (Herdr only)
+
+Pi is the default runtime:
 
 ```jsonc
-{ "prompt": "Review the diff in ~/repo and list actionable findings.", "agent": "codex", "label": "reviewer" }
+{
+  "role": "checker",
+  "model": "openai-codex/gpt-5.6-sol",
+  "thinking": "high",
+  "prompt": "Review the assigned builder diff for correctness and missing behavior.",
+  "anchor": "result.md contains evidence-backed findings or a supported approval",
+  "requiredSkills": ["review-pr"],
+  "label": "auth-checker"
+}
 ```
 
-Starts a real interactive agent via `herdr agent start`, submits the prompt,
-and follows the same promote-after-30s contract. The session is woken when the
-agent **settles**: `done`/`idle` (finished), `blocked` (waiting on an approval
-or question — the notification tells pi how to answer), or `stalled` (the
-prompt never visibly started a turn). The agent stays alive in its pane;
-follow-ups reuse it:
+A role resolves through `~/.pi/agent/bg-agent-profiles.json`. The profile pins
+the guardrails only: hidden role skill, tool restrictions, CLI arguments, anchor
+policy, and prompt-cycle cap. Profiles never pin a model. Every role launch
+chooses `model` ("provider/model-id") and `thinking` per call; when the config
+has a `models` map, the chosen model and thinking level must be in it. A
+per-launch `maxTurns` overrides the profile cap and is forwarded through the
+profile's `turnCapFlag`. `bg_agent` submits a structured task packet and
+follows the promote-after-30s contract. The parent is woken when the worker
+settles as `done`, `idle`, `blocked`, or `stalled`.
+
+Successful `done`/`idle` panes close after their transcript is captured. Blocked,
+stalled, and failed panes remain visible. Preserve a successful pane only for a
+planned follow-up:
 
 ```jsonc
-{ "name": "reviewer-a3f9k", "prompt": "Now fix finding #2." }
+{
+  "role": "builder",
+  "model": "openai-codex/gpt-5.6-sol",
+  "thinking": "high",
+  "prompt": "Implement the fixed task packet.",
+  "anchor": "localized typecheck and affected tests pass",
+  "requiredSkills": ["backend-development", "testing-development"],
+  "label": "auth-builder",
+  "keepAlive": true
+}
 ```
 
-Plain headless invocations like `codex exec "…"` don't need `bg_agent` — they
-are ordinary commands, use `bg_run`.
+Then reuse it by name:
 
-> Tip: if the agent shows a first-run trust dialog for a directory it has never
-> seen, the prompt lands in that dialog instead of the agent. Trust your repos
-> once beforehand, or pass the flags your agent needs in `agent`.
+```jsonc
+{ "name": "auth-builder-a3f9k", "prompt": "Address these bounded checker findings: …", "keepAlive": true }
+```
+
+Without a role, `bg_agent` starts plain interactive Pi. An explicit compatibility
+command is still supported with `agent`, but role and agent cannot be combined:
+
+```jsonc
+{ "agent": "codex", "prompt": "One legacy interactive task", "label": "legacy" }
+```
+
+Profile file shape:
+
+```jsonc
+{
+  "defaultAgent": "pi",
+  "models": {
+    "openai-codex/gpt-5.6-sol": {
+      "character": "Workhorse for implementation, planning, and review.",
+      "thinking": ["high", "xhigh", "max"],
+      "defaultThinking": "high"
+    }
+  },
+  "profiles": {
+    "scout": {
+      "agent": "pi",
+      "skill": "advisor-role-scout",
+      "excludeTools": ["edit", "bg_agent"],
+      "cliArgs": ["--advisor-worker-role", "scout"],
+      "turnCapFlag": "--advisor-worker-max-turns",
+      "maxTurns": 3,
+      "requireAnchor": true
+    }
+  }
+}
+```
+
+Normal Pi skills remain available. A profile forces its hidden role skill; it
+does not disable unrelated project skills. Mark skills that must never load
+automatically with `disable-model-invocation: true`.
+
+> Tip: trust a repository before unattended work. `bg_agent` fails visibly when
+> Pi is waiting on first-run input and never falls back to a hidden process.
 
 ## Design
 
@@ -114,9 +179,9 @@ detaching everything.
 
 **Fan-out is just parallel tool calls.** Issue several `bg_run`/`bg_agent`
 calls in one message and they execute concurrently, each detaching on its own
-schedule. In herdr mode panes stack next to your session — the first split off
-the caller's pane (right when wide, down when tall), later ones off the newest
-run pane.
+schedule. Promoted commands use viewer panes. Agents split into sibling panes
+in the caller's tab—right when the advisor is wide, down when it is narrow or
+tall—so their work remains visible while the advisor keeps focus.
 
 **Visibility follows backgroundness.** Commands don't get panes; *background
 tasks* do. A pane appears only when a run is promoted, a watch starts, or an
@@ -134,10 +199,9 @@ the same directory reuses the first process instead of fighting over the port.
 Running `bun dev` in three different worktrees starts three servers. Agent runs
 never dedupe.
 
-**Panes are recycled, not accumulated.** Successful viewer panes close
-themselves; failure panes and dead-watch panes return to a pool and the next
-background task reuses them (verified against process-info first — if you
-started typing in one, it's left alone).
+**Panes are recycled, not accumulated.** Successful viewer and agent panes
+close themselves. Failure panes and dead-watch panes return to a pool, while
+blocked/failed agent panes remain available for diagnosis or input.
 
 **Watch completion in a pane is sentinel-based.** A pane is a shared terminal,
 not a child process, so watch commands are bracketed with printed markers and
@@ -149,11 +213,10 @@ back at its prompt and settles the run as killed.
 
 ## Herdr behavior notes
 
-- Pane-hosted work (**watches and agents**) survives pi. On session shutdown
-  or `/reload` their panes keep running — they're visible and yours. Close
-  them in herdr when you're done. `bg_run` processes are local and die with
-  the session as before; a viewer pane orphaned by a hard exit just shows the
-  final tail and can be closed by hand.
+- Pane-hosted work survives Pi shutdown or `/reload`. Active watches and agents
+  remain visible. Successful agent panes normally close on settlement;
+  `keepAlive` agents, blocked agents, and failed agents remain yours to inspect
+  or close. Local `bg_run` processes die with the parent session as before.
 - `bg_output` on a running watch or agent reads its pane live; local runs read
   their streamed log at `~/.pi/detach/runs/<runId>/output.log`. Pane
   scrollback limits apply to very chatty watch commands.

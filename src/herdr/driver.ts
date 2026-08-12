@@ -33,6 +33,7 @@ const INTERRUPT_GRACE_MS = 3_000;
 const STOP_SETTLE_MS = 1_500;
 const AGENT_START_TIMEOUT_MS = 45_000;
 const AGENT_WORKING_TIMEOUT_MS = 20_000;
+const PI_PROMPT_RETRY_MS = 1_500;
 const READ_LINES = 400;
 
 export interface HerdrDriverDeps {
@@ -50,6 +51,11 @@ function tokenize(input: string): string[] {
 		tokens.push(match[1] ?? match[2] ?? match[3] ?? "");
 	}
 	return tokens;
+}
+
+function isPiAgentCommand(command: string): boolean {
+	const executable = tokenize(command)[0];
+	return executable?.split("/").at(-1) === "pi";
 }
 
 function agentName(label: string, id: string): string {
@@ -281,36 +287,9 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			if (argv.length === 0) throw new Error("agent command is empty");
 			name = agentName(record.label, record.id);
 
-			// Agents live in their own tab, not a split: the herdr sidebar lists
-			// them per-tab, and the caller's layout stays untouched.
-			let startArgs: string[] | undefined;
-			let leftoverRootPane: string | undefined;
-			const tab = await cli.exec([
-				"tab",
-				"create",
-				...(ctx.workspaceId ? ["--workspace", ctx.workspaceId] : []),
-				"--cwd",
-				options.cwd,
-				"--label",
-				name,
-				"--no-focus",
-			]);
-			if (tab.ok) {
-				const tabId = findString((tab.json as { result?: { tab?: unknown } }).result?.tab, "tab_id");
-				leftoverRootPane = findString(
-					(tab.json as { result?: { root_pane?: unknown } }).result?.root_pane,
-					"pane_id",
-				);
-				if (tabId) {
-					startArgs = ["--tab", tabId];
-				}
-			}
-			if (!startArgs) {
-				// Tab creation refused — degrade to the old split-next-to-caller.
-				const direction = await splitDirectionFor(cli, ctx.paneId);
-				startArgs = ["--split", direction];
-				leftoverRootPane = undefined;
-			}
+			// Agent work stays visible beside the advisor in the caller's tab. Wide
+			// advisor panes split right; narrow or tall panes split down.
+			const direction = await splitDirectionFor(cli, ctx.paneId);
 			const started = await cli.exec(
 				[
 					"agent",
@@ -319,7 +298,9 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 					"--cwd",
 					options.cwd,
 					...(ctx.workspaceId ? ["--workspace", ctx.workspaceId] : []),
-					...startArgs,
+					...(ctx.tabId ? ["--tab", ctx.tabId] : []),
+					"--split",
+					direction,
 					"--no-focus",
 					"--",
 					...argv,
@@ -332,11 +313,6 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 				);
 			}
 			paneId = findString(started.json, "pane_id") ?? "";
-			// `agent start --tab` splits inside the tab; drop the empty root shell
-			// so the agent has the tab to itself.
-			if (leftoverRootPane && leftoverRootPane !== paneId) {
-				void cli.exec(["pane", "close", leftoverRootPane]);
-			}
 		}
 		if (!paneId) throw new Error("herdr did not report a pane id for the agent");
 		record.paneId = paneId;
@@ -350,6 +326,22 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		let finished = false;
 		const waiters: Waiter[] = [];
 		const timers: NodeJS.Timeout[] = [];
+		if (isPiAgentCommand(options.command)) {
+			// A multiline Pi skill command can remain in the editor after pane run.
+			// Retry one Enter only while Herdr still reports idle; never interrupt a
+			// working or already-completed turn.
+			timers.push(
+				setTimeout(() => {
+					void (async () => {
+						if (finished) return;
+						const info = await cli.exec(["agent", "get", name]);
+						if (findString(info.json, "agent_status") === "idle") {
+							await cli.exec(["pane", "send-keys", paneId, "enter"]);
+						}
+					})();
+				}, PI_PROMPT_RETRY_MS),
+			);
+		}
 
 		function finalize(
 			outcome: Parameters<RunController["finish"]>[0],
@@ -360,8 +352,13 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			for (const timer of timers) clearInterval(timer);
 			for (const waiter of waiters) waiter.kill();
 			if (finalText?.trim()) controller.emitOutput(`${finalText}\n`);
+			const state = outcome.agentState ?? "unknown";
+			if (options.closeOnSettle && (state === "done" || state === "idle")) {
+				// The transcript is already captured and the Pi session remains persisted;
+				// close successful graph nodes so they never crowd the advisor layout.
+				void cli.exec(["pane", "close", paneId]);
+			}
 			if (record.promoted && !outcome.killed) {
-				const state = outcome.agentState ?? "unknown";
 				if (state === "blocked") {
 					toast(`⧗ ${record.label} needs input`, `agent ${name} is waiting in pane ${paneId}`, "request");
 				} else {
