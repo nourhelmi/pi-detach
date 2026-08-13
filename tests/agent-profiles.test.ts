@@ -268,3 +268,34 @@ test("does not allow model or thinking with an explicit agent command", async ()
 		/not explicit agent commands/,
 	);
 });
+
+test("role allowedModels restricts which mapped models the role may use", async () => {
+	const path = await configFile({
+		...MAPPED_CONFIG,
+		profiles: {
+			checker: {
+				skill: "advisor-role-checker",
+				allowedModels: ["openai-codex/gpt-5.6-luna"],
+				maxTurns: 3,
+			},
+		},
+	});
+	await assert.rejects(
+		resolveAgentLaunch({
+			role: "checker",
+			model: "openai-codex/gpt-5.6-sol",
+			prompt: "Review.",
+			label: "checker",
+			configPath: path,
+		}),
+		/only allows models openai-codex\/gpt-5\.6-luna; requested openai-codex\/gpt-5\.6-sol/,
+	);
+	const launch = await resolveAgentLaunch({
+		role: "checker",
+		model: "openai-codex/gpt-5.6-luna",
+		prompt: "Review.",
+		label: "checker",
+		configPath: path,
+	});
+	assert.match(launch.command, /--model gpt-5\.6-luna --thinking max/);
+});

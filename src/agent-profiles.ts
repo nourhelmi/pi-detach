@@ -36,6 +36,7 @@ const AgentProfileSchema = Type.Object(
 		tools: Type.Optional(Type.Array(NonEmptyString)),
 		excludeTools: Type.Optional(Type.Array(NonEmptyString)),
 		cliArgs: Type.Optional(Type.Array(NonEmptyString)),
+		allowedModels: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
 		turnCapFlag: Type.Optional(Type.String({ pattern: "^--[a-z0-9][a-z0-9-]*$" })),
 		maxTurns: Type.Optional(Type.Integer({ minimum: 1 })),
 		requireAnchor: Type.Optional(Type.Boolean()),
@@ -184,7 +185,7 @@ function splitModel(value: string): { provider: string; model: string } {
 function selectIdentity(
 	options: ResolveAgentLaunchOptions,
 	config: AgentProfilesConfig,
-	profileMaxTurns?: number,
+	profile?: AgentProfile,
 ): LaunchIdentity {
 	if (!options.model) {
 		throw new Error(
@@ -199,6 +200,11 @@ function selectIdentity(
 			`Model ${key} is not in the model map. Allowed models:\n${describeModelMap(config.models)}`,
 		);
 	}
+	if (profile?.allowedModels && !profile.allowedModels.includes(key)) {
+		throw new Error(
+			`This role only allows models ${profile.allowedModels.join(", ")}; requested ${key}`,
+		);
+	}
 	const thinking = options.thinking ?? entry?.defaultThinking;
 	if (entry?.thinking?.length && (!thinking || !entry.thinking.includes(thinking))) {
 		throw new Error(
@@ -207,7 +213,7 @@ function selectIdentity(
 	}
 	const identity: LaunchIdentity = { provider, model };
 	if (thinking) identity.thinking = thinking;
-	const maxTurns = options.maxTurns ?? profileMaxTurns;
+	const maxTurns = options.maxTurns ?? profile?.maxTurns;
 	if (maxTurns) identity.maxTurns = maxTurns;
 	return identity;
 }
@@ -291,7 +297,7 @@ function resolveProfileLaunch(
 	if (!profile) {
 		throw new Error(`Unknown bg_agent role ${role}. Available roles: ${availableRoles(config)}`);
 	}
-	const identity = selectIdentity(options, config, profile.maxTurns);
+	const identity = selectIdentity(options, config, profile);
 	return {
 		command: buildPiCommand(profile, identity, config.defaultAgent, options.label),
 		prompt: rolePrompt(options, role, profile, identity.maxTurns),
