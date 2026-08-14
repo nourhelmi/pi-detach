@@ -432,3 +432,47 @@ test("reusing a live agent by name skips agent start", async () => {
 	const finished = await completion;
 	assert.equal(finished.agentState, "idle");
 });
+
+test("the advisor pane is split at most twice; further agents stack off worker panes", async () => {
+	const fake = createFakeCli();
+	let agentPane = 20;
+	fake.respond("agent start", (args) => {
+		const paneFlag = args.indexOf("--pane");
+		const paneId = paneFlag >= 0 ? args[paneFlag + 1] : `w1:p${++agentPane}`;
+		return ok({ result: { agent: { pane_id: paneId }, type: "agent_started" } });
+	});
+	const registry = herdrRegistry(fake);
+	const records: { paneId?: string | undefined }[] = [];
+	const completions: Promise<unknown>[] = [];
+	for (const label of ["builder", "checker", "verifier"]) {
+		const { record, completion } = await registry.start({
+			kind: "agent",
+			command: "codex",
+			cwd,
+			label,
+			prompt: "Work.",
+			closeOnSettle: false,
+		});
+		records.push(record);
+		completions.push(completion);
+		fake.waiters
+			.filter((w) => w.args.includes("working"))
+			.at(-1)
+			?.resolveWith(ok({ event: "pane.agent_status_changed" }));
+		await new Promise((r) => setTimeout(r, 20));
+	}
+	const starts = fake.execCalls.filter((args) => args[0] === "agent" && args[1] === "start");
+	assert.equal(starts.length, 3);
+	assert.ok(starts[0]?.includes("--split"), "first agent splits the advisor pane");
+	assert.ok(starts[1]?.includes("--split"), "second agent still splits the advisor pane");
+	assert.ok(starts[2]?.includes("--pane"), "third agent is placed in a pre-split worker pane");
+	assert.ok(!starts[2]?.includes("--split"), "third agent must not split the advisor again");
+	const workerSplit = fake.execCalls.find(
+		(args) => args[0] === "pane" && args[1] === "split" && args[2] === records[1]?.paneId,
+	);
+	assert.ok(workerSplit, "third agent splits off the newest worker pane");
+	for (const waiter of fake.waiters.filter((w) => w.args.includes("done"))) {
+		waiter.resolveWith(ok({ event: "pane.agent_status_changed" }));
+	}
+	await Promise.all(completions);
+});

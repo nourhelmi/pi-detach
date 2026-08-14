@@ -32,6 +32,7 @@ const WATCH_POLL_MS = 10_000;
 const INTERRUPT_GRACE_MS = 3_000;
 const STOP_SETTLE_MS = 1_500;
 const AGENT_START_TIMEOUT_MS = 45_000;
+const ADVISOR_SPLIT_CAP = 2;
 const AGENT_WORKING_TIMEOUT_MS = 20_000;
 const PI_PROMPT_RETRY_MS = 1_500;
 const READ_LINES = 400;
@@ -71,6 +72,82 @@ function agentName(label: string, id: string): string {
 export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 	const { cli, ctx, panes } = deps;
 	const toasts = toastsEnabled(deps.env ?? process.env);
+
+	// Layout policy: the caller (advisor) pane is split directly at most
+	// ADVISOR_SPLIT_CAP times — one right + one down, quarter screen worst
+	// case. Additional parallel agents split off the newest live worker pane
+	// so the caller keeps its space. Closed panes free their slot.
+	const agentPaneStack: { paneId: string; offAdvisor: boolean }[] = [];
+
+	async function paneAlive(id: string): Promise<boolean> {
+		const info = await cli.exec(["pane", "process-info", "--pane", id]);
+		return info.ok;
+	}
+
+	async function pruneAgentPanes(): Promise<void> {
+		for (let index = agentPaneStack.length - 1; index >= 0; index--) {
+			const tracked = agentPaneStack[index];
+			if (tracked && !(await paneAlive(tracked.paneId))) agentPaneStack.splice(index, 1);
+		}
+	}
+
+	async function startAgentPane(name: string, cwd: string, argv: string[]): Promise<string> {
+		await pruneAgentPanes();
+		const advisorSplits = agentPaneStack.filter((pane) => pane.offAdvisor).length;
+		const stackTarget = advisorSplits >= ADVISOR_SPLIT_CAP ? agentPaneStack[0] : undefined;
+		if (stackTarget) {
+			const direction = await splitDirectionFor(cli, stackTarget.paneId);
+			const split = await cli.exec([
+				"pane",
+				"split",
+				stackTarget.paneId,
+				"--direction",
+				direction,
+				"--cwd",
+				cwd,
+				"--no-focus",
+			]);
+			const workerPane = split.ok ? findString(split.json, "pane_id") : undefined;
+			if (workerPane) {
+				const started = await cli.exec(
+					["agent", "start", name, "--cwd", cwd, "--pane", workerPane, "--", ...argv],
+					{ timeoutMs: AGENT_START_TIMEOUT_MS },
+				);
+				if (started.ok) {
+					const pane = findString(started.json, "pane_id") ?? workerPane;
+					agentPaneStack.unshift({ paneId: pane, offAdvisor: false });
+					return pane;
+				}
+				// Do not leak the split pane when the targeted start is refused
+				// (older herdr without --pane); fall back to the caller split.
+				void cli.exec(["pane", "close", workerPane]);
+			}
+		}
+		const direction = await splitDirectionFor(cli, ctx.paneId);
+		const started = await cli.exec(
+			[
+				"agent",
+				"start",
+				name,
+				"--cwd",
+				cwd,
+				...(ctx.workspaceId ? ["--workspace", ctx.workspaceId] : []),
+				...(ctx.tabId ? ["--tab", ctx.tabId] : []),
+				"--split",
+				direction,
+				"--no-focus",
+				"--",
+				...argv,
+			],
+			{ timeoutMs: AGENT_START_TIMEOUT_MS },
+		);
+		if (!started.ok) {
+			throw new Error(`herdr agent start failed: ${started.errorMessage ?? started.stderr.trim()}`);
+		}
+		const pane = findString(started.json, "pane_id") ?? "";
+		if (pane) agentPaneStack.unshift({ paneId: pane, offAdvisor: true });
+		return pane;
+	}
 
 	function toast(title: string, body: string, sound: "none" | "done" | "request"): void {
 		if (!toasts) return;
@@ -286,33 +363,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			const argv = tokenize(options.command);
 			if (argv.length === 0) throw new Error("agent command is empty");
 			name = agentName(record.label, record.id);
-
-			// Agent work stays visible beside the advisor in the caller's tab. Wide
-			// advisor panes split right; narrow or tall panes split down.
-			const direction = await splitDirectionFor(cli, ctx.paneId);
-			const started = await cli.exec(
-				[
-					"agent",
-					"start",
-					name,
-					"--cwd",
-					options.cwd,
-					...(ctx.workspaceId ? ["--workspace", ctx.workspaceId] : []),
-					...(ctx.tabId ? ["--tab", ctx.tabId] : []),
-					"--split",
-					direction,
-					"--no-focus",
-					"--",
-					...argv,
-				],
-				{ timeoutMs: AGENT_START_TIMEOUT_MS },
-			);
-			if (!started.ok) {
-				throw new Error(
-					`herdr agent start failed: ${started.errorMessage ?? started.stderr.trim()}`,
-				);
-			}
-			paneId = findString(started.json, "pane_id") ?? "";
+			paneId = await startAgentPane(name, options.cwd, argv);
 		}
 		if (!paneId) throw new Error("herdr did not report a pane id for the agent");
 		record.paneId = paneId;
