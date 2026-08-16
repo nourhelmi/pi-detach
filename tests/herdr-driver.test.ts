@@ -328,6 +328,11 @@ test("an agent run settles when its status wait fires", async () => {
 	const prompted = fake.execCalls.find((args) => args[0] === "pane" && args[1] === "run");
 	assert.equal(prompted?.[3], "Review the diff.");
 
+	const renamed = fake.execCalls.find(
+		(args) => args[0] === "pane" && args[1] === "rename" && args[2] === "w1:p7",
+	);
+	assert.equal(renamed?.[3], "reviewer", "agent pane is labeled with the run label");
+
 	const working = fake.waiters.find((w) => w.args.includes("working"));
 	assert.ok(working, "waits for the agent to start working");
 	working?.resolveWith(ok({ event: "pane.agent_status_changed" }));

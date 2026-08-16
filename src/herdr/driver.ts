@@ -95,7 +95,12 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		}
 	}
 
-	async function startAgentPane(name: string, cwd: string, argv: string[]): Promise<string> {
+	async function startAgentPane(
+		name: string,
+		label: string,
+		cwd: string,
+		argv: string[],
+	): Promise<string> {
 		await pruneAgentPanes();
 		// herdr >= 0.8 signature: the pane is always created first, then
 		// `agent start <name> --kind KIND --pane ID -- <agent-args>` where the
@@ -139,6 +144,8 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			throw new Error(`herdr agent start failed: ${started.errorMessage ?? started.stderr.trim()}`);
 		}
 		const pane = findString(started.json, "pane_id") ?? workerPane;
+		// The pre-split pane carries no label; restore the old auto-labeled UX.
+		void cli.exec(["pane", "rename", pane, label]);
 		agentPaneStack.unshift({ paneId: pane, offAdvisor });
 		return pane;
 	}
@@ -358,7 +365,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			const argv = tokenize(options.command);
 			if (argv.length === 0) throw new Error("agent command is empty");
 			name = agentName(record.label, record.id);
-			paneId = await startAgentPane(name, options.cwd, argv);
+			paneId = await startAgentPane(name, record.label, options.cwd, argv);
 		}
 		if (!paneId) throw new Error("herdr did not report a pane id for the agent");
 		record.paneId = paneId;
