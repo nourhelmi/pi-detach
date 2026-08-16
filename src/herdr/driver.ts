@@ -38,7 +38,6 @@ const AGENT_WORKING_TIMEOUT_MS = 20_000;
 const WAIT_FOREVER_MS = 7 * 24 * 60 * 60 * 1000;
 const SHELL_READY_ATTEMPTS = 20;
 const SHELL_READY_POLL_MS = 250;
-const PI_PROMPT_RETRY_MS = 1_500;
 const READ_LINES = 400;
 
 export interface HerdrDriverDeps {
@@ -56,11 +55,6 @@ function tokenize(input: string): string[] {
 		tokens.push(match[1] ?? match[2] ?? match[3] ?? "");
 	}
 	return tokens;
-}
-
-function isPiAgentCommand(command: string): boolean {
-	const executable = tokenize(command)[0];
-	return executable?.split("/").at(-1) === "pi";
 }
 
 function agentName(label: string, id: string): string {
@@ -371,7 +365,9 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		record.paneId = paneId;
 		record.agentName = name;
 
-		const prompted = await cli.exec(["pane", "run", paneId, options.prompt]);
+		// herdr 0.8 `agent prompt` submits text + Enter atomically under the
+		// pane's live bracketed-paste mode, so no multiline Enter retry is needed.
+		const prompted = await cli.exec(["agent", "prompt", name, options.prompt]);
 		if (!prompted.ok) {
 			throw new Error(`failed to submit prompt: ${prompted.errorMessage ?? prompted.stderr.trim()}`);
 		}
@@ -379,22 +375,6 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		let finished = false;
 		const waiters: Waiter[] = [];
 		const timers: NodeJS.Timeout[] = [];
-		if (isPiAgentCommand(options.command)) {
-			// A multiline Pi skill command can remain in the editor after pane run.
-			// Retry one Enter only while Herdr still reports idle; never interrupt a
-			// working or already-completed turn.
-			timers.push(
-				setTimeout(() => {
-					void (async () => {
-						if (finished) return;
-						const info = await cli.exec(["agent", "get", name]);
-						if (findString(info.json, "agent_status") === "idle") {
-							await cli.exec(["pane", "send-keys", paneId, "enter"]);
-						}
-					})();
-				}, PI_PROMPT_RETRY_MS),
-			);
-		}
 
 		function finalize(
 			outcome: Parameters<RunController["finish"]>[0],

@@ -67,6 +67,7 @@ function createFakeCli(): {
 		},
 		{ prefix: "pane rename", handler: () => ok({ result: { type: "pane_info" } }) },
 		{ prefix: "pane run", handler: () => ok(undefined) },
+		{ prefix: "agent prompt", handler: () => ok({ result: { type: "agent_prompted" } }) },
 		{ prefix: "pane send-keys", handler: () => ok({ result: { type: "ok" } }) },
 		{ prefix: "pane read", handler: () => ok(undefined, "") },
 		{ prefix: "pane close", handler: () => ok({ result: { type: "ok" } }) },
@@ -325,7 +326,7 @@ test("an agent run settles when its status wait fires", async () => {
 	);
 	assert.ok(advisorSplit?.includes("--no-focus"), "advisor retains focus");
 
-	const prompted = fake.execCalls.find((args) => args[0] === "pane" && args[1] === "run");
+	const prompted = fake.execCalls.find((args) => args[0] === "agent" && args[1] === "prompt");
 	assert.equal(prompted?.[3], "Review the diff.");
 
 	const renamed = fake.execCalls.find(
@@ -354,32 +355,26 @@ test("an agent run settles when its status wait fires", async () => {
 	assert.equal(blocked?.killedByDriver, true, "loser waits are cancelled");
 });
 
-test("a Pi agent retries Enter when a multiline prompt remains idle", async () => {
+test("a multiline Pi prompt is submitted atomically via agent prompt", async () => {
 	const fake = createFakeCli();
 	fake.respond("agent start", () =>
 		ok({ result: { agent: { pane_id: "w1:p7" }, type: "agent_started" } }),
 	);
-	fake.respond("agent get", () =>
-		ok({ result: { agent: { pane_id: "w1:p7", agent_status: "idle" }, type: "agent_info" } }),
-	);
 	fake.respond("pane read", () => ok(undefined, "role task finished"));
 	const registry = herdrRegistry(fake);
-	const { completion } = await registry.start({
+	const prompt = "/skill:advisor-role-scout ROLE: scout\n\nTASK: inspect";
+	const { record, completion } = await registry.start({
 		kind: "agent",
 		command: "pi --model gpt-5.6-sol",
 		cwd,
-		prompt: "/skill:advisor-role-scout ROLE: scout\n\nTASK: inspect",
+		prompt,
 	});
-	await new Promise((complete) => setTimeout(complete, 1_600));
+	const prompted = fake.execCalls.find((args) => args[0] === "agent" && args[1] === "prompt");
+	assert.equal(prompted?.[2], record.agentName, "prompt targets the agent by name");
+	assert.equal(prompted?.[3], prompt, "full multiline prompt in one atomic submit");
 	assert.ok(
-		fake.execCalls.some(
-			(args) =>
-				args[0] === "pane" &&
-				args[1] === "send-keys" &&
-				args[2] === "w1:p7" &&
-				args[3] === "enter",
-		),
-		"idle Pi editor receives one Enter retry",
+		!fake.execCalls.some((args) => args[0] === "pane" && args[1] === "send-keys"),
+		"no Enter retry is needed",
 	);
 	fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
 	await new Promise((complete) => setTimeout(complete, 20));
