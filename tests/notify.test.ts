@@ -41,6 +41,17 @@ test("an idle session is woken with a new turn", async () => {
 	assert.match(sent[0]?.content ?? "", /done/);
 });
 
+test("a quiet promoted run never reaches the viewer hook", async () => {
+	const promotions: string[] = [];
+	const registry = createRegistry({ onPromoted: (record) => promotions.push(record.id) });
+	const loud = await registry.start({ kind: "run", command: "sleep 0.05", cwd });
+	registry.markPromoted(loud.record.id);
+	const quiet = await registry.start({ kind: "run", command: "sleep 0.06", cwd, quiet: true });
+	registry.markPromoted(quiet.record.id);
+	assert.deepEqual(promotions, [loud.record.id], "only the loud run is surfaced");
+	await Promise.all([loud.completion, quiet.completion]);
+});
+
 test("a busy session is steered mid-turn instead", async () => {
 	const { sent, registry } = harness(false);
 	const { record, completion } = await registry.start({ kind: "run", command: "echo done", cwd });

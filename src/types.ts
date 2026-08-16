@@ -32,6 +32,8 @@ export interface RunRecord {
 	errorPattern?: string;
 	/** Set when a herdr start failed and the run fell back to a local process. */
 	fallbackReason?: string | undefined;
+	/** Quiet runs never get a viewer pane when promoted (silent waiters). */
+	quiet?: boolean | undefined;
 }
 
 export interface StartOptions {
@@ -46,6 +48,8 @@ export interface StartOptions {
 	reuseName?: string;
 	/** Agent runs: close the dedicated pane after a successful done/idle settlement. */
 	closeOnSettle?: boolean;
+	/** Skip the promoted-run viewer pane; the run stays visible in bg_list only. */
+	quiet?: boolean;
 }
 
 export interface StartResult {

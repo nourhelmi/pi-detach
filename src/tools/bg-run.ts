@@ -61,6 +61,13 @@ export function registerBgRunTool(pi: ExtensionAPI, registry: Registry): void {
 						"Milliseconds to wait before detaching to the background. Defaults to 30000.",
 				}),
 			),
+			quiet: Type.Optional(
+				Type.Boolean({
+					description:
+						"Skip the herdr viewer pane when this run is promoted. Use for silent " +
+						"waiter commands with no meaningful output; the run stays in bg_list.",
+				}),
+			),
 		}),
 		executionMode: "parallel",
 
@@ -76,6 +83,7 @@ export function registerBgRunTool(pi: ExtensionAPI, registry: Registry): void {
 				command: params.command,
 				cwd,
 				...(params.label ? { label: params.label } : {}),
+				...(params.quiet ? { quiet: true } : {}),
 			});
 
 			const promoteAfter = params.promoteAfterMs ?? DEFAULT_PROMOTE_AFTER_MS;
@@ -100,9 +108,10 @@ export function registerBgRunTool(pi: ExtensionAPI, registry: Registry): void {
 			if (outcome === "promote") {
 				registry.markPromoted(record.id);
 				const waited = formatDuration(Date.now() - record.startedAt);
-				const where = detectHerdrContext()
-					? "A live viewer pane is opening in herdr; it closes itself on success.\n"
-					: "";
+				const where =
+					detectHerdrContext() && !params.quiet
+						? "A live viewer pane is opening in herdr; it closes itself on success.\n"
+						: "";
 				return {
 					content: [
 						{

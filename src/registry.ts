@@ -212,6 +212,7 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 			promoted: options.kind === "watch",
 			logPath,
 			...(options.errorPattern ? { errorPattern: options.errorPattern } : {}),
+			...(options.quiet ? { quiet: true } : {}),
 		};
 
 		let resolve!: (value: RunRecord) => void;
@@ -343,8 +344,8 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 			if (!live) return;
 			live.record.promoted = true;
 			// The run just became genuine background work — now it earns a
-			// visible surface.
-			if (live.record.kind === "run" && live.record.status === "running") {
+			// visible surface, unless the caller marked it quiet (silent waiters).
+			if (live.record.kind === "run" && live.record.status === "running" && !live.record.quiet) {
 				onPromoted?.(live.record, live.completion);
 			}
 		},
