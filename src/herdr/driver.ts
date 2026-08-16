@@ -93,59 +93,42 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 
 	async function startAgentPane(name: string, cwd: string, argv: string[]): Promise<string> {
 		await pruneAgentPanes();
+		// herdr >= 0.8 signature: the pane is always created first, then
+		// `agent start <name> --kind KIND --pane ID -- <agent-args>` where the
+		// binary comes from --kind and agent-args must not repeat it.
+		const kind = (argv[0] ?? "").split("/").pop() ?? "";
+		if (!kind) throw new Error("agent command is empty");
+		const agentArgs = argv.slice(1);
 		const advisorSplits = agentPaneStack.filter((pane) => pane.offAdvisor).length;
 		const stackTarget = advisorSplits >= ADVISOR_SPLIT_CAP ? agentPaneStack[0] : undefined;
-		if (stackTarget) {
-			const direction = await splitDirectionFor(cli, stackTarget.paneId);
-			const split = await cli.exec([
-				"pane",
-				"split",
-				stackTarget.paneId,
-				"--direction",
-				direction,
-				"--cwd",
-				cwd,
-				"--no-focus",
-			]);
-			const workerPane = split.ok ? findString(split.json, "pane_id") : undefined;
-			if (workerPane) {
-				const started = await cli.exec(
-					["agent", "start", name, "--cwd", cwd, "--pane", workerPane, "--", ...argv],
-					{ timeoutMs: AGENT_START_TIMEOUT_MS },
-				);
-				if (started.ok) {
-					const pane = findString(started.json, "pane_id") ?? workerPane;
-					agentPaneStack.unshift({ paneId: pane, offAdvisor: false });
-					return pane;
-				}
-				// Do not leak the split pane when the targeted start is refused
-				// (older herdr without --pane); fall back to the caller split.
-				void cli.exec(["pane", "close", workerPane]);
-			}
+		const splitBase = stackTarget?.paneId ?? ctx.paneId;
+		const offAdvisor = !stackTarget;
+		const direction = await splitDirectionFor(cli, splitBase);
+		const split = await cli.exec([
+			"pane",
+			"split",
+			splitBase,
+			"--direction",
+			direction,
+			"--cwd",
+			cwd,
+			"--no-focus",
+		]);
+		const workerPane = split.ok ? findString(split.json, "pane_id") : undefined;
+		if (!workerPane) {
+			throw new Error(`herdr pane split failed: ${split.errorMessage ?? split.stderr.trim()}`);
 		}
-		const direction = await splitDirectionFor(cli, ctx.paneId);
 		const started = await cli.exec(
-			[
-				"agent",
-				"start",
-				name,
-				"--cwd",
-				cwd,
-				...(ctx.workspaceId ? ["--workspace", ctx.workspaceId] : []),
-				...(ctx.tabId ? ["--tab", ctx.tabId] : []),
-				"--split",
-				direction,
-				"--no-focus",
-				"--",
-				...argv,
-			],
+			["agent", "start", name, "--kind", kind, "--pane", workerPane, "--", ...agentArgs],
 			{ timeoutMs: AGENT_START_TIMEOUT_MS },
 		);
 		if (!started.ok) {
+			// Do not leak the split pane when the start is refused.
+			void cli.exec(["pane", "close", workerPane]);
 			throw new Error(`herdr agent start failed: ${started.errorMessage ?? started.stderr.trim()}`);
 		}
-		const pane = findString(started.json, "pane_id") ?? "";
-		if (pane) agentPaneStack.unshift({ paneId: pane, offAdvisor: true });
+		const pane = findString(started.json, "pane_id") ?? workerPane;
+		agentPaneStack.unshift({ paneId: pane, offAdvisor });
 		return pane;
 	}
 

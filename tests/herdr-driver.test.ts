@@ -313,9 +313,17 @@ test("an agent run settles when its status wait fires", async () => {
 		"agent does not create another tab",
 	);
 	const started = fake.execCalls.find((args) => args[0] === "agent" && args[1] === "start");
-	assert.equal(started?.[started.indexOf("--tab") + 1], "w1:t7", "agent stays in caller tab");
-	assert.equal(started?.[started.indexOf("--split") + 1], "right", "wide advisor splits right");
-	assert.ok(started?.includes("--no-focus"), "advisor retains focus");
+	assert.equal(started?.[started.indexOf("--kind") + 1], "codex", "kind derived from argv[0]");
+	assert.ok(started?.includes("--pane"), "agent starts in a pre-split pane");
+	const advisorSplit = fake.execCalls.find(
+		(args) => args[0] === "pane" && args[1] === "split" && args[2] === "w1:p1",
+	);
+	assert.equal(
+		advisorSplit?.[advisorSplit.indexOf("--direction") + 1],
+		"right",
+		"wide advisor splits right",
+	);
+	assert.ok(advisorSplit?.includes("--no-focus"), "advisor retains focus");
 
 	const prompted = fake.execCalls.find((args) => args[0] === "pane" && args[1] === "run");
 	assert.equal(prompted?.[3], "Review the diff.");
@@ -463,10 +471,11 @@ test("the advisor pane is split at most twice; further agents stack off worker p
 	}
 	const starts = fake.execCalls.filter((args) => args[0] === "agent" && args[1] === "start");
 	assert.equal(starts.length, 3);
-	assert.ok(starts[0]?.includes("--split"), "first agent splits the advisor pane");
-	assert.ok(starts[1]?.includes("--split"), "second agent still splits the advisor pane");
-	assert.ok(starts[2]?.includes("--pane"), "third agent is placed in a pre-split worker pane");
-	assert.ok(!starts[2]?.includes("--split"), "third agent must not split the advisor again");
+	assert.ok(starts.every((args) => args.includes("--kind") && args.includes("--pane")));
+	const advisorSplits = fake.execCalls.filter(
+		(args) => args[0] === "pane" && args[1] === "split" && args[2] === "w1:p1",
+	);
+	assert.equal(advisorSplits.length, 2, "the advisor pane is split at most twice");
 	const workerSplit = fake.execCalls.find(
 		(args) => args[0] === "pane" && args[1] === "split" && args[2] === records[1]?.paneId,
 	);
