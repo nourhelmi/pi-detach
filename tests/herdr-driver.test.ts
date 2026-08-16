@@ -235,7 +235,7 @@ test("a watch is pane-hosted and completes through the sentinel wait", async () 
 	assert.match(paneRun?.[3] ?? "", /bun dev/);
 	assert.match(paneRun?.[3] ?? "", new RegExp(`<<pi-detach:${record.id}:start>>`));
 
-	const waiter = fake.waiters.find((w) => w.args[0] === "wait" && w.args[1] === "output");
+	const waiter = fake.waiters.find((w) => w.args[0] === "pane" && w.args[1] === "wait-output");
 	assert.ok(waiter, "spawned a blocking output wait");
 	waiter?.resolveWith(waitOutcome(record.id, 1, "EADDRINUSE: port taken"));
 

@@ -34,6 +34,10 @@ const STOP_SETTLE_MS = 1_500;
 const AGENT_START_TIMEOUT_MS = 45_000;
 const ADVISOR_SPLIT_CAP = 2;
 const AGENT_WORKING_TIMEOUT_MS = 20_000;
+// herdr 0.8 waits require an explicit --timeout; emulate the old indefinite wait.
+const WAIT_FOREVER_MS = 7 * 24 * 60 * 60 * 1000;
+const SHELL_READY_ATTEMPTS = 20;
+const SHELL_READY_POLL_MS = 250;
 const PI_PROMPT_RETRY_MS = 1_500;
 const READ_LINES = 400;
 
@@ -118,6 +122,13 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		if (!workerPane) {
 			throw new Error(`herdr pane split failed: ${split.errorMessage ?? split.stderr.trim()}`);
 		}
+		// A just-split pane's shell may not be ready; herdr refuses `agent start`
+		// with "not an available shell" until it is.
+		for (let attempt = 0; attempt < SHELL_READY_ATTEMPTS; attempt++) {
+			const info = await cli.exec(["pane", "process-info", "--pane", workerPane]);
+			if (info.ok && isIdleShell(info.json)) break;
+			await new Promise((resolvePromise) => setTimeout(resolvePromise, SHELL_READY_POLL_MS));
+		}
 		const started = await cli.exec(
 			["agent", "start", name, "--kind", kind, "--pane", workerPane, "--", ...agentArgs],
 			{ timeoutMs: AGENT_START_TIMEOUT_MS },
@@ -177,12 +188,13 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		let emittedLines = 0;
 
 		const waiter: Waiter = cli.spawnWaiter([
-			"wait",
-			"output",
+			"pane",
+			"wait-output",
 			paneId,
-			"--match",
-			exitMatchPattern(record.id),
 			"--regex",
+			exitMatchPattern(record.id),
+			"--timeout",
+			String(WAIT_FOREVER_MS),
 		]);
 
 		const timers: NodeJS.Timeout[] = [];
@@ -418,10 +430,10 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 
 		void (async () => {
 			const working = cli.spawnWaiter([
+				"agent",
 				"wait",
-				"agent-status",
 				paneId,
-				"--status",
+				"--until",
 				"working",
 				"--timeout",
 				String(AGENT_WORKING_TIMEOUT_MS),
@@ -440,7 +452,15 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			const states: AgentSettledState[] = ["done", "idle", "blocked"];
 			let failures = 0;
 			for (const state of states) {
-				const waiter = cli.spawnWaiter(["wait", "agent-status", paneId, "--status", state]);
+				const waiter = cli.spawnWaiter([
+					"agent",
+					"wait",
+					paneId,
+					"--until",
+					state,
+					"--timeout",
+					String(WAIT_FOREVER_MS),
+				]);
 				waiters.push(waiter);
 				void waiter.promise.then((result) => {
 					if (finished) return;
