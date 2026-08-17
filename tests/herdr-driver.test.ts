@@ -406,10 +406,46 @@ test("agent start does not retry non-readiness failures", async () => {
 		/unknown agent kind/,
 	);
 	assert.equal(starts, 1);
-	assert.ok(
-		fake.execCalls.some((args) => args[0] === "pane" && args[1] === "close"),
-		"a permanent failure cleans up its split pane",
+	const closes = fake.execCalls.filter((args) => args[0] === "pane" && args[1] === "close");
+	assert.equal(closes.length, 1, "a permanent failure closes its split pane exactly once");
+	assert.equal(closes[0]?.[2], "w1:p2");
+});
+
+test("agent start times out and closes a pane that never reaches a shell prompt", async () => {
+	const fake = createFakeCli();
+	fake.respond("pane process-info", () =>
+		ok({
+			result: {
+				process_info: {
+					foreground_processes: [{ name: "zsh" }, { name: "shell-init" }],
+				},
+			},
+		}),
 	);
+	const originalSetTimeout = globalThis.setTimeout;
+	globalThis.setTimeout = ((
+		handler: (...args: any[]) => void,
+		_delay?: number,
+		...args: any[]
+	) => originalSetTimeout(handler, 0, ...args)) as typeof globalThis.setTimeout;
+	try {
+		const registry = herdrRegistry(fake);
+		await assert.rejects(
+			registry.start({ kind: "agent", command: "pi", cwd, prompt: "Never starts." }),
+			/shell readiness timed out/,
+		);
+	} finally {
+		globalThis.setTimeout = originalSetTimeout;
+	}
+	const starts = fake.execCalls.filter((args) => args[0] === "agent" && args[1] === "start");
+	assert.equal(starts.length, 0, "agent start is not attempted while the shell gate stays busy");
+	const readinessChecks = fake.execCalls.filter(
+		(args) => args[0] === "pane" && args[1] === "process-info",
+	);
+	assert.equal(readinessChecks.length, 120, "timeout uses the full bounded readiness loop");
+	const closes = fake.execCalls.filter((args) => args[0] === "pane" && args[1] === "close");
+	assert.equal(closes.length, 1, "timeout closes the split pane exactly once");
+	assert.equal(closes[0]?.[2], "w1:p2");
 });
 
 test("a multiline Pi prompt is submitted atomically via agent prompt", async () => {
@@ -541,4 +577,44 @@ test("the advisor pane is split at most twice; further agents stack off worker p
 		waiter.resolveWith(ok({ event: "pane.agent_status_changed" }));
 	}
 	await Promise.all(completions);
+});
+
+test("parallel agent starts preserve the advisor split cap", async () => {
+	const fake = createFakeCli();
+	let agentPane = 20;
+	fake.respond("agent start", (args) => {
+		const paneFlag = args.indexOf("--pane");
+		const paneId = paneFlag >= 0 ? args[paneFlag + 1] : `w1:p${++agentPane}`;
+		return ok({ result: { agent: { pane_id: paneId }, type: "agent_started" } });
+	});
+	const registry = herdrRegistry(fake);
+	const launches = await Promise.all(
+		["builder", "checker", "verifier"].map((label) =>
+			registry.start({
+				kind: "agent",
+				command: "codex",
+				cwd,
+				label,
+				prompt: "Work.",
+				closeOnSettle: false,
+			}),
+		),
+	);
+	const records = launches.map(({ record }) => record);
+	const advisorSplits = fake.execCalls.filter(
+		(args) => args[0] === "pane" && args[1] === "split" && args[2] === "w1:p1",
+	);
+	assert.equal(advisorSplits.length, 2, "parallel launches still cap direct advisor splits");
+	const workerSplit = fake.execCalls.find(
+		(args) => args[0] === "pane" && args[1] === "split" && args[2] === records[1]?.paneId,
+	);
+	assert.ok(workerSplit, "the third parallel agent splits off a worker pane");
+	fake.waiters
+		.filter((waiter) => waiter.args.includes("working"))
+		.forEach((waiter) => waiter.resolveWith(ok({ event: "pane.agent_status_changed" })));
+	await new Promise((complete) => setTimeout(complete, 20));
+	fake.waiters
+		.filter((waiter) => waiter.args.includes("done"))
+		.forEach((waiter) => waiter.resolveWith(ok({ event: "pane.agent_status_changed" })));
+	await Promise.all(launches.map(({ completion }) => completion));
 });

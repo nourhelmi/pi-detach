@@ -82,6 +82,10 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 	// so the caller keeps its space. Closed panes free their slot.
 	const agentPaneStack: { paneId: string; offAdvisor: boolean }[] = [];
 
+	// Fan-out launches execute concurrently. Serialize pane allocation so the
+	// advisor split cap is observed before another launch chooses its split base.
+	let agentStartQueue = Promise.resolve();
+
 	async function paneAlive(id: string): Promise<boolean> {
 		const info = await cli.exec(["pane", "process-info", "--pane", id]);
 		return info.ok;
@@ -95,6 +99,25 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 	}
 
 	async function startAgentPane(
+		name: string,
+		label: string,
+		cwd: string,
+		argv: string[],
+	): Promise<string> {
+		const predecessor = agentStartQueue;
+		let release!: () => void;
+		agentStartQueue = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		await predecessor;
+		try {
+			return await startAgentPaneUnlocked(name, label, cwd, argv);
+		} finally {
+			release();
+		}
+	}
+
+	async function startAgentPaneUnlocked(
 		name: string,
 		label: string,
 		cwd: string,
