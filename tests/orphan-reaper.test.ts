@@ -500,6 +500,32 @@ test("seq-changed abort before close", async () => {
 	assert.equal(leftover(dir, "dead-sess").length, 1);
 });
 
+test("missing state_change_seq keeps the record and does not close", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-detach-reaper-"));
+	seed(dir, "dead-sess", 999019, [{ paneId: "w4:pQ", agentName: "seq-missing" }]);
+	const fake = createFakeCli();
+	fake.respond("agent get", () =>
+		ok({
+			result: {
+				agent: { pane_id: "w4:pQ", name: "seq-missing", agent_status: "idle" },
+				type: "agent_info",
+			},
+		}),
+	);
+	fake.respond("pane close", () => ok({ result: { type: "ok" } }));
+
+	await reapOrphanAgentPanes({
+		cli: fake.cli,
+		ledgerDir: dir,
+		currentSessionId: "live-sess",
+		isPidAlive: () => false,
+	});
+
+	assert.deepEqual(paneGets(fake.execCalls), ["w4:pQ", "w4:pQ"]);
+	assert.equal(closedPanes(fake.execCalls).length, 0);
+	assert.equal(leftover(dir, "dead-sess").length, 1);
+});
+
 test("under-age record is left untouched", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "pi-detach-reaper-"));
 	seed(dir, "dead-sess", 999017, [

@@ -125,6 +125,19 @@ function createFakeCli(): {
 	};
 }
 
+function agentGet(paneId: string, name: string, agent_status: string, state_change_seq = 1): CliResult {
+	return ok({
+		result: {
+			agent: { pane_id: paneId, name, agent_status, state_change_seq },
+			type: "agent_info",
+		},
+	});
+}
+
+function closedPanes(execCalls: string[][]): string[] {
+	return execCalls.filter((args) => args[0] === "pane" && args[1] === "close").map((args) => args[2] ?? "");
+}
+
 function herdrRegistry(
 	fake: ReturnType<typeof createFakeCli>,
 	extras: {
@@ -354,6 +367,7 @@ test("an agent run settles when its status wait fires", async () => {
 	working?.resolveWith(ok({ event: "pane.agent_status_changed" }));
 	// The done/idle/blocked race is spawned after `working` resolves.
 	await new Promise((r) => setTimeout(r, 20));
+	fake.respond("agent get", () => agentGet("w1:p7", record.agentName ?? "", "done"));
 	const done = fake.waiters.find((w) => w.args.includes("done"));
 	assert.ok(done, "races a wait on done");
 	done?.resolveWith(ok({ event: "pane.agent_status_changed" }));
@@ -362,6 +376,7 @@ test("an agent run settles when its status wait fires", async () => {
 	assert.equal(finished.agentState, "done");
 	assert.equal(finished.status, "exited");
 	assert.match(registry.tail(record.id, 10), /I finished the review/);
+	await flushAsync();
 	assert.ok(
 		fake.execCalls.some((args) => args[0] === "pane" && args[1] === "close" && args[2] === "w1:p7"),
 		"successful agent pane closes after its transcript is captured",
@@ -664,6 +679,7 @@ test("an agent launch writes a ledger record and drops it when the driver closes
 
 	fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
 	await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+	fake.respond("agent get", () => agentGet("w1:p7", record.agentName ?? "", "done"));
 	fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
 	await completion;
 	await flushAsync();
@@ -683,7 +699,7 @@ test("a failed pane close retains the ledger record", async () => {
 		ownerPid: 4242,
 	});
 	const registry = herdrRegistry(fake, { ledger });
-	const { completion } = await registry.start({
+	const { record, completion } = await registry.start({
 		kind: "agent",
 		command: "codex",
 		cwd,
@@ -693,6 +709,7 @@ test("a failed pane close retains the ledger record", async () => {
 	});
 	fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
 	await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+	fake.respond("agent get", () => agentGet("w1:p7", record.agentName ?? "", "done"));
 	fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
 	await completion;
 	await flushAsync();
@@ -725,4 +742,68 @@ test("pre-launch orphan sweep does not delay agent start", async () => {
 	await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
 	fake.waiters.find((waiter) => waiter.args.includes("idle"))?.resolveWith(ok({}));
 	await completion;
+});
+
+test("close-on-settle skips pane close when the occupant was replaced", async () => {
+	const fake = createFakeCli();
+	fake.respond("agent start", () =>
+		ok({ result: { agent: { pane_id: "w1:p7" }, type: "agent_started" } }),
+	);
+	fake.respond("pane read", () => ok(undefined, "review done"));
+	const ledger = createSessionLedger({
+		ledgerDir: mkdtempSync(join(tmpdir(), "pi-detach-ledger-")),
+		sessionId: "sess-live",
+		ownerPid: 4242,
+	});
+	const registry = herdrRegistry(fake, { ledger });
+	const { record, completion } = await registry.start({
+		kind: "agent",
+		command: "codex",
+		cwd,
+		label: "reviewer",
+		prompt: "Review.",
+		closeOnSettle: true,
+	});
+	fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+	fake.respond("agent get", () => agentGet("w1:p7", "replacement-agent", "idle"));
+	fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+	const finished = await completion;
+	await flushAsync();
+	assert.equal(finished.agentState, "done");
+	assert.equal(finished.status, "exited");
+	assert.equal(closedPanes(fake.execCalls).length, 0, "replaced occupant is not closed");
+	assert.equal(ledger.read().records.length, 1, "ledger stays so a later reap can decide");
+	assert.notEqual(record.agentName, "replacement-agent");
+});
+
+test("close-on-settle still closes when the confirm get matches this occupant", async () => {
+	const fake = createFakeCli();
+	fake.respond("agent start", () =>
+		ok({ result: { agent: { pane_id: "w1:p7" }, type: "agent_started" } }),
+	);
+	fake.respond("pane read", () => ok(undefined, "review done"));
+	const ledger = createSessionLedger({
+		ledgerDir: mkdtempSync(join(tmpdir(), "pi-detach-ledger-")),
+		sessionId: "sess-live",
+		ownerPid: 4242,
+	});
+	const registry = herdrRegistry(fake, { ledger });
+	const { record, completion } = await registry.start({
+		kind: "agent",
+		command: "codex",
+		cwd,
+		label: "reviewer",
+		prompt: "Review.",
+		closeOnSettle: true,
+	});
+	fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+	fake.respond("agent get", () => agentGet("w1:p7", record.agentName ?? "", "idle"));
+	fake.waiters.find((waiter) => waiter.args.includes("idle"))?.resolveWith(ok({}));
+	const finished = await completion;
+	await flushAsync();
+	assert.equal(finished.agentState, "idle");
+	assert.deepEqual(closedPanes(fake.execCalls), ["w1:p7"]);
+	assert.equal(ledger.read().records.length, 0);
 });

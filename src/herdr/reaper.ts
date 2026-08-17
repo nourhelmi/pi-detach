@@ -8,9 +8,10 @@
  * Herdr reuses names. Occupant pane_id + name must match the ledger or the
  * record is kept. Settled agents (`idle`/`done`) are closed after a second
  * get confirms pane, name, settled state, and `state_change_seq` are
- * unchanged. `working`/`blocked`/`unknown` panes stay. `not_found` drops
- * the record without closing; any other CLI error keeps it. Empty
- * dead-session files are deleted.
+ * unchanged. A missing or non-number `state_change_seq` on either get
+ * keeps the record — never close, never drop. `working`/`blocked`/
+ * `unknown` panes stay. `not_found` drops the record without closing;
+ * any other CLI error keeps it. Empty dead-session files are deleted.
  *
  * Own-session pass: after `/reload` the PID is still alive and closeOnSettle
  * waiters are gone. The live driver finishes leftover closeOnSettle records
@@ -47,7 +48,7 @@ const LEAVE = new Set(["working", "blocked", "unknown"]);
 /** Records younger than this are never closed — PID-reuse / occupant-swap cushion. */
 export const MIN_RECORD_AGE_MS = 60_000;
 
-interface Occupant {
+export interface Occupant {
 	paneId: string;
 	agentName: string;
 	status: string;
@@ -76,7 +77,7 @@ function agentStatus(json: unknown): string | undefined {
 	return raw?.toLowerCase();
 }
 
-function occupantFrom(json: unknown): Occupant | undefined {
+export function occupantFrom(json: unknown): Occupant | undefined {
 	const paneId = findString(json, "pane_id");
 	const agentName = findString(json, "name") ?? findString(json, "agent_name");
 	if (!paneId || !agentName) return undefined;
@@ -86,6 +87,15 @@ function occupantFrom(json: unknown): Occupant | undefined {
 		status: agentStatus(json) ?? "unknown",
 		stateChangeSeq: findNumber(json, "state_change_seq"),
 	};
+}
+
+/** True when this occupant is the expected pane+name and already idle/done. */
+export function isSettledOccupantOf(occupant: Occupant, paneId: string, agentName: string): boolean {
+	return occupant.paneId === paneId && occupant.agentName === agentName && SETTLED.has(occupant.status);
+}
+
+function hasStateChangeSeq(occupant: Occupant): occupant is Occupant & { stateChangeSeq: number } {
+	return typeof occupant.stateChangeSeq === "number";
 }
 
 async function lookupByPane(cli: HerdrCli, record: AgentPaneLedgerRecord): Promise<Lookup> {
@@ -106,10 +116,11 @@ async function lookupByPane(cli: HerdrCli, record: AgentPaneLedgerRecord): Promi
 }
 
 function sameSettledOccupant(first: Occupant, second: Occupant): boolean {
+	// Missing/non-number generation on either read is not a match — fail closed.
+	if (!hasStateChangeSeq(first) || !hasStateChangeSeq(second)) return false;
 	return (
-		second.paneId === first.paneId &&
-		second.agentName === first.agentName &&
-		SETTLED.has(second.status) &&
+		isSettledOccupantOf(second, first.paneId, first.agentName) &&
+		SETTLED.has(first.status) &&
 		second.status === first.status &&
 		second.stateChangeSeq === first.stateChangeSeq
 	);

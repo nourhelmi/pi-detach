@@ -228,10 +228,12 @@ back at its prompt and settles the run as killed.
   agent name — Herdr reuses names for new agents; pane IDs are never reused.
   Records younger than 60s are ineligible. Immediately before `pane close` the
   reaper re-reads the pane and aborts if pane, name, settled state, or
-  `state_change_seq` changed. A Herdr server-side conditional close (close only
-  if the same occupant generation is still `idle`/`done`) is the complete fix;
-  until that exists, a sub-millisecond residual race is accepted for settled
-  orphans of dead sessions.
+  `state_change_seq` changed. Missing or non-number `state_change_seq` on
+  either get keeps the record. The live driver also confirms pane, name, and
+  idle/done via `agent get <paneId>` before close-on-settle. Upstream: complete
+  atomicity needs a Herdr server-side conditional close keyed to pane + occupant
+  generation; requested as a future herdr feature. Until that exists, a
+  sub-millisecond residual race is accepted for settled orphans of dead sessions.
 - `bg_output` on a running watch or agent reads its pane live; local runs read
   their streamed log at `~/.pi/detach/runs/<runId>/output.log`. Pane
   scrollback limits apply to very chatty watch commands.

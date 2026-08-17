@@ -18,6 +18,7 @@ import { type CliResult, findString, type HerdrCli, type Waiter } from "./cli.ts
 import { type HerdrContext, toastsEnabled } from "./context.ts";
 import type { AgentPaneLedger } from "./ledger.ts";
 import { isIdleShell, type PaneManager, splitDirectionFor } from "./panes.ts";
+import { isSettledOccupantOf, occupantFrom } from "./reaper.ts";
 import { exitMatchPattern, extractRunOutput, parseExitCode, wrapRunCommand } from "./sentinel.ts";
 import type {
 	AgentSettledState,
@@ -438,9 +439,17 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			if (finalText?.trim()) controller.emitOutput(`${finalText}\n`);
 			const state = outcome.agentState ?? "unknown";
 			if (options.closeOnSettle && (state === "done" || state === "idle")) {
-				// Transcript is already captured. Sequence close → forget without
-				// blocking the settlement notification on the pane-close RPC.
+				// Transcript is already captured. Confirm the live occupant still
+				// matches this run, then close → forget without blocking settlement.
 				void (async () => {
+					let got: CliResult;
+					try {
+						got = await cli.exec(["agent", "get", paneId]);
+					} catch {
+						return;
+					}
+					const occupant = occupantFrom(got.json);
+					if (!got.ok || !occupant || !isSettledOccupantOf(occupant, paneId, name)) return;
 					let closed: CliResult;
 					try {
 						closed = await cli.exec(["pane", "close", paneId]);
