@@ -17,7 +17,7 @@
 import { type CliResult, findString, type HerdrCli, type Waiter } from "./cli.ts";
 import { type HerdrContext, toastsEnabled } from "./context.ts";
 import type { AgentPaneLedger } from "./ledger.ts";
-import { isIdleShell, type PaneManager, splitDirectionFor } from "./panes.ts";
+import { isIdleShell, type PaneManager, splitWithCallerBudget } from "./panes.ts";
 import { isSettledOccupantOf, occupantFrom } from "./reaper.ts";
 import { exitMatchPattern, extractRunOutput, parseExitCode, wrapRunCommand } from "./sentinel.ts";
 import type {
@@ -34,7 +34,6 @@ const WATCH_POLL_MS = 10_000;
 const INTERRUPT_GRACE_MS = 3_000;
 const STOP_SETTLE_MS = 1_500;
 const AGENT_START_TIMEOUT_MS = 45_000;
-const ADVISOR_SPLIT_CAP = 2;
 const AGENT_WORKING_TIMEOUT_MS = 20_000;
 // herdr 0.8 waits require an explicit --timeout; emulate the old indefinite wait.
 const WAIT_FOREVER_MS = 7 * 24 * 60 * 60 * 1000;
@@ -82,11 +81,11 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 	const { cli, ctx, panes, ledger, reapOrphans } = deps;
 	const toasts = toastsEnabled(deps.env ?? process.env);
 
-	// Layout policy: the caller (advisor) pane is split directly at most
-	// ADVISOR_SPLIT_CAP times — one right + one down, quarter screen worst
-	// case. Additional parallel agents split off the newest live worker pane
-	// so the caller keeps its space. Closed panes free their slot.
-	const agentPaneStack: { paneId: string; offAdvisor: boolean }[] = [];
+	// Layout policy lives in splitWithCallerBudget: caller is split at most
+	// twice (right, then down-only-if-no-run-pane). Count is persistent —
+	// closed worker panes do not refund a caller split.
+	const agentPaneStack: string[] = [];
+	let callerSplits = 0;
 
 	// Fan-out launches execute concurrently. Serialize pane allocation so the
 	// advisor split cap is observed before another launch chooses its split base.
@@ -99,8 +98,8 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 
 	async function pruneAgentPanes(): Promise<void> {
 		for (let index = agentPaneStack.length - 1; index >= 0; index--) {
-			const tracked = agentPaneStack[index];
-			if (tracked && !(await paneAlive(tracked.paneId))) agentPaneStack.splice(index, 1);
+			const paneId = agentPaneStack[index];
+			if (paneId && !(await paneAlive(paneId))) agentPaneStack.splice(index, 1);
 		}
 	}
 
@@ -136,25 +135,16 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		const kind = (argv[0] ?? "").split("/").pop() ?? "";
 		if (!kind) throw new Error("agent command is empty");
 		const agentArgs = argv.slice(1);
-		const advisorSplits = agentPaneStack.filter((pane) => pane.offAdvisor).length;
-		const stackTarget = advisorSplits >= ADVISOR_SPLIT_CAP ? agentPaneStack[0] : undefined;
-		const splitBase = stackTarget?.paneId ?? ctx.paneId;
-		const offAdvisor = !stackTarget;
-		const direction = await splitDirectionFor(cli, splitBase);
-		const split = await cli.exec([
-			"pane",
-			"split",
-			splitBase,
-			"--direction",
-			direction,
-			"--cwd",
-			cwd,
-			"--no-focus",
-		]);
-		const workerPane = split.ok ? findString(split.json, "pane_id") : undefined;
-		if (!workerPane) {
-			throw new Error(`herdr pane split failed: ${split.errorMessage ?? split.stderr.trim()}`);
+		const split = await splitWithCallerBudget(cli, cwd, {
+			stackTargets: agentPaneStack,
+			callerPaneId: ctx.paneId,
+			callerSplitsUsed: callerSplits,
+		});
+		if (!split.ok) {
+			throw new Error(`herdr pane split failed: ${split.errorMessage}`);
 		}
+		if (split.consumedCallerSplit) callerSplits += 1;
+		const workerPane = split.paneId;
 		// Shell startup can briefly report one foreground zsh before later init
 		// jobs run. process-info is therefore only a cheap gate; Herdr's own
 		// `agent start` precondition is authoritative. Retry only its exact
@@ -182,7 +172,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		const pane = findString(started.json, "pane_id") ?? workerPane;
 		// The pre-split pane carries no label; restore the old auto-labeled UX.
 		void cli.exec(["pane", "rename", pane, label]);
-		agentPaneStack.unshift({ paneId: pane, offAdvisor });
+		agentPaneStack.unshift(pane);
 		return pane;
 	}
 

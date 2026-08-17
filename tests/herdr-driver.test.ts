@@ -179,6 +179,30 @@ function waitOutcome(id: string, exitCode: number, body: string): CliResult {
 	});
 }
 
+function splitCalls(execCalls: string[][]): string[][] {
+	return execCalls.filter((args) => args[0] === "pane" && args[1] === "split");
+}
+
+function splitDirection(args: string[] | undefined): string | undefined {
+	if (!args) return undefined;
+	const index = args.indexOf("--direction");
+	return index >= 0 ? args[index + 1] : undefined;
+}
+
+function idleShell(): CliResult {
+	return ok({
+		result: {
+			process_info: { foreground_processes: [{ name: "zsh", argv0: "zsh" }] },
+		},
+	});
+}
+
+function paneManagerOf(fake: ReturnType<typeof createFakeCli>) {
+	const ctx = { paneId: "w1:p1", tabId: "w1:t7", workspaceId: "w1" };
+	return { ctx, panes: createPaneManager(fake.cli, ctx) };
+}
+
+
 test("bg_run stays local and invisible even inside herdr", async () => {
 	const fake = createFakeCli();
 	const registry = herdrRegistry(fake);
@@ -355,7 +379,7 @@ test("an agent run settles when its status wait fires", async () => {
 	assert.equal(
 		advisorSplit?.[advisorSplit.indexOf("--direction") + 1],
 		"right",
-		"wide advisor splits right",
+		"first caller split is always right",
 	);
 	assert.ok(advisorSplit?.includes("--no-focus"), "advisor retains focus");
 
@@ -569,7 +593,7 @@ test("reusing a live agent by name skips agent start", async () => {
 	assert.equal(finished.agentState, "idle");
 });
 
-test("the advisor pane is split at most twice; further agents stack off worker panes", async () => {
+test("the first helper splits the caller; further agents stack off run panes", async () => {
 	const fake = createFakeCli();
 	let agentPane = 20;
 	fake.respond("agent start", (args) => {
@@ -603,11 +627,12 @@ test("the advisor pane is split at most twice; further agents stack off worker p
 	const advisorSplits = fake.execCalls.filter(
 		(args) => args[0] === "pane" && args[1] === "split" && args[2] === "w1:p1",
 	);
-	assert.equal(advisorSplits.length, 2, "the advisor pane is split at most twice");
+	assert.equal(advisorSplits.length, 1, "caller is not split again while a run pane exists");
+	assert.equal(splitDirection(advisorSplits[0]), "right");
 	const workerSplit = fake.execCalls.find(
-		(args) => args[0] === "pane" && args[1] === "split" && args[2] === records[1]?.paneId,
+		(args) => args[0] === "pane" && args[1] === "split" && args[2] === records[0]?.paneId,
 	);
-	assert.ok(workerSplit, "third agent splits off the newest worker pane");
+	assert.ok(workerSplit, "second agent stacks off the first run pane");
 	for (const waiter of fake.waiters.filter((w) => w.args.includes("done"))) {
 		waiter.resolveWith(ok({ event: "pane.agent_status_changed" }));
 	}
@@ -639,11 +664,11 @@ test("parallel agent starts preserve the advisor split cap", async () => {
 	const advisorSplits = fake.execCalls.filter(
 		(args) => args[0] === "pane" && args[1] === "split" && args[2] === "w1:p1",
 	);
-	assert.equal(advisorSplits.length, 2, "parallel launches still cap direct advisor splits");
+	assert.equal(advisorSplits.length, 1, "parallel launches still only split the caller once while run panes live");
 	const workerSplit = fake.execCalls.find(
-		(args) => args[0] === "pane" && args[1] === "split" && args[2] === records[1]?.paneId,
+		(args) => args[0] === "pane" && args[1] === "split" && args[2] === records[0]?.paneId,
 	);
-	assert.ok(workerSplit, "the third parallel agent splits off a worker pane");
+	assert.ok(workerSplit, "the second parallel agent splits off a worker pane");
 	fake.waiters
 		.filter((waiter) => waiter.args.includes("working"))
 		.forEach((waiter) => waiter.resolveWith(ok({ event: "pane.agent_status_changed" })));
@@ -811,4 +836,224 @@ test("close-on-settle still closes when the confirm get matches this occupant", 
 	assert.equal(finished.agentState, "idle");
 	assert.deepEqual(closedPanes(fake.execCalls), ["w1:p7"]);
 	assert.equal(ledger.read().records.length, 0);
+});
+
+test("pane manager: first caller split is right even when the advisor is tall", async () => {
+	const fake = createFakeCli();
+	fake.respond("pane layout", () =>
+		ok({
+			result: {
+				layout: {
+					panes: [{ pane_id: "w1:p1", rect: { width: 40, height: 80 } }],
+				},
+			},
+		}),
+	);
+	const { panes } = paneManagerOf(fake);
+	await panes.acquire(cwd, "one");
+	const first = splitCalls(fake.execCalls)[0];
+	assert.equal(first?.[2], "w1:p1");
+	assert.equal(splitDirection(first), "right");
+});
+
+test("pane manager: second helper stacks off the run pane", async () => {
+	const fake = createFakeCli();
+	const { panes } = paneManagerOf(fake);
+	const first = await panes.acquire(cwd, "one");
+	await panes.acquire(cwd, "two");
+	const splits = splitCalls(fake.execCalls);
+	assert.equal(splits.length, 2);
+	assert.equal(splits[0]?.[2], "w1:p1");
+	assert.equal(splits[1]?.[2], first.paneId, "second helper does not recarve the caller");
+});
+
+test("pane manager: pooled reuse does not consume the caller-split budget", async () => {
+	const fake = createFakeCli();
+	const { panes } = paneManagerOf(fake);
+	const first = await panes.acquire(cwd, "one");
+	panes.release(first.paneId);
+	const second = await panes.acquire(cwd, "two");
+	assert.equal(second.reused, true);
+	assert.equal(second.paneId, first.paneId);
+	assert.equal(splitCalls(fake.execCalls).length, 1);
+});
+
+test("pane manager: second caller split is down when no run pane remains", async () => {
+	const fake = createFakeCli();
+	const { panes } = paneManagerOf(fake);
+	const first = await panes.acquire(cwd, "one");
+	panes.discard(first.paneId);
+	await panes.acquire(cwd, "two");
+	const callerSplits = splitCalls(fake.execCalls).filter((args) => args[2] === "w1:p1");
+	assert.equal(callerSplits.length, 2);
+	assert.equal(splitDirection(callerSplits[0]), "right");
+	assert.equal(splitDirection(callerSplits[1]), "down");
+});
+
+test("pane manager: budget exhausted with no run pane fails instead of a third caller split", async () => {
+	const fake = createFakeCli();
+	const { panes } = paneManagerOf(fake);
+	const first = await panes.acquire(cwd, "one");
+	panes.discard(first.paneId);
+	const second = await panes.acquire(cwd, "two");
+	panes.discard(second.paneId);
+	await assert.rejects(panes.acquire(cwd, "three"), /budget exhausted/);
+	assert.equal(splitCalls(fake.execCalls).filter((args) => args[2] === "w1:p1").length, 2);
+});
+
+test("pane manager: failed stack target prefers other created panes before the caller", async () => {
+	const fake = createFakeCli();
+	const dead = new Set<string>();
+	let nextPane = 100;
+	fake.respond("pane split", (args) => {
+		const target = args[2] ?? "";
+		if (dead.has(target)) return failed("not_found", "pane not found");
+		nextPane += 1;
+		return ok({ result: { pane: { pane_id: `w1:p${nextPane}` }, type: "pane_info" } });
+	});
+	const { panes } = paneManagerOf(fake);
+	const first = await panes.acquire(cwd, "one");
+	const second = await panes.acquire(cwd, "two");
+	dead.add(second.paneId);
+	const third = await panes.acquire(cwd, "three");
+	assert.equal(third.reused, false);
+	const splits = splitCalls(fake.execCalls);
+	assert.equal(splits.filter((args) => args[2] === "w1:p1").length, 1);
+	assert.ok(
+		splits.some((args) => args[2] === first.paneId),
+		"retry stacked off the surviving older run pane",
+	);
+	assert.equal(splits.at(-1)?.[2], first.paneId);
+});
+
+test("pane manager: failed stack-target retry off the caller consumes the budget", async () => {
+	const fake = createFakeCli();
+	const dead = new Set<string>();
+	let nextPane = 100;
+	fake.respond("pane split", (args) => {
+		const target = args[2] ?? "";
+		if (dead.has(target)) return failed("not_found", "pane not found");
+		nextPane += 1;
+		return ok({ result: { pane: { pane_id: `w1:p${nextPane}` }, type: "pane_info" } });
+	});
+	const { panes } = paneManagerOf(fake);
+	const first = await panes.acquire(cwd, "one");
+	dead.add(first.paneId);
+	const second = await panes.acquire(cwd, "two");
+	const callerSplits = splitCalls(fake.execCalls).filter((args) => args[2] === "w1:p1");
+	assert.equal(callerSplits.length, 2);
+	assert.equal(splitDirection(callerSplits[0]), "right");
+	assert.equal(splitDirection(callerSplits[1]), "down");
+	dead.add(second.paneId);
+	panes.discard(first.paneId);
+	panes.discard(second.paneId);
+	await assert.rejects(panes.acquire(cwd, "three"), /budget exhausted/);
+	assert.equal(splitCalls(fake.execCalls).filter((args) => args[2] === "w1:p1").length, 2);
+});
+
+test("when all agent run panes are gone the second caller split is down", async () => {
+	const fake = createFakeCli();
+	const dead = new Set<string>();
+	fake.respond("pane process-info", (args) => {
+		const paneId = args[args.indexOf("--pane") + 1] ?? "";
+		if (dead.has(paneId)) return failed("not_found");
+		return idleShell();
+	});
+	fake.respond("agent start", (args) => {
+		const paneFlag = args.indexOf("--pane");
+		const paneId = paneFlag >= 0 ? args[paneFlag + 1] : "w1:p2";
+		return ok({ result: { agent: { pane_id: paneId }, type: "agent_started" } });
+	});
+	const registry = herdrRegistry(fake);
+	const first = await registry.start({
+		kind: "agent",
+		command: "codex",
+		cwd,
+		label: "builder",
+		prompt: "Work.",
+		closeOnSettle: false,
+	});
+	fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+	if (first.record.paneId) dead.add(first.record.paneId);
+
+	const second = await registry.start({
+		kind: "agent",
+		command: "codex",
+		cwd,
+		label: "checker",
+		prompt: "Work.",
+		closeOnSettle: false,
+	});
+	const callerSplits = splitCalls(fake.execCalls).filter((args) => args[2] === "w1:p1");
+	assert.equal(callerSplits.length, 2);
+	assert.equal(splitDirection(callerSplits[0]), "right");
+	assert.equal(splitDirection(callerSplits[1]), "down");
+	fake.waiters
+		.filter((waiter) => waiter.args.includes("working"))
+		.forEach((waiter) => waiter.resolveWith(ok({})));
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+	fake.waiters
+		.filter((waiter) => waiter.args.includes("done"))
+		.forEach((waiter) => waiter.resolveWith(ok({})));
+	await Promise.all([first.completion, second.completion]);
+});
+
+test("agent launches fail clearly once the caller budget is spent and no run pane remains", async () => {
+	const fake = createFakeCli();
+	const dead = new Set<string>();
+	fake.respond("pane process-info", (args) => {
+		const paneId = args[args.indexOf("--pane") + 1] ?? "";
+		if (dead.has(paneId)) return failed("not_found");
+		return idleShell();
+	});
+	fake.respond("agent start", (args) => {
+		const paneFlag = args.indexOf("--pane");
+		const paneId = paneFlag >= 0 ? args[paneFlag + 1] : "w1:p2";
+		return ok({ result: { agent: { pane_id: paneId }, type: "agent_started" } });
+	});
+	const registry = herdrRegistry(fake);
+	const first = await registry.start({
+		kind: "agent",
+		command: "codex",
+		cwd,
+		label: "builder",
+		prompt: "Work.",
+		closeOnSettle: false,
+	});
+	fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+	if (first.record.paneId) dead.add(first.record.paneId);
+
+	const second = await registry.start({
+		kind: "agent",
+		command: "codex",
+		cwd,
+		label: "checker",
+		prompt: "Work.",
+		closeOnSettle: false,
+	});
+	fake.waiters
+		.filter((waiter) => waiter.args.includes("working"))
+		.at(-1)
+		?.resolveWith(ok({}));
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+	if (second.record.paneId) dead.add(second.record.paneId);
+
+	await assert.rejects(
+		registry.start({
+			kind: "agent",
+			command: "codex",
+			cwd,
+			label: "verifier",
+			prompt: "Work.",
+			closeOnSettle: false,
+		}),
+		/budget exhausted/,
+	);
+	assert.equal(splitCalls(fake.execCalls).filter((args) => args[2] === "w1:p1").length, 2);
+	fake.waiters
+		.filter((waiter) => waiter.args.includes("done"))
+		.forEach((waiter) => waiter.resolveWith(ok({})));
+	await Promise.all([first.completion, second.completion]);
 });

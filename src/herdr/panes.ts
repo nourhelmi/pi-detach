@@ -5,8 +5,15 @@
  * and the next run reuses it instead of splitting again, so fan-outs don't
  * shred the layout. Reuse is verified against process-info first — if the
  * user started typing or launched something in the pane, it is quietly
- * dropped from the pool. Splits stack: the first run splits the caller pane
- * (right when wide, down when tall), later ones split the newest run pane.
+ * dropped from the pool. Pooled reuse does not consume the caller-split budget.
+ *
+ * Layout: the caller (advisor) pane is split at most twice. The first caller
+ * split is always `--direction right` so the advisor keeps the left half. The
+ * second is `--direction down` and only happens when no created run pane can
+ * be the stack target, leaving the advisor at a quarter. After that the caller
+ * is never split again — further helpers stack off surviving run panes with
+ * the wide/tall heuristic. If nothing remains to stack on, the split fails
+ * rather than carving the advisor a third time.
  */
 
 import { findString, type HerdrCli } from "./cli.ts";
@@ -16,6 +23,9 @@ const SHELL_NAMES = new Set(["zsh", "bash", "fish", "sh", "dash", "nu", "pwsh"])
 
 /** Wide panes split right, tall panes down; terminal cells are ~2x taller than wide. */
 const WIDE_RATIO = 2.5;
+
+/** Persistent cap on splits of the caller pane; never decrements as panes close. */
+export const CALLER_SPLIT_CAP = 2;
 
 export interface AcquiredPane {
 	paneId: string;
@@ -37,6 +47,10 @@ interface ProcessEntry {
 	name?: string;
 	argv0?: string;
 }
+
+export type SplitWithCallerBudgetResult =
+	| { ok: true; paneId: string; consumedCallerSplit: boolean }
+	| { ok: false; budgetExhausted: boolean; errorMessage: string };
 
 export function isIdleShell(json: unknown): boolean {
 	const info = json as {
@@ -63,42 +77,92 @@ export async function splitDirectionFor(cli: HerdrCli, targetPane: string): Prom
 	return "right";
 }
 
+/** Fixed directions for the two budgeted caller splits; stacking never uses this. */
+export function callerSplitDirection(callerSplitsUsed: number): "right" | "down" {
+	return callerSplitsUsed === 0 ? "right" : "down";
+}
+
+async function execSplit(
+	cli: HerdrCli,
+	target: string,
+	direction: "right" | "down",
+	cwd: string,
+): Promise<{ ok: true; paneId: string } | { ok: false; errorMessage: string }> {
+	const result = await cli.exec([
+		"pane",
+		"split",
+		target,
+		"--direction",
+		direction,
+		"--cwd",
+		cwd,
+		"--no-focus",
+	]);
+	if (!result.ok) {
+		return { ok: false, errorMessage: result.errorMessage ?? (result.stderr.trim() || "pane split refused") };
+	}
+	const paneId = findString(result.json, "pane_id");
+	if (!paneId) return { ok: false, errorMessage: "herdr did not report a pane id" };
+	return { ok: true, paneId };
+}
+
+/**
+ * Pick a split target under the caller-split budget.
+ *
+ * Prefer surviving created panes (newest first, wide/tall heuristic). Only
+ * if those all fail — or none exist — spend a caller split (right, then down).
+ * A failed stack target does not skip the remaining created panes and jump
+ * straight to the caller; the caller is last resort and never a third time.
+ */
+export async function splitWithCallerBudget(
+	cli: HerdrCli,
+	cwd: string,
+	params: {
+		stackTargets: readonly string[];
+		callerPaneId: string;
+		callerSplitsUsed: number;
+	},
+): Promise<SplitWithCallerBudgetResult> {
+	let lastError = "pane split refused";
+	const stackTargets = params.stackTargets.filter((id) => id !== params.callerPaneId);
+
+	for (const target of stackTargets) {
+		const direction = await splitDirectionFor(cli, target);
+		const attempt = await execSplit(cli, target, direction, cwd);
+		if (attempt.ok) return { ok: true, paneId: attempt.paneId, consumedCallerSplit: false };
+		lastError = attempt.errorMessage;
+	}
+
+	if (params.callerSplitsUsed >= CALLER_SPLIT_CAP) {
+		return {
+			ok: false,
+			budgetExhausted: true,
+			errorMessage: "caller pane split budget exhausted and no run pane remains to stack on",
+		};
+	}
+
+	const direction = callerSplitDirection(params.callerSplitsUsed);
+	const attempt = await execSplit(cli, params.callerPaneId, direction, cwd);
+	if (attempt.ok) return { ok: true, paneId: attempt.paneId, consumedCallerSplit: true };
+	return { ok: false, budgetExhausted: false, errorMessage: attempt.errorMessage || lastError };
+}
+
 export function createPaneManager(cli: HerdrCli, ctx: HerdrContext): PaneManager {
 	const createdPanes: string[] = [];
 	const idle: string[] = [];
+	let callerSplits = 0;
 
-	async function split(cwd: string): Promise<string | undefined> {
-		// Stack new panes off the newest run pane so the caller keeps its space.
-		const target = createdPanes[0] ?? ctx.paneId;
-		const direction = await splitDirectionFor(cli, target);
-		const result = await cli.exec([
-			"pane",
-			"split",
-			target,
-			"--direction",
-			direction,
-			"--cwd",
-			cwd,
-			"--no-focus",
-		]);
-		if (!result.ok) {
-			if (target !== ctx.paneId) {
-				// The stack target may have been closed by the user; retry off the caller.
-				const retry = await cli.exec([
-					"pane",
-					"split",
-					ctx.paneId,
-					"--direction",
-					await splitDirectionFor(cli, ctx.paneId),
-					"--cwd",
-					cwd,
-					"--no-focus",
-				]);
-				if (retry.ok) return findString(retry.json, "pane_id");
-			}
-			return undefined;
+	async function split(cwd: string): Promise<string> {
+		const outcome = await splitWithCallerBudget(cli, cwd, {
+			stackTargets: createdPanes,
+			callerPaneId: ctx.paneId,
+			callerSplitsUsed: callerSplits,
+		});
+		if (!outcome.ok) {
+			throw new Error(`herdr pane split failed: ${outcome.errorMessage}`);
 		}
-		return findString(result.json, "pane_id");
+		if (outcome.consumedCallerSplit) callerSplits += 1;
+		return outcome.paneId;
 	}
 
 	// The shell needs a beat to print its prompt after the sentinel matches,
@@ -141,7 +205,6 @@ export function createPaneManager(cli: HerdrCli, ctx: HerdrContext): PaneManager
 				return { paneId: chosen, reused: true };
 			}
 			const paneId = await split(cwd);
-			if (!paneId) throw new Error("herdr pane split failed");
 			createdPanes.unshift(paneId);
 			this.rename(paneId, label);
 			return { paneId, reused: false };
