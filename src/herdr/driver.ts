@@ -16,6 +16,7 @@
 
 import { type CliResult, findString, type HerdrCli, type Waiter } from "./cli.ts";
 import { type HerdrContext, toastsEnabled } from "./context.ts";
+import type { AgentPaneLedger } from "./ledger.ts";
 import { isIdleShell, type PaneManager, splitDirectionFor } from "./panes.ts";
 import { exitMatchPattern, extractRunOutput, parseExitCode, wrapRunCommand } from "./sentinel.ts";
 import type {
@@ -45,6 +46,10 @@ export interface HerdrDriverDeps {
 	ctx: HerdrContext;
 	panes: PaneManager;
 	env?: Record<string, string | undefined>;
+	/** Current session's agent-pane ledger; omitted in tests that do not cover orphans. */
+	ledger?: AgentPaneLedger;
+	/** Cheap orphan sweep before a new agent launch. */
+	reapOrphans?: () => Promise<void>;
 }
 
 function tokenize(input: string): string[] {
@@ -73,7 +78,7 @@ function isUnavailableShell(result: CliResult): boolean {
 }
 
 export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
-	const { cli, ctx, panes } = deps;
+	const { cli, ctx, panes, ledger, reapOrphans } = deps;
 	const toasts = toastsEnabled(deps.env ?? process.env);
 
 	// Layout policy: the caller (advisor) pane is split directly at most
@@ -379,6 +384,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 	): Promise<DriverHandle> {
 		const { record } = controller;
 		if (!options.prompt) throw new Error("agent runs require a prompt");
+		await reapOrphans?.();
 
 		let paneId: string;
 		let name: string;
@@ -400,6 +406,14 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		if (!paneId) throw new Error("herdr did not report a pane id for the agent");
 		record.paneId = paneId;
 		record.agentName = name;
+		// Track before the prompt so a later session death can still reap this pane.
+		ledger?.track({
+			paneId,
+			agentName: name,
+			runId: record.id,
+			label: record.label,
+			closeOnSettle: Boolean(options.closeOnSettle),
+		});
 
 		// herdr 0.8 `agent prompt` submits text + Enter atomically under the
 		// pane's live bracketed-paste mode, so no multiline Enter retry is needed.
@@ -426,6 +440,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 				// The transcript is already captured and the Pi session remains persisted;
 				// close successful graph nodes so they never crowd the advisor layout.
 				void cli.exec(["pane", "close", paneId]);
+				ledger?.forget(paneId);
 			}
 			if (record.promoted && !outcome.killed) {
 				if (state === "blocked") {

@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import type { CliResult, HerdrCli, Waiter } from "../src/herdr/cli.ts";
 import { createHerdrDriver } from "../src/herdr/driver.ts";
+import { createSessionLedger } from "../src/herdr/ledger.ts";
 import { createPaneManager } from "../src/herdr/panes.ts";
 import { startMarker } from "../src/herdr/sentinel.ts";
 import { createViewerManager } from "../src/herdr/viewer.ts";
@@ -122,7 +125,10 @@ function createFakeCli(): {
 	};
 }
 
-function herdrRegistry(fake: ReturnType<typeof createFakeCli>) {
+function herdrRegistry(
+	fake: ReturnType<typeof createFakeCli>,
+	extras: { ledger?: ReturnType<typeof createSessionLedger> } = {},
+) {
 	const ctx = { paneId: "w1:p1", tabId: "w1:t7", workspaceId: "w1" };
 	const panes = createPaneManager(fake.cli, ctx);
 	const driver = createHerdrDriver({
@@ -130,6 +136,7 @@ function herdrRegistry(fake: ReturnType<typeof createFakeCli>) {
 		ctx,
 		panes,
 		env: { PI_DETACH_HERDR_TOAST: "0" },
+		...(extras.ledger ? { ledger: extras.ledger } : {}),
 	});
 	const viewer = createViewerManager(fake.cli, panes);
 	return createRegistry({ herdrDriver: driver, onPromoted: viewer.attach });
@@ -617,4 +624,39 @@ test("parallel agent starts preserve the advisor split cap", async () => {
 		.filter((waiter) => waiter.args.includes("done"))
 		.forEach((waiter) => waiter.resolveWith(ok({ event: "pane.agent_status_changed" })));
 	await Promise.all(launches.map(({ completion }) => completion));
+});
+
+test("an agent launch writes a ledger record and drops it when the driver closes the pane", async () => {
+	const fake = createFakeCli();
+	fake.respond("agent start", () =>
+		ok({ result: { agent: { pane_id: "w1:p7" }, type: "agent_started" } }),
+	);
+	fake.respond("pane read", () => ok(undefined, "review done"));
+	const ledger = createSessionLedger({
+		ledgerDir: mkdtempSync(join(tmpdir(), "pi-detach-ledger-")),
+		sessionId: "sess-live",
+		ownerPid: 4242,
+	});
+	const registry = herdrRegistry(fake, { ledger });
+	const { record, completion } = await registry.start({
+		kind: "agent",
+		command: "codex",
+		cwd,
+		label: "reviewer",
+		prompt: "Review.",
+		closeOnSettle: true,
+	});
+	const tracked = ledger.read().records;
+	assert.equal(tracked.length, 1);
+	assert.equal(tracked[0]?.paneId, "w1:p7");
+	assert.equal(tracked[0]?.agentName, record.agentName);
+	assert.equal(tracked[0]?.runId, record.id);
+	assert.equal(tracked[0]?.closeOnSettle, true);
+	assert.equal(tracked[0]?.ownerPid, 4242);
+
+	fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+	fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+	await completion;
+	assert.equal(ledger.read().records.length, 0, "driver forgets the record when it closes the pane");
 });

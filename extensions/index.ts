@@ -8,8 +8,10 @@
  *
  * When pi itself is running inside a herdr pane (HERDR_ENV=1), watches and
  * agents are hosted in visible herdr panes, and a bg_run that gets promoted
- * to the background is given a live viewer pane. Quick foreground commands
- * never touch the layout; outside herdr everything uses the local
+ * to the background is given a live viewer pane. Agent panes are also written
+ * to a per-session ledger so a later live session can reap orphans after this
+ * process dies or `/reload` drops closeOnSettle waiters. Quick foreground
+ * commands never touch the layout; outside herdr everything uses the local
  * detached-process backend, exactly as before.
  */
 
@@ -17,7 +19,13 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { createHerdrCli } from "../src/herdr/cli.ts";
 import { detectHerdrContext } from "../src/herdr/context.ts";
 import { createHerdrDriver } from "../src/herdr/driver.ts";
+import {
+	createSessionLedger,
+	DEFAULT_LEDGER_DIR,
+	resolveOwningSessionId,
+} from "../src/herdr/ledger.ts";
 import { createPaneManager } from "../src/herdr/panes.ts";
+import { isProcessAlive, reapOrphanAgentPanes } from "../src/herdr/reaper.ts";
 import { createViewerManager } from "../src/herdr/viewer.ts";
 import { createNotifier } from "../src/notify.ts";
 import { createRegistry } from "../src/registry.ts";
@@ -42,13 +50,38 @@ export default function registerDetachExtension(pi: ExtensionAPI): void {
 	}
 
 	const herdrCtx = detectHerdrContext();
+	const herdrCli = herdrCtx ? createHerdrCli() : undefined;
+	const ledger = herdrCtx
+		? createSessionLedger({
+				ledgerDir: DEFAULT_LEDGER_DIR,
+				sessionId: resolveOwningSessionId(),
+				ownerPid: process.pid,
+			})
+		: undefined;
+	const reapOrphans =
+		herdrCli && ledger
+			? (): Promise<void> =>
+					reapOrphanAgentPanes({
+						cli: herdrCli,
+						ledgerDir: ledger.dir,
+						currentSessionId: ledger.sessionId,
+						isPidAlive: isProcessAlive,
+					})
+			: undefined;
 	let herdrDriver: ReturnType<typeof createHerdrDriver> | undefined;
 	let viewer: ReturnType<typeof createViewerManager> | undefined;
-	if (herdrCtx) {
-		const cli = createHerdrCli();
-		const panes = createPaneManager(cli, herdrCtx);
-		herdrDriver = createHerdrDriver({ cli, ctx: herdrCtx, panes });
-		viewer = createViewerManager(cli, panes);
+	if (herdrCtx && herdrCli && ledger && reapOrphans) {
+		const panes = createPaneManager(herdrCli, herdrCtx);
+		// Activation sweep: other sessions' dead owners + our leftover closeOnSettle.
+		void reapOrphans();
+		herdrDriver = createHerdrDriver({
+			cli: herdrCli,
+			ctx: herdrCtx,
+			panes,
+			ledger,
+			reapOrphans,
+		});
+		viewer = createViewerManager(herdrCli, panes);
 	}
 
 	const registry = createRegistry({
@@ -71,7 +104,12 @@ export default function registerDetachExtension(pi: ExtensionAPI): void {
 	const track = (_event: unknown, ctx: ExtensionContext): void => {
 		currentCtx = ctx;
 	};
-	pi.on("session_start", track);
+	pi.on("session_start", (_event, ctx) => {
+		currentCtx = ctx;
+		const sessionId = ctx.sessionManager?.getSessionId();
+		if (ledger && sessionId) ledger.rebindSession(sessionId);
+		void reapOrphans?.();
+	});
 	pi.on("agent_start", track);
 	pi.on("agent_end", track);
 	pi.on("agent_settled", track);

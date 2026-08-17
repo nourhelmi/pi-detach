@@ -217,6 +217,13 @@ back at its prompt and settles the run as killed.
   remain visible. Successful agent panes normally close on settlement;
   `keepAlive` agents, blocked agents, and failed agents remain yours to inspect
   or close. Local `bg_run` processes die with the parent session as before.
+- Agent panes are recorded in `~/.pi/detach/ledgers/<PI_SESSION_ID>.json` (one
+  file per Pi session). After a session dies, another live Herdr session reaps
+  settled orphans (`idle`/`done`) — including `keepAlive` panes, whose follow-up
+  owner is gone. Working, blocked, and unknown agents are left alone. A live
+  session never closes another live session's panes, and never closes a pane
+  that is not in a ledger. After `/reload` in the same process, leftover
+  `closeOnSettle` records in this session's file are finished when they settle.
 - `bg_output` on a running watch or agent reads its pane live; local runs read
   their streamed log at `~/.pi/detach/runs/<runId>/output.log`. Pane
   scrollback limits apply to very chatty watch commands.
