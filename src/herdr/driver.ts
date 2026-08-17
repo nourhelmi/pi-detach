@@ -17,7 +17,7 @@
 import { type CliResult, findString, type HerdrCli, type Waiter } from "./cli.ts";
 import { type HerdrContext, toastsEnabled } from "./context.ts";
 import type { AgentPaneLedger } from "./ledger.ts";
-import { isIdleShell, type PaneManager, splitWithCallerBudget } from "./panes.ts";
+import { isIdleShell, type PaneManager } from "./panes.ts";
 import { isSettledOccupantOf, occupantFrom } from "./reaper.ts";
 import { exitMatchPattern, extractRunOutput, parseExitCode, wrapRunCommand } from "./sentinel.ts";
 import type {
@@ -78,14 +78,13 @@ function isUnavailableShell(result: CliResult): boolean {
 }
 
 export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
-	const { cli, ctx, panes, ledger, reapOrphans } = deps;
+	const { cli, panes, ledger, reapOrphans } = deps;
 	const toasts = toastsEnabled(deps.env ?? process.env);
 
-	// Layout policy lives in splitWithCallerBudget: caller is split at most
-	// twice (right, then down-only-if-no-run-pane). Count is persistent —
-	// closed worker panes do not refund a caller split.
+	// Layout policy lives on the pane manager's caller-split coordinator.
+	// This stack is agent-only (not the idle pool); the shared coordinator
+	// owns the max-two caller budget and surviving-target view.
 	const agentPaneStack: string[] = [];
-	let callerSplits = 0;
 
 	// Fan-out launches execute concurrently. Serialize pane allocation so the
 	// advisor split cap is observed before another launch chooses its split base.
@@ -99,7 +98,10 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 	async function pruneAgentPanes(): Promise<void> {
 		for (let index = agentPaneStack.length - 1; index >= 0; index--) {
 			const paneId = agentPaneStack[index];
-			if (paneId && !(await paneAlive(paneId))) agentPaneStack.splice(index, 1);
+			if (paneId && !(await paneAlive(paneId))) {
+				agentPaneStack.splice(index, 1);
+				panes.forgetTarget(paneId);
+			}
 		}
 	}
 
@@ -135,16 +137,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		const kind = (argv[0] ?? "").split("/").pop() ?? "";
 		if (!kind) throw new Error("agent command is empty");
 		const agentArgs = argv.slice(1);
-		const split = await splitWithCallerBudget(cli, cwd, {
-			stackTargets: agentPaneStack,
-			callerPaneId: ctx.paneId,
-			callerSplitsUsed: callerSplits,
-		});
-		if (!split.ok) {
-			throw new Error(`herdr pane split failed: ${split.errorMessage}`);
-		}
-		if (split.consumedCallerSplit) callerSplits += 1;
-		const workerPane = split.paneId;
+		const workerPane = await panes.splitOff(cwd, agentPaneStack);
 		// Shell startup can briefly report one foreground zsh before later init
 		// jobs run. process-info is therefore only a cheap gate; Herdr's own
 		// `agent start` precondition is authoritative. Retry only its exact
@@ -166,6 +159,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		if (!started?.ok) {
 			// Do not leak the split pane when the start is refused.
 			void cli.exec(["pane", "close", workerPane]);
+			panes.forgetTarget(workerPane);
 			const detail = started?.errorMessage ?? started?.stderr.trim() ?? "shell readiness timed out";
 			throw new Error(`herdr agent start failed: ${detail}`);
 		}

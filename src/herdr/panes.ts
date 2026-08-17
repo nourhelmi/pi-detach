@@ -14,6 +14,11 @@
  * is never split again — further helpers stack off surviving run panes with
  * the wide/tall heuristic. If nothing remains to stack on, the split fails
  * rather than carving the advisor a third time.
+ *
+ * One coordinator per manager owns that budget and the surviving created-pane
+ * list. The driver allocates through the same coordinator so mixed
+ * watch/viewer/agent fan-out cannot recarve the caller. Allocations are
+ * serialized; the idle pool and the agent stack stay separate.
  */
 
 import { findString, type HerdrCli } from "./cli.ts";
@@ -41,6 +46,14 @@ export interface PaneManager {
 	rename(paneId: string, label: string): void;
 	/** Panes created by this manager, newest first. */
 	created(): string[];
+	/**
+	 * Allocate under the shared caller-split budget. `preferredStack` is tried
+	 * first (agent panes stay off the idle pool); other surviving created panes
+	 * are fallback targets so mixed allocators share one max-two caller cap.
+	 */
+	splitOff(cwd: string, preferredStack: readonly string[]): Promise<string>;
+	/** Drop a pane from the shared surviving-target view (agent close/fail). */
+	forgetTarget(paneId: string): void;
 }
 
 interface ProcessEntry {
@@ -147,23 +160,79 @@ export async function splitWithCallerBudget(
 	return { ok: false, budgetExhausted: false, errorMessage: attempt.errorMessage || lastError };
 }
 
-export function createPaneManager(cli: HerdrCli, ctx: HerdrContext): PaneManager {
-	const createdPanes: string[] = [];
-	const idle: string[] = [];
-	let callerSplits = 0;
+/** Preferred stack first, then other surviving created panes, de-duped. */
+function stackTargetsFor(
+	preferredStack: readonly string[],
+	surviving: readonly string[],
+	callerPaneId: string,
+): string[] {
+	const seen = new Set<string>([callerPaneId]);
+	const targets: string[] = [];
+	for (const id of [...preferredStack, ...surviving]) {
+		if (seen.has(id)) continue;
+		seen.add(id);
+		targets.push(id);
+	}
+	return targets;
+}
 
-	async function split(cwd: string): Promise<string> {
+/**
+ * Shared caller-split budget + surviving-target view for every allocator
+ * of this `ctx.paneId`. The mutex covers the full split bookkeeping so a
+ * concurrent acquire cannot both observe 0 and both split `--direction right`.
+ */
+function createCallerSplitCoordinator(cli: HerdrCli, callerPaneId: string) {
+	const surviving: string[] = [];
+	let callerSplits = 0;
+	let tail = Promise.resolve();
+
+	async function exclusive<T>(work: () => Promise<T>): Promise<T> {
+		const predecessor = tail;
+		let release!: () => void;
+		tail = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		await predecessor;
+		try {
+			return await work();
+		} finally {
+			release();
+		}
+	}
+
+	function forget(paneId: string): void {
+		const index = surviving.indexOf(paneId);
+		if (index >= 0) surviving.splice(index, 1);
+	}
+
+	async function splitUnlocked(cwd: string, preferredStack: readonly string[]): Promise<string> {
 		const outcome = await splitWithCallerBudget(cli, cwd, {
-			stackTargets: createdPanes,
-			callerPaneId: ctx.paneId,
+			stackTargets: stackTargetsFor(preferredStack, surviving, callerPaneId),
+			callerPaneId,
 			callerSplitsUsed: callerSplits,
 		});
 		if (!outcome.ok) {
 			throw new Error(`herdr pane split failed: ${outcome.errorMessage}`);
 		}
 		if (outcome.consumedCallerSplit) callerSplits += 1;
+		// Publish before the mutex releases so the next allocator stacks here.
+		surviving.unshift(outcome.paneId);
 		return outcome.paneId;
 	}
+
+	return {
+		exclusive,
+		forget,
+		splitUnlocked,
+		split: (cwd: string, preferredStack: readonly string[]) =>
+			exclusive(() => splitUnlocked(cwd, preferredStack)),
+	};
+}
+
+export function createPaneManager(cli: HerdrCli, ctx: HerdrContext): PaneManager {
+	const createdPanes: string[] = [];
+	const idle: string[] = [];
+	const coordinator = createCallerSplitCoordinator(cli, ctx.paneId);
 
 	// The shell needs a beat to print its prompt after the sentinel matches,
 	// so a just-released pane can look busy for a few hundred ms.
@@ -179,35 +248,47 @@ export function createPaneManager(cli: HerdrCli, ctx: HerdrContext): PaneManager
 
 	return {
 		async acquire(cwd, label) {
-			const candidates = idle.splice(0, idle.length);
-			const stillIdle: string[] = [];
-			let chosen: string | undefined;
-			for (const candidate of candidates) {
+			// Full acquire is serialized so pool checks and splits share one budget.
+			return coordinator.exclusive(async () => {
+				const candidates = idle.splice(0, idle.length);
+				const stillIdle: string[] = [];
+				let chosen: string | undefined;
+				for (const candidate of candidates) {
+					if (chosen) {
+						stillIdle.push(candidate);
+						continue;
+					}
+					const state = await reusability(candidate);
+					if (state === "reuse") {
+						chosen = candidate;
+					} else if (state === "busy") {
+						// The user may have taken it, or it is still settling; keep it
+						// pooled — the process-info gate protects the next attempt.
+						stillIdle.push(candidate);
+					} else {
+						const index = createdPanes.indexOf(candidate);
+						if (index >= 0) createdPanes.splice(index, 1);
+						coordinator.forget(candidate);
+					}
+				}
+				idle.push(...stillIdle);
 				if (chosen) {
-					stillIdle.push(candidate);
-					continue;
+					this.rename(chosen, label);
+					return { paneId: chosen, reused: true };
 				}
-				const state = await reusability(candidate);
-				if (state === "reuse") {
-					chosen = candidate;
-				} else if (state === "busy") {
-					// The user may have taken it, or it is still settling; keep it
-					// pooled — the process-info gate protects the next attempt.
-					stillIdle.push(candidate);
-				} else {
-					const index = createdPanes.indexOf(candidate);
-					if (index >= 0) createdPanes.splice(index, 1);
-				}
-			}
-			idle.push(...stillIdle);
-			if (chosen) {
-				this.rename(chosen, label);
-				return { paneId: chosen, reused: true };
-			}
-			const paneId = await split(cwd);
-			createdPanes.unshift(paneId);
-			this.rename(paneId, label);
-			return { paneId, reused: false };
+				const paneId = await coordinator.splitUnlocked(cwd, createdPanes);
+				createdPanes.unshift(paneId);
+				this.rename(paneId, label);
+				return { paneId, reused: false };
+			});
+		},
+
+		splitOff(cwd, preferredStack) {
+			return coordinator.split(cwd, preferredStack);
+		},
+
+		forgetTarget(paneId) {
+			coordinator.forget(paneId);
 		},
 
 		release(paneId) {
@@ -219,6 +300,7 @@ export function createPaneManager(cli: HerdrCli, ctx: HerdrContext): PaneManager
 			if (index >= 0) createdPanes.splice(index, 1);
 			const idleIndex = idle.indexOf(paneId);
 			if (idleIndex >= 0) idle.splice(idleIndex, 1);
+			coordinator.forget(paneId);
 		},
 
 		rename(paneId, label) {

@@ -42,11 +42,11 @@ function createFakeCli(): {
 	cli: HerdrCli;
 	execCalls: string[][];
 	waiters: FakeWaiter[];
-	respond: (prefix: string, handler: (args: string[]) => CliResult) => void;
+	respond: (prefix: string, handler: (args: string[]) => CliResult | Promise<CliResult>) => void;
 } {
 	const execCalls: string[][] = [];
 	const waiters: FakeWaiter[] = [];
-	const routes: { prefix: string; handler: (args: string[]) => CliResult }[] = [];
+	const routes: { prefix: string; handler: (args: string[]) => CliResult | Promise<CliResult> }[] = [];
 	let paneCounter = 1;
 
 	const defaults: typeof routes = [
@@ -1056,4 +1056,171 @@ test("agent launches fail clearly once the caller budget is spent and no run pan
 		.filter((waiter) => waiter.args.includes("done"))
 		.forEach((waiter) => waiter.resolveWith(ok({})));
 	await Promise.all([first.completion, second.completion]);
+});
+
+test("mixed pane-manager and driver allocation share one caller-split budget", async () => {
+	const startAgent = (fake: ReturnType<typeof createFakeCli>) => {
+		fake.respond("agent start", (args) => {
+			const paneFlag = args.indexOf("--pane");
+			const paneId = paneFlag >= 0 ? args[paneFlag + 1] : "w1:p9";
+			return ok({ result: { agent: { pane_id: paneId }, type: "agent_started" } });
+		});
+	};
+	const wired = (fake: ReturnType<typeof createFakeCli>) => {
+		const ctx = { paneId: "w1:p1", tabId: "w1:t7", workspaceId: "w1" };
+		const panes = createPaneManager(fake.cli, ctx);
+		const driver = createHerdrDriver({
+			cli: fake.cli,
+			ctx,
+			panes,
+			env: { PI_DETACH_HERDR_TOAST: "0" },
+		});
+		return { panes, registry: createRegistry({ herdrDriver: driver }) };
+	};
+
+	const sharing = createFakeCli();
+	startAgent(sharing);
+	const shared = wired(sharing);
+	const watch = await shared.panes.acquire(cwd, "watch");
+	const stackedAgent = await shared.registry.start({
+		kind: "agent",
+		command: "codex",
+		cwd,
+		label: "builder",
+		prompt: "Work.",
+		closeOnSettle: false,
+	});
+	const sharedCaller = splitCalls(sharing.execCalls).filter((args) => args[2] === "w1:p1");
+	assert.equal(sharedCaller.length, 1, "agent stacks on the watch pane instead of recarving the caller");
+	assert.equal(splitDirection(sharedCaller[0]), "right");
+	assert.ok(
+		splitCalls(sharing.execCalls).some((args) => args[2] === watch.paneId),
+		"driver used the pane-manager's surviving target",
+	);
+	sharing.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+	sharing.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+	await stackedAgent.completion;
+
+	const budget = createFakeCli();
+	startAgent(budget);
+	const spent = wired(budget);
+	const first = await spent.panes.acquire(cwd, "watch");
+	spent.panes.discard(first.paneId);
+	const agent = await spent.registry.start({
+		kind: "agent",
+		command: "codex",
+		cwd,
+		label: "builder",
+		prompt: "Work.",
+		closeOnSettle: false,
+	});
+	const callerSplits = splitCalls(budget.execCalls).filter((args) => args[2] === "w1:p1");
+	assert.equal(callerSplits.length, 2, "mixed allocators share one max-two budget");
+	assert.equal(splitDirection(callerSplits[0]), "right");
+	assert.equal(splitDirection(callerSplits[1]), "down");
+	if (agent.record.paneId) spent.panes.forgetTarget(agent.record.paneId);
+	await assert.rejects(spent.panes.acquire(cwd, "three"), /budget exhausted/);
+	assert.equal(splitCalls(budget.execCalls).filter((args) => args[2] === "w1:p1").length, 2);
+	budget.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+	budget.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+	await agent.completion;
+
+	const mixed = createFakeCli();
+	let nextPane = 1;
+	mixed.respond("pane split", () => {
+		nextPane += 1;
+		const paneId = `w1:p${nextPane}`;
+		return new Promise<CliResult>((resolve) => {
+			setTimeout(
+				() => resolve(ok({ result: { pane: { pane_id: paneId }, type: "pane_info" } })),
+				25,
+			);
+		});
+	});
+	startAgent(mixed);
+	const concurrent = wired(mixed);
+	const agentLaunch = concurrent.registry.start({
+		kind: "agent",
+		command: "codex",
+		cwd,
+		label: "builder",
+		prompt: "Work.",
+		closeOnSettle: false,
+	});
+	await Promise.all([
+		concurrent.panes.acquire(cwd, "watch-a"),
+		agentLaunch,
+		concurrent.panes.acquire(cwd, "watch-b"),
+	]);
+	const mixedCaller = splitCalls(mixed.execCalls).filter((args) => args[2] === "w1:p1");
+	assert.ok(mixedCaller.length <= 2, "concurrent mixed fan-out cannot exceed two caller splits");
+	assert.equal(
+		mixedCaller.filter((args) => splitDirection(args) === "right").length,
+		1,
+		"mixed fan-out still only splits the caller right once",
+	);
+	mixed.waiters
+		.filter((waiter) => waiter.args.includes("working"))
+		.forEach((waiter) => waiter.resolveWith(ok({})));
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+	mixed.waiters
+		.filter((waiter) => waiter.args.includes("done"))
+		.forEach((waiter) => waiter.resolveWith(ok({})));
+	await (await agentLaunch).completion;
+});
+
+test("concurrent pane-manager acquires never issue two right splits of the caller", async () => {
+	const fake = createFakeCli();
+	let nextPane = 1;
+	fake.respond("pane split", () => {
+		nextPane += 1;
+		const paneId = `w1:p${nextPane}`;
+		return new Promise<CliResult>((resolve) => {
+			setTimeout(
+				() => resolve(ok({ result: { pane: { pane_id: paneId }, type: "pane_info" } })),
+				25,
+			);
+		});
+	});
+	const { panes } = paneManagerOf(fake);
+	const acquired = await Promise.all([
+		panes.acquire(cwd, "one"),
+		panes.acquire(cwd, "two"),
+		panes.acquire(cwd, "three"),
+	]);
+	assert.equal(new Set(acquired.map((pane) => pane.paneId)).size, 3);
+	const callerSplits = splitCalls(fake.execCalls).filter((args) => args[2] === "w1:p1");
+	assert.ok(callerSplits.length <= 2, "concurrent acquire cannot exceed the caller budget");
+	assert.equal(
+		callerSplits.filter((args) => splitDirection(args) === "right").length,
+		1,
+		"only the first caller split is right",
+	);
+	assert.equal(splitCalls(fake.execCalls)[1]?.[2], acquired[0]?.paneId);
+});
+
+test("tall worker panes stack down via splitDirectionFor", async () => {
+	const fake = createFakeCli();
+	fake.respond("pane layout", (args) => {
+		const paneId = args[args.indexOf("--pane") + 1] ?? "w1:p1";
+		const rect =
+			paneId === "w1:p1" ? { width: 120, height: 30 } : { width: 40, height: 80 };
+		return ok({
+			result: {
+				layout: {
+					panes: [{ pane_id: paneId, rect }],
+				},
+			},
+		});
+	});
+	const { panes } = paneManagerOf(fake);
+	const first = await panes.acquire(cwd, "wide-caller-split");
+	await panes.acquire(cwd, "tall-worker");
+	const splits = splitCalls(fake.execCalls);
+	assert.equal(splits[0]?.[2], "w1:p1");
+	assert.equal(splitDirection(splits[0]), "right");
+	assert.equal(splits[1]?.[2], first.paneId, "second helper stacks off the worker");
+	assert.equal(splitDirection(splits[1]), "down", "tall worker uses the down heuristic");
 });
