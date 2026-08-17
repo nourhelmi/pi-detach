@@ -36,7 +36,7 @@ const ADVISOR_SPLIT_CAP = 2;
 const AGENT_WORKING_TIMEOUT_MS = 20_000;
 // herdr 0.8 waits require an explicit --timeout; emulate the old indefinite wait.
 const WAIT_FOREVER_MS = 7 * 24 * 60 * 60 * 1000;
-const SHELL_READY_ATTEMPTS = 20;
+const SHELL_READY_ATTEMPTS = 120;
 const SHELL_READY_POLL_MS = 250;
 const READ_LINES = 400;
 
@@ -65,6 +65,11 @@ function agentName(label: string, id: string): string {
 			.replace(/^[^a-z]+/, "")
 			.replace(/-+$/, "") || "agent";
 	return `${slug.slice(0, 31 - id.length)}-${id}`;
+}
+
+function isUnavailableShell(result: CliResult): boolean {
+	const detail = `${result.errorMessage ?? ""}\n${result.stderr}`.toLowerCase();
+	return detail.includes("not an available shell");
 }
 
 export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
@@ -121,21 +126,29 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		if (!workerPane) {
 			throw new Error(`herdr pane split failed: ${split.errorMessage ?? split.stderr.trim()}`);
 		}
-		// A just-split pane's shell may not be ready; herdr refuses `agent start`
-		// with "not an available shell" until it is.
+		// Shell startup can briefly report one foreground zsh before later init
+		// jobs run. process-info is therefore only a cheap gate; Herdr's own
+		// `agent start` precondition is authoritative. Retry only its exact
+		// unavailable-shell refusal, on the same pane, until startup settles.
+		let started: CliResult | undefined;
 		for (let attempt = 0; attempt < SHELL_READY_ATTEMPTS; attempt++) {
 			const info = await cli.exec(["pane", "process-info", "--pane", workerPane]);
-			if (info.ok && isIdleShell(info.json)) break;
-			await new Promise((resolvePromise) => setTimeout(resolvePromise, SHELL_READY_POLL_MS));
+			if (info.ok && isIdleShell(info.json)) {
+				started = await cli.exec(
+					["agent", "start", name, "--kind", kind, "--pane", workerPane, "--", ...agentArgs],
+					{ timeoutMs: AGENT_START_TIMEOUT_MS },
+				);
+				if (started.ok || !isUnavailableShell(started)) break;
+			}
+			if (attempt + 1 < SHELL_READY_ATTEMPTS) {
+				await new Promise((resolvePromise) => setTimeout(resolvePromise, SHELL_READY_POLL_MS));
+			}
 		}
-		const started = await cli.exec(
-			["agent", "start", name, "--kind", kind, "--pane", workerPane, "--", ...agentArgs],
-			{ timeoutMs: AGENT_START_TIMEOUT_MS },
-		);
-		if (!started.ok) {
+		if (!started?.ok) {
 			// Do not leak the split pane when the start is refused.
 			void cli.exec(["pane", "close", workerPane]);
-			throw new Error(`herdr agent start failed: ${started.errorMessage ?? started.stderr.trim()}`);
+			const detail = started?.errorMessage ?? started?.stderr.trim() ?? "shell readiness timed out";
+			throw new Error(`herdr agent start failed: ${detail}`);
 		}
 		const pane = findString(started.json, "pane_id") ?? workerPane;
 		// The pre-split pane carries no label; restore the old auto-labeled UX.

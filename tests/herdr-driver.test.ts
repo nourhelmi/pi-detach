@@ -355,6 +355,63 @@ test("an agent run settles when its status wait fires", async () => {
 	assert.equal(blocked?.killedByDriver, true, "loser waits are cancelled");
 });
 
+test("agent start retries Herdr's transient unavailable-shell refusal", async () => {
+	const fake = createFakeCli();
+	let starts = 0;
+	fake.respond("agent start", () => {
+		starts += 1;
+		if (starts < 3) {
+			return failed(
+				"invalid_state",
+				"agent target pane w1:p2 is not an available shell",
+			);
+		}
+		return ok({ result: { agent: { pane_id: "w1:p2" }, type: "agent_started" } });
+	});
+	const registry = herdrRegistry(fake);
+	const { record, completion } = await registry.start({
+		kind: "agent",
+		command: "pi",
+		cwd,
+		prompt: "Verify retry behavior.",
+	});
+	assert.equal(starts, 3, "the same pre-split pane is retried until Herdr accepts it");
+	assert.equal(record.paneId, "w1:p2");
+	assert.equal(
+		fake.execCalls.filter((args) => args[0] === "pane" && args[1] === "split").length,
+		1,
+		"retry does not create replacement panes",
+	);
+	assert.ok(
+		!fake.execCalls.some((args) => args[0] === "pane" && args[1] === "close"),
+		"a transient refusal does not discard the pane",
+	);
+	fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+	await new Promise((complete) => setTimeout(complete, 20));
+	fake.waiters.find((waiter) => waiter.args.includes("idle"))?.resolveWith(ok({}));
+	const finished = await completion;
+	assert.equal(finished.agentState, "idle");
+});
+
+test("agent start does not retry non-readiness failures", async () => {
+	const fake = createFakeCli();
+	let starts = 0;
+	fake.respond("agent start", () => {
+		starts += 1;
+		return failed("invalid_argument", "unknown agent kind");
+	});
+	const registry = herdrRegistry(fake);
+	await assert.rejects(
+		registry.start({ kind: "agent", command: "pi", cwd, prompt: "Do not launch." }),
+		/unknown agent kind/,
+	);
+	assert.equal(starts, 1);
+	assert.ok(
+		fake.execCalls.some((args) => args[0] === "pane" && args[1] === "close"),
+		"a permanent failure cleans up its split pane",
+	);
+});
+
 test("a multiline Pi prompt is submitted atomically via agent prompt", async () => {
 	const fake = createFakeCli();
 	fake.respond("agent start", () =>
