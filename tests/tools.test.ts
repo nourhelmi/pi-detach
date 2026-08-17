@@ -14,6 +14,7 @@ import type {
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import registerDetachExtension from "../extensions/index.ts";
+import { agentLabel } from "../src/tools/bg-agent.ts";
 
 type AnyTool = ToolDefinition<any, any, any>;
 
@@ -77,6 +78,30 @@ test("registers the full toolset", () => {
 		["bg_agent", "bg_list", "bg_output", "bg_run", "bg_stop", "bg_watch"],
 	);
 	shutdown();
+});
+
+test("bg_agent labels compose a role with a provided purpose", () => {
+	assert.equal(
+		agentLabel({ role: "builder", label: "adaptive dock", prompt: "Implement it" }),
+		"builder · adaptive dock",
+	);
+	assert.equal(
+		agentLabel({ role: "builder", label: "builder · adaptive dock", prompt: "Implement it" }),
+		"builder · adaptive dock",
+	);
+});
+
+test("bg_agent fallback labels use concise meaningful prompt words", () => {
+	const label = agentLabel({
+		role: "sidecar",
+		prompt: "Please investigate the phone bridge synchronization failure immediately",
+	});
+	assert.equal(label, "sidecar · investigate phone");
+	assert(label.length <= 32);
+	assert.equal(
+		agentLabel({ agent: "codex --model x", prompt: "Review the API changes" }),
+		"codex · Review API changes",
+	);
 });
 
 test("bg_run returns inline when the command finishes in time", async () => {

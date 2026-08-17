@@ -32,7 +32,7 @@ export function createViewerManager(cli: HerdrCli, panes: PaneManager): ViewerMa
 				if (record.status !== "running" || record.paneId) return;
 				let paneId: string;
 				try {
-					const acquired = await panes.acquire(record.cwd, `▶ ${record.label} · ${record.id}`);
+					const acquired = await panes.acquire(record.cwd, `▶ ${record.label}`);
 					paneId = acquired.paneId;
 					const ran = await cli.exec([
 						"pane",
@@ -52,7 +52,7 @@ export function createViewerManager(cli: HerdrCli, panes: PaneManager): ViewerMa
 				await cli.exec(["pane", "send-keys", paneId, "ctrl+c"]);
 				const failed = finished.status === "exited" && finished.exitCode !== 0;
 				if (failed) {
-					panes.rename(paneId, `✗ ${record.label} · ${record.id}`);
+					panes.rename(paneId, `✗ ${record.label}`);
 					panes.release(paneId);
 				} else {
 					// Success or deliberate stop: the surface disappears with the task.

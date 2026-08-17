@@ -143,11 +143,35 @@ function workingDirectory(requested: string | undefined, current: string): strin
 	return isAbsolute(requested) ? requested : resolve(current, requested);
 }
 
-function agentLabel(params: BgAgentParams): string {
-	if (params.label) return params.label;
+export function agentLabel(params: BgAgentParams): string {
+	const role = params.role?.trim().split(/\s+/)[0];
+	if (params.label) {
+		const label = params.label.trim().replace(/\s+/g, " ");
+		const escapedRole = role?.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		if (!escapedRole || new RegExp(`^${escapedRole}(?:$|[\\s·:—-])`, "i").test(label)) {
+			return label;
+		}
+		return `${role} · ${label}`;
+	}
 	if (params.name) return params.name;
-	const target = params.role ?? params.agent ?? "pi";
-	return `${target.split(/\s+/)[0]}: ${params.prompt.slice(0, 32)}`;
+
+	const command = params.agent?.trim().split(/\s+/)[0];
+	const target = role ?? command?.split("/").pop() ?? "pi";
+	const meaningful = (params.prompt.match(/[A-Za-z0-9][A-Za-z0-9'-]*/g) ?? []).filter(
+		(word) =>
+			!["a", "an", "and", "for", "in", "of", "on", "or", "please", "that", "the", "this", "to", "with", "you"].includes(
+				word.toLowerCase(),
+			),
+	);
+	const prefix = `${target} ·`;
+	const words: string[] = [];
+	for (const word of meaningful) {
+		if (words.length >= 4) break;
+		const candidate = `${prefix} ${[...words, word].join(" ")}`;
+		if (candidate.length > 32) break;
+		words.push(word);
+	}
+	return `${prefix} ${words.join(" ") || "task"}`;
 }
 
 async function prepareLaunch(params: BgAgentParams, label: string): Promise<ResolvedAgentLaunch> {

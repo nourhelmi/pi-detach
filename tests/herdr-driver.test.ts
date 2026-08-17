@@ -210,6 +210,10 @@ test("a promoted run gets a viewer pane that closes itself on success", async ()
 	const tailRun = fake.execCalls.find((args) => args[0] === "pane" && args[1] === "run");
 	assert.match(tailRun?.[3] ?? "", /tail -n \+1 -f/);
 	assert.match(tailRun?.[3] ?? "", new RegExp(record.id));
+	const runningLabel = fake.execCalls.find(
+		(args) => args[0] === "pane" && args[1] === "rename" && args[3] === "▶ slow build",
+	);
+	assert.ok(runningLabel, "viewer pane label omits run-id noise");
 
 	await completion;
 	await new Promise((r) => setTimeout(r, 600));
@@ -236,6 +240,7 @@ test("a promoted run that fails keeps its viewer pane for inspection", async () 
 	assert.equal(record.paneId, "w1:p2");
 	const rename = fake.execCalls.filter((args) => args[0] === "pane" && args[1] === "rename").at(-1);
 	assert.match(rename?.[3] ?? "", /^✗ failing tests/);
+	assert.doesNotMatch(rename?.[3] ?? "", new RegExp(record.id));
 });
 
 test("a run promoted after finishing gets no viewer pane", async () => {

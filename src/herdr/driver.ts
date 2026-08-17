@@ -211,7 +211,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		controller: RunController,
 	): Promise<DriverHandle> {
 		const { record } = controller;
-		const paneLabel = `▶ ${record.label} · ${record.id}`;
+		const paneLabel = `▶ ${record.label}`;
 		const { paneId, reused } = await panes.acquire(options.cwd, paneLabel);
 		record.paneId = paneId;
 
@@ -265,7 +265,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 				panes.discard(paneId);
 			} else {
 				const ok = !outcome.killed && outcome.exitCode === 0;
-				panes.rename(paneId, `${ok ? "✓" : "✗"} ${record.label} · ${record.id}`);
+				panes.rename(paneId, `${ok ? "✓" : "✗"} ${record.label}`);
 				panes.release(paneId);
 			}
 			if (record.promoted && !outcome.killed) {
