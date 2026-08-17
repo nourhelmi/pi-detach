@@ -8,6 +8,9 @@
  *
  * Session key: `PI_SESSION_ID` when the process has it, otherwise the id from
  * `sessionManager.getSessionId()` after session_start, otherwise `pid-<pid>`.
+ *
+ * Files and records are strictly validated. Invalid JSON, files, or records
+ * are skipped — never coerced — so a malformed occupant cannot be closed.
  */
 
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
@@ -63,16 +66,72 @@ export function ledgerFilePath(ledgerDir: string, sessionId: string): string {
 	return join(ledgerDir, `${safe}.json`);
 }
 
+function isPositiveInt(value: unknown): value is number {
+	return typeof value === "number" && Number.isInteger(value) && value > 0;
+}
+
+function isNonEmptyString(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Strict record schema — extra keys are ignored, missing/wrong types reject. */
+export function parseLedgerRecord(value: unknown): AgentPaneLedgerRecord | undefined {
+	if (!isRecord(value)) return undefined;
+	if (!isNonEmptyString(value.paneId)) return undefined;
+	if (!isNonEmptyString(value.agentName)) return undefined;
+	if (typeof value.runId !== "string") return undefined;
+	if (typeof value.label !== "string") return undefined;
+	if (typeof value.closeOnSettle !== "boolean") return undefined;
+	if (!isPositiveInt(value.ownerPid)) return undefined;
+	if (typeof value.createdAt !== "number" || !Number.isFinite(value.createdAt) || value.createdAt < 0) {
+		return undefined;
+	}
+	return {
+		paneId: value.paneId,
+		agentName: value.agentName,
+		runId: value.runId,
+		label: value.label,
+		closeOnSettle: value.closeOnSettle,
+		ownerPid: value.ownerPid,
+		createdAt: value.createdAt,
+	};
+}
+
+function parseLedgerFile(value: unknown): SessionLedgerFile | undefined {
+	if (!isRecord(value)) return undefined;
+	if (!isNonEmptyString(value.sessionId)) return undefined;
+	if (!isPositiveInt(value.ownerPid)) return undefined;
+	if (!Array.isArray(value.records)) return undefined;
+	const records: AgentPaneLedgerRecord[] = [];
+	for (const entry of value.records) {
+		const parsed = parseLedgerRecord(entry);
+		if (parsed) records.push(parsed);
+	}
+	return { sessionId: value.sessionId, ownerPid: value.ownerPid, records };
+}
+
 export function readLedgerFile(path: string): SessionLedgerFile | undefined {
 	try {
-		const parsed = JSON.parse(readFileSync(path, "utf8")) as SessionLedgerFile;
-		if (!parsed || typeof parsed.sessionId !== "string" || !Array.isArray(parsed.records)) {
-			return undefined;
-		}
-		return parsed;
+		return parseLedgerFile(JSON.parse(readFileSync(path, "utf8")));
 	} catch {
 		return undefined;
 	}
+}
+
+/** Destination records win on paneId collision so a reload cannot clobber them. */
+export function mergeLedgerRecords(
+	destination: AgentPaneLedgerRecord[],
+	incoming: AgentPaneLedgerRecord[],
+): AgentPaneLedgerRecord[] {
+	const byPane = new Map(destination.map((record) => [record.paneId, record]));
+	for (const record of incoming) {
+		if (!byPane.has(record.paneId)) byPane.set(record.paneId, record);
+	}
+	return [...byPane.values()];
 }
 
 /** Atomic replace, or unlink when the session file has no remaining records. */
@@ -137,13 +196,17 @@ export function createSessionLedger(deps: SessionLedgerDeps): AgentPaneLedger {
 		rebindSession(nextId) {
 			const trimmed = nextId.trim();
 			if (!trimmed || trimmed === sessionId) return;
-			const previous = load();
 			const oldPath = pathFor(sessionId);
+			const destPath = pathFor(trimmed);
+			const fallback = load();
+			const destination = readLedgerFile(destPath);
 			sessionId = trimmed;
-			previous.sessionId = sessionId;
-			previous.ownerPid = ownerPid;
-			persist(previous);
-			if (oldPath !== pathFor(sessionId)) {
+			persist({
+				sessionId,
+				ownerPid,
+				records: mergeLedgerRecords(destination?.records ?? [], fallback.records),
+			});
+			if (oldPath !== destPath) {
 				try {
 					unlinkSync(oldPath);
 				} catch {

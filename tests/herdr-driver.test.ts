@@ -127,7 +127,10 @@ function createFakeCli(): {
 
 function herdrRegistry(
 	fake: ReturnType<typeof createFakeCli>,
-	extras: { ledger?: ReturnType<typeof createSessionLedger> } = {},
+	extras: {
+		ledger?: ReturnType<typeof createSessionLedger>;
+		reapOrphans?: () => Promise<void>;
+	} = {},
 ) {
 	const ctx = { paneId: "w1:p1", tabId: "w1:t7", workspaceId: "w1" };
 	const panes = createPaneManager(fake.cli, ctx);
@@ -137,9 +140,14 @@ function herdrRegistry(
 		panes,
 		env: { PI_DETACH_HERDR_TOAST: "0" },
 		...(extras.ledger ? { ledger: extras.ledger } : {}),
+		...(extras.reapOrphans ? { reapOrphans: extras.reapOrphans } : {}),
 	});
 	const viewer = createViewerManager(fake.cli, panes);
 	return createRegistry({ herdrDriver: driver, onPromoted: viewer.attach });
+}
+
+function flushAsync(): Promise<void> {
+	return new Promise((resolve) => setImmediate(resolve));
 }
 
 function waitOutcome(id: string, exitCode: number, body: string): CliResult {
@@ -658,5 +666,63 @@ test("an agent launch writes a ledger record and drops it when the driver closes
 	await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
 	fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
 	await completion;
+	await flushAsync();
 	assert.equal(ledger.read().records.length, 0, "driver forgets the record when it closes the pane");
+});
+
+test("a failed pane close retains the ledger record", async () => {
+	const fake = createFakeCli();
+	fake.respond("agent start", () =>
+		ok({ result: { agent: { pane_id: "w1:p7" }, type: "agent_started" } }),
+	);
+	fake.respond("pane read", () => ok(undefined, "review done"));
+	fake.respond("pane close", () => failed("unavailable", "herdr restart"));
+	const ledger = createSessionLedger({
+		ledgerDir: mkdtempSync(join(tmpdir(), "pi-detach-ledger-")),
+		sessionId: "sess-live",
+		ownerPid: 4242,
+	});
+	const registry = herdrRegistry(fake, { ledger });
+	const { completion } = await registry.start({
+		kind: "agent",
+		command: "codex",
+		cwd,
+		label: "reviewer",
+		prompt: "Review.",
+		closeOnSettle: true,
+	});
+	fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+	fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+	await completion;
+	await flushAsync();
+	assert.equal(ledger.read().records.length, 1, "forget waits for a successful close");
+});
+
+test("pre-launch orphan sweep does not delay agent start", async () => {
+	const fake = createFakeCli();
+	fake.respond("agent start", () =>
+		ok({ result: { agent: { pane_id: "w1:p7" }, type: "agent_started" } }),
+	);
+	fake.respond("pane read", () => ok(undefined, "ok"));
+	let sweepStarted = false;
+	const reapOrphans = (): Promise<void> => {
+		sweepStarted = true;
+		return new Promise(() => {
+			// Never resolves — an unavailable server must not stall the launch.
+		});
+	};
+	const registry = herdrRegistry(fake, { reapOrphans });
+	const { completion } = await registry.start({
+		kind: "agent",
+		command: "codex",
+		cwd,
+		prompt: "Go.",
+		closeOnSettle: false,
+	});
+	assert.equal(sweepStarted, true);
+	fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+	fake.waiters.find((waiter) => waiter.args.includes("idle"))?.resolveWith(ok({}));
+	await completion;
 });

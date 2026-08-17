@@ -3,7 +3,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -14,7 +14,12 @@ import {
 	type AgentPaneLedgerRecord,
 	type SessionLedgerFile,
 } from "../src/herdr/ledger.ts";
-import { reapOrphanAgentPanes } from "../src/herdr/reaper.ts";
+import {
+	createSafeReap,
+	isProcessAlive,
+	MIN_RECORD_AGE_MS,
+	reapOrphanAgentPanes,
+} from "../src/herdr/reaper.ts";
 
 const ok = (json: unknown, stdout = ""): CliResult => ({
 	ok: true,
@@ -83,8 +88,30 @@ function seed(
 	writeFileSync(ledgerFilePath(dir, sessionId), `${JSON.stringify(file, null, "\t")}\n`);
 }
 
-function agentInfo(paneId: string, name: string, agent_status: string): CliResult {
-	return ok({ result: { agent: { pane_id: paneId, name, agent_status }, type: "agent_info" } });
+function agentInfo(
+	paneId: string,
+	name: string,
+	agent_status: string,
+	state_change_seq = 1,
+): CliResult {
+	return ok({
+		result: {
+			agent: { pane_id: paneId, name, agent_status, state_change_seq },
+			type: "agent_info",
+		},
+	});
+}
+
+function leftover(dir: string, sessionId: string): AgentPaneLedgerRecord[] {
+	return createSessionLedger({ ledgerDir: dir, sessionId, ownerPid: 1 }).read().records;
+}
+
+function paneGets(execCalls: string[][]): string[] {
+	return execCalls.filter((args) => args[0] === "agent" && args[1] === "get").map((args) => args[2] ?? "");
+}
+
+function closedPanes(execCalls: string[][]): string[] {
+	return execCalls.filter((args) => args[0] === "pane" && args[1] === "close").map((args) => args[2] ?? "");
 }
 
 test("dead-PID + settled closes the pane and drops the record", async () => {
@@ -103,10 +130,9 @@ test("dead-PID + settled closes the pane and drops the record", async () => {
 		isPidAlive: (pid) => pid !== 999001,
 	});
 
-	assert.ok(
-		fake.execCalls.some((args) => args[0] === "pane" && args[1] === "close" && args[2] === "w4:p9"),
-	);
-	assert.equal(createSessionLedger({ ledgerDir: dir, sessionId: "dead-sess", ownerPid: 1 }).read().records.length, 0);
+	assert.deepEqual(paneGets(fake.execCalls), ["w4:p9", "w4:p9"]);
+	assert.deepEqual(closedPanes(fake.execCalls), ["w4:p9"]);
+	assert.equal(leftover(dir, "dead-sess").length, 0);
 });
 
 test("dead-PID + keepAlive settled is also reaped — follow-up owner is gone", async () => {
@@ -125,8 +151,8 @@ test("dead-PID + keepAlive settled is also reaped — follow-up owner is gone", 
 		isPidAlive: () => false,
 	});
 
-	assert.ok(fake.execCalls.some((args) => args[0] === "pane" && args[1] === "close" && args[2] === "w4:p3"));
-	assert.equal(createSessionLedger({ ledgerDir: dir, sessionId: "dead-sess", ownerPid: 1 }).read().records.length, 0);
+	assert.deepEqual(closedPanes(fake.execCalls), ["w4:p3"]);
+	assert.equal(leftover(dir, "dead-sess").length, 0);
 });
 
 test("dead-PID + working or blocked leaves the pane and the record", async () => {
@@ -137,9 +163,7 @@ test("dead-PID + working or blocked leaves the pane and the record", async () =>
 	]);
 	const fake = createFakeCli();
 	fake.respond("agent get", (args) => {
-		if (args.includes("working-agent") || args.includes("w4:p1")) {
-			return agentInfo("w4:p1", "working-agent", "working");
-		}
+		if (args.includes("w4:p1")) return agentInfo("w4:p1", "working-agent", "working");
 		return agentInfo("w4:p2", "blocked-agent", "blocked");
 	});
 
@@ -150,9 +174,8 @@ test("dead-PID + working or blocked leaves the pane and the record", async () =>
 		isPidAlive: () => false,
 	});
 
-	assert.ok(!fake.execCalls.some((args) => args[0] === "pane" && args[1] === "close"));
-	const leftover = createSessionLedger({ ledgerDir: dir, sessionId: "dead-sess", ownerPid: 1 }).read();
-	assert.equal(leftover.records.length, 2);
+	assert.equal(closedPanes(fake.execCalls).length, 0);
+	assert.equal(leftover(dir, "dead-sess").length, 2);
 });
 
 test("alive-PID records are never reaped even when the agent is settled", async () => {
@@ -170,12 +193,9 @@ test("alive-PID records are never reaped even when the agent is settled", async 
 		isPidAlive: (pid) => pid === 777,
 	});
 
-	assert.ok(!fake.execCalls.some((args) => args[0] === "pane" && args[1] === "close"));
-	assert.ok(!fake.execCalls.some((args) => args[0] === "agent" && args[1] === "get"));
-	assert.equal(
-		createSessionLedger({ ledgerDir: dir, sessionId: "other-live", ownerPid: 777 }).read().records.length,
-		1,
-	);
+	assert.equal(closedPanes(fake.execCalls).length, 0);
+	assert.equal(paneGets(fake.execCalls).length, 0);
+	assert.equal(leftover(dir, "other-live").length, 1);
 });
 
 test("a missing pane or agent drops the record without a close", async () => {
@@ -191,8 +211,9 @@ test("a missing pane or agent drops the record without a close", async () => {
 		isPidAlive: () => false,
 	});
 
-	assert.ok(!fake.execCalls.some((args) => args[0] === "pane" && args[1] === "close"));
-	assert.equal(createSessionLedger({ ledgerDir: dir, sessionId: "dead-sess", ownerPid: 1 }).read().records.length, 0);
+	assert.deepEqual(paneGets(fake.execCalls), ["w4:pGone"]);
+	assert.equal(closedPanes(fake.execCalls).length, 0);
+	assert.equal(leftover(dir, "dead-sess").length, 0);
 });
 
 test("concurrent sessions are isolated — own file is not foreign-reaped", async () => {
@@ -205,9 +226,7 @@ test("concurrent sessions are isolated — own file is not foreign-reaped", asyn
 	]);
 	const fake = createFakeCli();
 	fake.respond("agent get", (args) => {
-		if (args.includes("own-keep") || args.includes("w1:pOwn")) {
-			return agentInfo("w1:pOwn", "own-keep", "idle");
-		}
+		if (args.includes("w1:pOwn")) return agentInfo("w1:pOwn", "own-keep", "idle");
 		return agentInfo("w4:pX", "orphan-idle", "idle");
 	});
 	fake.respond("pane close", () => ok({ result: { type: "ok" } }));
@@ -219,10 +238,9 @@ test("concurrent sessions are isolated — own file is not foreign-reaped", asyn
 		isPidAlive: (pid) => pid === 111,
 	});
 
-	assert.ok(fake.execCalls.some((args) => args[0] === "pane" && args[1] === "close" && args[2] === "w4:pX"));
-	assert.ok(!fake.execCalls.some((args) => args[0] === "pane" && args[1] === "close" && args[2] === "w1:pOwn"));
-	assert.equal(createSessionLedger({ ledgerDir: dir, sessionId: "live-sess", ownerPid: 111 }).read().records.length, 1);
-	assert.equal(createSessionLedger({ ledgerDir: dir, sessionId: "dead-sess", ownerPid: 1 }).read().records.length, 0);
+	assert.deepEqual(closedPanes(fake.execCalls), ["w4:pX"]);
+	assert.equal(leftover(dir, "live-sess").length, 1);
+	assert.equal(leftover(dir, "dead-sess").length, 0);
 });
 
 test("own leftover closeOnSettle records are finished after a same-process reload", async () => {
@@ -241,10 +259,8 @@ test("own leftover closeOnSettle records are finished after a same-process reloa
 		isPidAlive: () => true,
 	});
 
-	assert.ok(
-		fake.execCalls.some((args) => args[0] === "pane" && args[1] === "close" && args[2] === "w4:pReload"),
-	);
-	assert.equal(createSessionLedger({ ledgerDir: dir, sessionId: "live-sess", ownerPid: 111 }).read().records.length, 0);
+	assert.deepEqual(closedPanes(fake.execCalls), ["w4:pReload"]);
+	assert.equal(leftover(dir, "live-sess").length, 0);
 });
 
 test("a pane that is not in any ledger is never closed", async () => {
@@ -261,4 +277,246 @@ test("a pane that is not in any ledger is never closed", async () => {
 	});
 
 	assert.equal(fake.execCalls.length, 0);
+});
+
+test("unknown status is left untouched", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-detach-reaper-"));
+	seed(dir, "dead-sess", 999010, [{ paneId: "w4:pU", agentName: "mystery" }]);
+	const fake = createFakeCli();
+	fake.respond("agent get", () => agentInfo("w4:pU", "mystery", "unknown"));
+
+	await reapOrphanAgentPanes({
+		cli: fake.cli,
+		ledgerDir: dir,
+		currentSessionId: "live-sess",
+		isPidAlive: () => false,
+	});
+
+	assert.equal(closedPanes(fake.execCalls).length, 0);
+	assert.equal(leftover(dir, "dead-sess").length, 1);
+});
+
+test("transient agent-get failure preserves the record", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-detach-reaper-"));
+	seed(dir, "dead-sess", 999011, [{ paneId: "w4:pT", agentName: "timeout-agent" }]);
+	const fake = createFakeCli();
+	fake.respond("agent get", () => failed("timeout", "herdr server unavailable"));
+
+	await reapOrphanAgentPanes({
+		cli: fake.cli,
+		ledgerDir: dir,
+		currentSessionId: "live-sess",
+		isPidAlive: () => false,
+	});
+
+	assert.equal(closedPanes(fake.execCalls).length, 0);
+	assert.equal(leftover(dir, "dead-sess").length, 1);
+});
+
+test("agent-get exception preserves the record", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-detach-reaper-"));
+	seed(dir, "dead-sess", 999012, [{ paneId: "w4:pE", agentName: "throw-agent" }]);
+	const fake = createFakeCli();
+	fake.respond("agent get", () => {
+		throw new Error("ECONNREFUSED");
+	});
+
+	await reapOrphanAgentPanes({
+		cli: fake.cli,
+		ledgerDir: dir,
+		currentSessionId: "live-sess",
+		isPidAlive: () => false,
+	});
+
+	assert.equal(closedPanes(fake.execCalls).length, 0);
+	assert.equal(leftover(dir, "dead-sess").length, 1);
+});
+
+test("name-reuse / pane-mismatch is not closed", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-detach-reaper-"));
+	seed(dir, "dead-sess", 999013, [{ paneId: "w4:p1", agentName: "n" }]);
+	const fake = createFakeCli();
+	fake.respond("agent get", (args) => {
+		const target = args[2];
+		if (target === "n") return agentInfo("w4:p2", "n", "idle");
+		return agentInfo("w4:p1", "replacement", "working");
+	});
+	fake.respond("pane close", () => ok({ result: { type: "ok" } }));
+
+	await reapOrphanAgentPanes({
+		cli: fake.cli,
+		ledgerDir: dir,
+		currentSessionId: "live-sess",
+		isPidAlive: () => false,
+	});
+
+	assert.deepEqual(paneGets(fake.execCalls), ["w4:p1"]);
+	assert.ok(!paneGets(fake.execCalls).includes("n"));
+	assert.equal(closedPanes(fake.execCalls).length, 0);
+	assert.equal(leftover(dir, "dead-sess").length, 1);
+});
+
+test("close-failure retains the record", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-detach-reaper-"));
+	seed(dir, "dead-sess", 999014, [{ paneId: "w4:pC", agentName: "closer" }]);
+	const fake = createFakeCli();
+	fake.respond("agent get", () => agentInfo("w4:pC", "closer", "idle"));
+	fake.respond("pane close", () => failed("unavailable", "socket reset"));
+
+	await reapOrphanAgentPanes({
+		cli: fake.cli,
+		ledgerDir: dir,
+		currentSessionId: "live-sess",
+		isPidAlive: () => false,
+	});
+
+	assert.deepEqual(closedPanes(fake.execCalls), ["w4:pC"]);
+	assert.equal(leftover(dir, "dead-sess").length, 1);
+});
+
+test("valid-but-malformed ledger records are skipped", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-detach-reaper-"));
+	const path = ledgerFilePath(dir, "dead-sess");
+	writeFileSync(
+		path,
+		`${JSON.stringify({
+			sessionId: "dead-sess",
+			ownerPid: 999015,
+			records: [
+				{ paneId: "w4:pBad", agentName: "coerced" },
+				{ paneId: 12, agentName: "typed-wrong", runId: "r", label: "x", closeOnSettle: true, ownerPid: 1, createdAt: 1 },
+			],
+		})}\n`,
+	);
+	const fake = createFakeCli();
+	fake.respond("agent get", () => agentInfo("w4:pBad", "coerced", "idle"));
+	fake.respond("pane close", () => ok({ result: { type: "ok" } }));
+
+	await reapOrphanAgentPanes({
+		cli: fake.cli,
+		ledgerDir: dir,
+		currentSessionId: "live-sess",
+		isPidAlive: () => false,
+	});
+
+	assert.equal(fake.execCalls.length, 0);
+	assert.ok(existsSync(path));
+	assert.match(readFileSync(path, "utf8"), /w4:pBad/);
+});
+
+test("truncated JSON ledger files are skipped", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-detach-reaper-"));
+	const path = ledgerFilePath(dir, "dead-sess");
+	writeFileSync(path, `{"sessionId":"dead-sess","records":[`);
+	const fake = createFakeCli();
+	fake.respond("pane close", () => ok({ result: { type: "ok" } }));
+
+	await reapOrphanAgentPanes({
+		cli: fake.cli,
+		ledgerDir: dir,
+		currentSessionId: "live-sess",
+		isPidAlive: () => false,
+	});
+
+	assert.equal(fake.execCalls.length, 0);
+	assert.ok(existsSync(path));
+});
+
+test("EPERM is treated as alive", () => {
+	const original = process.kill;
+	process.kill = ((pid: number) => {
+		assert.equal(pid, 4242);
+		const error = new Error("operation not permitted") as NodeJS.ErrnoException;
+		error.code = "EPERM";
+		throw error;
+	}) as typeof process.kill;
+	try {
+		assert.equal(isProcessAlive(4242), true);
+	} finally {
+		process.kill = original;
+	}
+});
+
+test("rebindSession preserves destination records including empty-fallback", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-detach-rebind-"));
+	const dest = createSessionLedger({ ledgerDir: dir, sessionId: "real-sess", ownerPid: 5 });
+	dest.track({
+		paneId: "w1:pKeep",
+		agentName: "kept",
+		runId: "run-keep",
+		label: "kept",
+		closeOnSettle: true,
+	});
+	writeFileSync(
+		ledgerFilePath(dir, "pid-9"),
+		`${JSON.stringify({ sessionId: "pid-9", ownerPid: 5, records: [] }, null, "\t")}\n`,
+	);
+	const fallback = createSessionLedger({ ledgerDir: dir, sessionId: "pid-9", ownerPid: 5 });
+	fallback.rebindSession("real-sess");
+	const records = fallback.read().records;
+	assert.equal(fallback.sessionId, "real-sess");
+	assert.equal(records.length, 1);
+	assert.equal(records[0]?.paneId, "w1:pKeep");
+	assert.ok(!existsSync(ledgerFilePath(dir, "pid-9")));
+});
+
+test("activation rejection is swallowed with a note", async () => {
+	const notes: string[] = [];
+	const original = console.error;
+	console.error = (...args: unknown[]) => {
+		notes.push(args.map(String).join(" "));
+	};
+	try {
+		const reap = createSafeReap(async () => {
+			throw new Error("rename failed");
+		});
+		await reap();
+		assert.match(notes.join("\n"), /orphan reap failed: rename failed/);
+	} finally {
+		console.error = original;
+	}
+});
+
+test("seq-changed abort before close", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-detach-reaper-"));
+	seed(dir, "dead-sess", 999016, [{ paneId: "w4:pS", agentName: "seq-agent" }]);
+	const fake = createFakeCli();
+	let gets = 0;
+	fake.respond("agent get", () => {
+		gets += 1;
+		return agentInfo("w4:pS", "seq-agent", "idle", gets === 1 ? 1 : 2);
+	});
+	fake.respond("pane close", () => ok({ result: { type: "ok" } }));
+
+	await reapOrphanAgentPanes({
+		cli: fake.cli,
+		ledgerDir: dir,
+		currentSessionId: "live-sess",
+		isPidAlive: () => false,
+	});
+
+	assert.equal(gets, 2);
+	assert.equal(closedPanes(fake.execCalls).length, 0);
+	assert.equal(leftover(dir, "dead-sess").length, 1);
+});
+
+test("under-age record is left untouched", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-detach-reaper-"));
+	seed(dir, "dead-sess", 999017, [
+		{ paneId: "w4:pYoung", agentName: "young-agent", createdAt: 90_000 },
+	]);
+	const fake = createFakeCli();
+	fake.respond("agent get", () => agentInfo("w4:pYoung", "young-agent", "idle"));
+	fake.respond("pane close", () => ok({ result: { type: "ok" } }));
+
+	await reapOrphanAgentPanes({
+		cli: fake.cli,
+		ledgerDir: dir,
+		currentSessionId: "live-sess",
+		isPidAlive: () => false,
+		now: () => 90_000 + MIN_RECORD_AGE_MS - 1,
+	});
+
+	assert.equal(fake.execCalls.length, 0);
+	assert.equal(leftover(dir, "dead-sess").length, 1);
 });

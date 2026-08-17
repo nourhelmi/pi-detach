@@ -224,6 +224,14 @@ back at its prompt and settles the run as killed.
   session never closes another live session's panes, and never closes a pane
   that is not in a ledger. After `/reload` in the same process, leftover
   `closeOnSettle` records in this session's file are finished when they settle.
+  Identity is bound to the ledger pane ID (`agent get <paneId>`), never the
+  agent name — Herdr reuses names for new agents; pane IDs are never reused.
+  Records younger than 60s are ineligible. Immediately before `pane close` the
+  reaper re-reads the pane and aborts if pane, name, settled state, or
+  `state_change_seq` changed. A Herdr server-side conditional close (close only
+  if the same occupant generation is still `idle`/`done`) is the complete fix;
+  until that exists, a sub-millisecond residual race is accepted for settled
+  orphans of dead sessions.
 - `bg_output` on a running watch or agent reads its pane live; local runs read
   their streamed log at `~/.pi/detach/runs/<runId>/output.log`. Pane
   scrollback limits apply to very chatty watch commands.

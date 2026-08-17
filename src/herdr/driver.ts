@@ -48,7 +48,7 @@ export interface HerdrDriverDeps {
 	env?: Record<string, string | undefined>;
 	/** Current session's agent-pane ledger; omitted in tests that do not cover orphans. */
 	ledger?: AgentPaneLedger;
-	/** Cheap orphan sweep before a new agent launch. */
+	/** Cheap orphan sweep kicked off before a new agent launch (must not block). */
 	reapOrphans?: () => Promise<void>;
 }
 
@@ -384,7 +384,8 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 	): Promise<DriverHandle> {
 		const { record } = controller;
 		if (!options.prompt) throw new Error("agent runs require a prompt");
-		await reapOrphans?.();
+		// Fire-and-forget: a hung/unavailable Herdr must not serially delay launches.
+		void reapOrphans?.();
 
 		let paneId: string;
 		let name: string;
@@ -437,10 +438,17 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			if (finalText?.trim()) controller.emitOutput(`${finalText}\n`);
 			const state = outcome.agentState ?? "unknown";
 			if (options.closeOnSettle && (state === "done" || state === "idle")) {
-				// The transcript is already captured and the Pi session remains persisted;
-				// close successful graph nodes so they never crowd the advisor layout.
-				void cli.exec(["pane", "close", paneId]);
-				ledger?.forget(paneId);
+				// Transcript is already captured. Sequence close → forget without
+				// blocking the settlement notification on the pane-close RPC.
+				void (async () => {
+					let closed: CliResult;
+					try {
+						closed = await cli.exec(["pane", "close", paneId]);
+					} catch {
+						return;
+					}
+					if (closed.ok || closed.errorCode === "not_found") ledger?.forget(paneId);
+				})();
 			}
 			if (record.promoted && !outcome.killed) {
 				if (state === "blocked") {

@@ -25,7 +25,7 @@ import {
 	resolveOwningSessionId,
 } from "../src/herdr/ledger.ts";
 import { createPaneManager } from "../src/herdr/panes.ts";
-import { isProcessAlive, reapOrphanAgentPanes } from "../src/herdr/reaper.ts";
+import { createSafeReap, isProcessAlive, reapOrphanAgentPanes } from "../src/herdr/reaper.ts";
 import { createViewerManager } from "../src/herdr/viewer.ts";
 import { createNotifier } from "../src/notify.ts";
 import { createRegistry } from "../src/registry.ts";
@@ -60,13 +60,14 @@ export default function registerDetachExtension(pi: ExtensionAPI): void {
 		: undefined;
 	const reapOrphans =
 		herdrCli && ledger
-			? (): Promise<void> =>
+			? createSafeReap(() =>
 					reapOrphanAgentPanes({
 						cli: herdrCli,
 						ledgerDir: ledger.dir,
 						currentSessionId: ledger.sessionId,
 						isPidAlive: isProcessAlive,
-					})
+					}),
+				)
 			: undefined;
 	let herdrDriver: ReturnType<typeof createHerdrDriver> | undefined;
 	let viewer: ReturnType<typeof createViewerManager> | undefined;

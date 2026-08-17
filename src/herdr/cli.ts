@@ -141,3 +141,15 @@ export function findString(value: unknown, key: string): string | undefined {
 	}
 	return undefined;
 }
+
+/** Depth-first search for a finite number property; never coerces strings. */
+export function findNumber(value: unknown, key: string): number | undefined {
+	if (value === null || typeof value !== "object") return undefined;
+	const record = value as Record<string, unknown>;
+	if (typeof record[key] === "number" && Number.isFinite(record[key])) return record[key];
+	for (const child of Object.values(record)) {
+		const found = findNumber(child, key);
+		if (found !== undefined) return found;
+	}
+	return undefined;
+}
