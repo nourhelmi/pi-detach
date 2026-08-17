@@ -146,11 +146,6 @@ async function decideRecord(
 	return confirmAndClose(cli, record, looked.occupant);
 }
 
-export function noteReapFailure(error: unknown): void {
-	const detail = error instanceof Error ? error.message : String(error);
-	console.error(`[pi-detach] orphan reap failed: ${detail}`);
-}
-
 /**
  * Deduped wrapper so concurrent activation/launch sweeps share one pass.
  * Failures are noted and swallowed — fire-and-forget call sites never reject.
@@ -159,11 +154,16 @@ export function createSafeReap(run: () => Promise<void>): () => Promise<void> {
 	let inflight: Promise<void> | undefined;
 	return () => {
 		if (inflight) return inflight;
-		inflight = run()
-			.catch(noteReapFailure)
-			.finally(() => {
+		inflight = (async () => {
+			try {
+				await run();
+			} catch (error) {
+				const detail = error instanceof Error ? error.message : String(error);
+				console.error(`[pi-detach] orphan reap failed: ${detail}`);
+			} finally {
 				inflight = undefined;
-			});
+			}
+		})();
 		return inflight;
 	};
 }

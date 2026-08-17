@@ -520,3 +520,91 @@ test("under-age record is left untouched", async () => {
 	assert.equal(fake.execCalls.length, 0);
 	assert.equal(leftover(dir, "dead-sess").length, 1);
 });
+
+test("a transient confirm agent-get failure preserves the record", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-detach-reaper-"));
+	seed(dir, "dead-sess", 999018, [{ paneId: "w4:pConfirm", agentName: "confirm-agent" }]);
+	const fake = createFakeCli();
+	let gets = 0;
+	fake.respond("agent get", () => {
+		gets += 1;
+		return gets === 1
+			? agentInfo("w4:pConfirm", "confirm-agent", "idle", 4)
+			: failed("timeout", "herdr server unavailable");
+	});
+	fake.respond("pane close", () => ok({ result: { type: "ok" } }));
+
+	await reapOrphanAgentPanes({
+		cli: fake.cli,
+		ledgerDir: dir,
+		currentSessionId: "live-sess",
+		isPidAlive: () => false,
+	});
+
+	assert.equal(gets, 2);
+	assert.equal(closedPanes(fake.execCalls).length, 0);
+	assert.equal(leftover(dir, "dead-sess").length, 1);
+});
+
+test("rebindSession merges both ledgers without duplicate pane records", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-detach-rebind-"));
+	const destination = createSessionLedger({ ledgerDir: dir, sessionId: "real-sess", ownerPid: 5 });
+	destination.track({
+		paneId: "w1:pDest",
+		agentName: "destination",
+		runId: "run-dest",
+		label: "destination",
+		closeOnSettle: true,
+	});
+	destination.track({
+		paneId: "w1:pShared",
+		agentName: "destination-wins",
+		runId: "run-dest-shared",
+		label: "destination shared",
+		closeOnSettle: true,
+	});
+	const fallback = createSessionLedger({ ledgerDir: dir, sessionId: "pid-9", ownerPid: 5 });
+	fallback.track({
+		paneId: "w1:pFallback",
+		agentName: "fallback",
+		runId: "run-fallback",
+		label: "fallback",
+		closeOnSettle: false,
+	});
+	fallback.track({
+		paneId: "w1:pShared",
+		agentName: "fallback-loses",
+		runId: "run-fallback-shared",
+		label: "fallback shared",
+		closeOnSettle: false,
+	});
+
+	fallback.rebindSession("real-sess");
+	const records = fallback.read().records;
+	assert.deepEqual(
+		records.map((record) => record.paneId).sort(),
+		["w1:pDest", "w1:pFallback", "w1:pShared"],
+	);
+	assert.equal(records.find((record) => record.paneId === "w1:pShared")?.agentName, "destination-wins");
+});
+
+test("concurrent safe-reap requests share one in-flight sweep", async () => {
+	let runs = 0;
+	let release: (() => void) | undefined;
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const reap = createSafeReap(() => {
+		runs += 1;
+		return gate;
+	});
+
+	const first = reap();
+	const second = reap();
+	assert.strictEqual(second, first);
+	assert.equal(runs, 1);
+	release?.();
+	await Promise.all([first, second]);
+	await reap();
+	assert.equal(runs, 2);
+});
