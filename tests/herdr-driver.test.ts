@@ -68,6 +68,19 @@ function createFakeCli(): {
 				return ok({ result: { pane: { pane_id: `w1:p${paneCounter}` }, type: "pane_info" } });
 			},
 		},
+		{
+			prefix: "tab create",
+			handler: () => {
+				paneCounter += 1;
+				return ok({
+					result: {
+						root_pane: { pane_id: `w1:p${paneCounter}` },
+						tab: { tab_id: "w1:t9" },
+						type: "tab_created",
+					},
+				});
+			},
+		},
 		{ prefix: "pane rename", handler: () => ok({ result: { type: "pane_info" } }) },
 		{ prefix: "pane run", handler: () => ok(undefined) },
 		{ prefix: "agent prompt", handler: () => ok({ result: { type: "agent_prompted" } }) },
@@ -878,7 +891,7 @@ test("pane manager: pooled reuse does not consume the caller-split budget", asyn
 	assert.equal(splitCalls(fake.execCalls).length, 1);
 });
 
-test("pane manager: second caller split is down when no run pane remains", async () => {
+test("pane manager: a closed caller child frees its slot — the resplit is right again", async () => {
 	const fake = createFakeCli();
 	const { panes } = paneManagerOf(fake);
 	const first = await panes.acquire(cwd, "one");
@@ -887,18 +900,57 @@ test("pane manager: second caller split is down when no run pane remains", async
 	const callerSplits = splitCalls(fake.execCalls).filter((args) => args[2] === "w1:p1");
 	assert.equal(callerSplits.length, 2);
 	assert.equal(splitDirection(callerSplits[0]), "right");
-	assert.equal(splitDirection(callerSplits[1]), "down");
+	assert.equal(splitDirection(callerSplits[1]), "right", "freed slot means the caller is whole again");
 });
 
-test("pane manager: budget exhausted with no run pane fails instead of a third caller split", async () => {
+test("pane manager: a second concurrent caller split goes down", async () => {
 	const fake = createFakeCli();
+	const dead = new Set<string>();
+	let nextPane = 100;
+	fake.respond("pane split", (args) => {
+		const target = args[2] ?? "";
+		if (dead.has(target)) return failed("not_found", "pane not found");
+		nextPane += 1;
+		return ok({ result: { pane: { pane_id: `w1:p${nextPane}` }, type: "pane_info" } });
+	});
 	const { panes } = paneManagerOf(fake);
 	const first = await panes.acquire(cwd, "one");
-	panes.discard(first.paneId);
+	dead.add(first.paneId);
+	await panes.acquire(cwd, "two");
+	const callerSplits = splitCalls(fake.execCalls).filter((args) => args[2] === "w1:p1");
+	assert.equal(callerSplits.length, 2);
+	assert.equal(splitDirection(callerSplits[0]), "right");
+	assert.equal(splitDirection(callerSplits[1]), "down", "both children live: second slot splits down");
+});
+
+test("pane manager: two live caller children with no usable stack target overflow to a new tab", async () => {
+	const fake = createFakeCli();
+	const dead = new Set<string>();
+	let nextPane = 100;
+	fake.respond("pane split", (args) => {
+		const target = args[2] ?? "";
+		if (dead.has(target)) return failed("not_found", "pane not found");
+		nextPane += 1;
+		return ok({ result: { pane: { pane_id: `w1:p${nextPane}` }, type: "pane_info" } });
+	});
+	const { panes } = paneManagerOf(fake);
+	const first = await panes.acquire(cwd, "one");
+	dead.add(first.paneId);
 	const second = await panes.acquire(cwd, "two");
-	panes.discard(second.paneId);
-	await assert.rejects(panes.acquire(cwd, "three"), /budget exhausted/);
+	dead.add(second.paneId);
+	// Both caller slots are live and neither child accepts a split: overflow.
+	const third = await panes.acquire(cwd, "three");
+	assert.equal(third.reused, false);
 	assert.equal(splitCalls(fake.execCalls).filter((args) => args[2] === "w1:p1").length, 2);
+	assert.ok(
+		fake.execCalls.some((args) => args[0] === "tab" && args[1] === "create"),
+		"overflow created a fresh tab instead of a third caller split",
+	);
+	// The overflow pane is a surviving target: the next helper stacks on it.
+	const fourth = await panes.acquire(cwd, "four");
+	assert.equal(fourth.reused, false);
+	assert.equal(splitCalls(fake.execCalls).at(-1)?.[2], third.paneId);
+	assert.equal(fake.execCalls.filter((args) => args[0] === "tab" && args[1] === "create").length, 1);
 });
 
 test("pane manager: failed stack target prefers other created panes before the caller", async () => {
@@ -926,7 +978,7 @@ test("pane manager: failed stack target prefers other created panes before the c
 	assert.equal(splits.at(-1)?.[2], first.paneId);
 });
 
-test("pane manager: failed stack-target retry off the caller consumes the budget", async () => {
+test("pane manager: failed stack-target retry off the caller takes a live slot; discards free it", async () => {
 	const fake = createFakeCli();
 	const dead = new Set<string>();
 	let nextPane = 100;
@@ -947,11 +999,18 @@ test("pane manager: failed stack-target retry off the caller consumes the budget
 	dead.add(second.paneId);
 	panes.discard(first.paneId);
 	panes.discard(second.paneId);
-	await assert.rejects(panes.acquire(cwd, "three"), /budget exhausted/);
-	assert.equal(splitCalls(fake.execCalls).filter((args) => args[2] === "w1:p1").length, 2);
+	const third = await panes.acquire(cwd, "three");
+	assert.equal(third.reused, false);
+	const finalCallerSplits = splitCalls(fake.execCalls).filter((args) => args[2] === "w1:p1");
+	assert.equal(finalCallerSplits.length, 3, "discarded children freed the caller slots");
+	assert.equal(splitDirection(finalCallerSplits[2]), "right", "caller is whole again");
+	assert.ok(
+		!fake.execCalls.some((args) => args[0] === "tab" && args[1] === "create"),
+		"no tab overflow needed once slots freed",
+	);
 });
 
-test("when all agent run panes are gone the second caller split is down", async () => {
+test("when all agent run panes are gone the freed slot resplits the caller right", async () => {
 	const fake = createFakeCli();
 	const dead = new Set<string>();
 	fake.respond("pane process-info", (args) => {
@@ -988,10 +1047,10 @@ test("when all agent run panes are gone the second caller split is down", async 
 	const callerSplits = splitCalls(fake.execCalls).filter((args) => args[2] === "w1:p1");
 	assert.equal(callerSplits.length, 2);
 	assert.equal(splitDirection(callerSplits[0]), "right");
-	assert.equal(splitDirection(callerSplits[1]), "down");
 	fake.waiters
 		.filter((waiter) => waiter.args.includes("working"))
 		.forEach((waiter) => waiter.resolveWith(ok({})));
+	assert.equal(splitDirection(callerSplits[1]), "right", "pruned dead pane freed the caller slot");
 	await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
 	fake.waiters
 		.filter((waiter) => waiter.args.includes("done"))
@@ -999,7 +1058,7 @@ test("when all agent run panes are gone the second caller split is down", async 
 	await Promise.all([first.completion, second.completion]);
 });
 
-test("agent launches fail clearly once the caller budget is spent and no run pane remains", async () => {
+test("agent launches keep working as dead run panes free caller slots", async () => {
 	const fake = createFakeCli();
 	const dead = new Set<string>();
 	fake.respond("pane process-info", (args) => {
@@ -1040,22 +1099,33 @@ test("agent launches fail clearly once the caller budget is spent and no run pan
 	await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
 	if (second.record.paneId) dead.add(second.record.paneId);
 
-	await assert.rejects(
-		registry.start({
-			kind: "agent",
-			command: "codex",
-			cwd,
-			label: "verifier",
-			prompt: "Work.",
-			closeOnSettle: false,
-		}),
-		/budget exhausted/,
+	const third = await registry.start({
+		kind: "agent",
+		command: "codex",
+		cwd,
+		label: "verifier",
+		prompt: "Work.",
+		closeOnSettle: false,
+	});
+	const callerSplits = splitCalls(fake.execCalls).filter((args) => args[2] === "w1:p1");
+	assert.equal(callerSplits.length, 3, "each dead pane freed its caller slot");
+	assert.ok(
+		callerSplits.every((args) => splitDirection(args) === "right"),
+		"every launch found the caller whole again",
 	);
-	assert.equal(splitCalls(fake.execCalls).filter((args) => args[2] === "w1:p1").length, 2);
+	assert.ok(
+		!fake.execCalls.some((args) => args[0] === "tab" && args[1] === "create"),
+		"no tab overflow needed when slots free up",
+	);
+	fake.waiters
+		.filter((waiter) => waiter.args.includes("working"))
+		.at(-1)
+		?.resolveWith(ok({}));
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
 	fake.waiters
 		.filter((waiter) => waiter.args.includes("done"))
 		.forEach((waiter) => waiter.resolveWith(ok({})));
-	await Promise.all([first.completion, second.completion]);
+	await Promise.all([first.completion, second.completion, third.completion]);
 });
 
 test("mixed pane-manager and driver allocation share one caller-split budget", async () => {
@@ -1116,12 +1186,16 @@ test("mixed pane-manager and driver allocation share one caller-split budget", a
 		closeOnSettle: false,
 	});
 	const callerSplits = splitCalls(budget.execCalls).filter((args) => args[2] === "w1:p1");
-	assert.equal(callerSplits.length, 2, "mixed allocators share one max-two budget");
+	assert.equal(callerSplits.length, 2, "mixed allocators share one live-slot budget");
 	assert.equal(splitDirection(callerSplits[0]), "right");
-	assert.equal(splitDirection(callerSplits[1]), "down");
+	assert.equal(splitDirection(callerSplits[1]), "right", "discarded watch pane freed its slot");
 	if (agent.record.paneId) spent.panes.forgetTarget(agent.record.paneId);
-	await assert.rejects(spent.panes.acquire(cwd, "three"), /budget exhausted/);
-	assert.equal(splitCalls(budget.execCalls).filter((args) => args[2] === "w1:p1").length, 2);
+	await spent.panes.acquire(cwd, "three");
+	assert.equal(
+		splitCalls(budget.execCalls).filter((args) => args[2] === "w1:p1").length,
+		3,
+		"forgotten agent pane freed its slot for the next helper",
+	);
 	budget.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
 	await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
 	budget.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
