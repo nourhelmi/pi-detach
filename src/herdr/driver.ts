@@ -83,7 +83,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 
 	// Layout policy lives on the pane manager's caller-split coordinator.
 	// This stack is agent-only (not the idle pool); the shared coordinator
-	// owns the max-two-live caller budget and surviving-target view.
+	// owns the stack-first split policy and surviving-target view.
 	const agentPaneStack: string[] = [];
 
 	// Fan-out launches execute concurrently. Serialize pane allocation so the

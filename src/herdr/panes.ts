@@ -5,21 +5,21 @@
  * and the next run reuses it instead of splitting again, so fan-outs don't
  * shred the layout. Reuse is verified against process-info first — if the
  * user started typing or launched something in the pane, it is quietly
- * dropped from the pool. Pooled reuse does not consume the caller-split budget.
+ * dropped from the pool.
  *
- * Layout: the caller (advisor) pane holds at most two live splits at a time
- * so the advisor stays visible and usable. The first live caller split is
- * `--direction right` so the advisor keeps the left half; a second concurrent
- * one goes down, leaving the advisor at a quarter. The cap counts LIVE child
- * panes, not history: when a caller child closes, its slot frees and the
- * advisor may be split again. Helpers always prefer stacking off surviving
- * run panes with the wide/tall heuristic; when two caller children are live
- * but nothing can be stacked on, the helper opens a fresh tab in the caller's
- * workspace instead of failing or carving the advisor a third way.
+ * Layout: helpers stay inside the caller's tab and prefer stacking off
+ * surviving run panes with the wide/tall heuristic, so the caller (advisor)
+ * pane is only split when no run pane can host the split. There is no hard
+ * cap and no failure path: a launch always gets a pane. Caller splits stay
+ * tidy by tracking LIVE caller children — the first concurrent split goes
+ * right (advisor keeps the left half), the second goes down, and any further
+ * concurrent split follows the caller's live wide/tall geometry. Because each
+ * new pane immediately becomes a stack target, deep concurrent carving of the
+ * caller only happens when every other pane is gone or refuses to split.
  *
- * One coordinator per manager owns that budget and the surviving created-pane
- * list. The driver allocates through the same coordinator so mixed
- * watch/viewer/agent fan-out cannot recarve the caller. Allocations are
+ * One coordinator per manager owns that bookkeeping and the surviving
+ * created-pane list. The driver allocates through the same coordinator so
+ * mixed watch/viewer/agent fan-out shares one view. Allocations are
  * serialized; the idle pool and the agent stack stay separate.
  */
 
@@ -30,9 +30,6 @@ const SHELL_NAMES = new Set(["zsh", "bash", "fish", "sh", "dash", "nu", "pwsh"])
 
 /** Wide panes split right, tall panes down; terminal cells are ~2x taller than wide. */
 const WIDE_RATIO = 2.5;
-
-/** Cap on LIVE splits of the caller pane; a slot frees when its child pane closes. */
-export const CALLER_SPLIT_CAP = 2;
 
 export interface AcquiredPane {
 	paneId: string;
@@ -49,9 +46,9 @@ export interface PaneManager {
 	/** Panes created by this manager, newest first. */
 	created(): string[];
 	/**
-	 * Allocate under the shared caller-split budget. `preferredStack` is tried
-	 * first (agent panes stay off the idle pool); other surviving created panes
-	 * are fallback targets so mixed allocators share one max-two caller cap.
+	 * Allocate stack-first through the shared coordinator. `preferredStack` is
+	 * tried first (agent panes stay off the idle pool); other surviving created
+	 * panes are fallback targets; the caller pane is the last resort.
 	 */
 	splitOff(cwd: string, preferredStack: readonly string[]): Promise<string>;
 	/** Drop a pane from the shared surviving-target view (agent close/fail). */
@@ -63,7 +60,7 @@ interface ProcessEntry {
 	argv0?: string;
 }
 
-export type SplitWithCallerBudgetResult =
+export type SplitStackFirstResult =
 	| { ok: true; paneId: string; consumedCallerSplit: boolean }
 	| { ok: false; errorMessage: string };
 
@@ -92,9 +89,18 @@ export async function splitDirectionFor(cli: HerdrCli, targetPane: string): Prom
 	return "right";
 }
 
-/** Fixed directions for the two live caller splits; stacking never uses this. */
-export function callerSplitDirection(liveCallerSplits: number): "right" | "down" {
-	return liveCallerSplits === 0 ? "right" : "down";
+/**
+ * Direction for a caller split, by LIVE caller children: right when the
+ * caller is whole, down beside one live child, then live geometry.
+ */
+export async function callerSplitDirection(
+	cli: HerdrCli,
+	callerPaneId: string,
+	liveCallerSplits: number,
+): Promise<"right" | "down"> {
+	if (liveCallerSplits === 0) return "right";
+	if (liveCallerSplits === 1) return "down";
+	return splitDirectionFor(cli, callerPaneId);
 }
 
 async function execSplit(
@@ -121,44 +127,24 @@ async function execSplit(
 	return { ok: true, paneId };
 }
 
-/** Overflow allocation once the caller budget is spent: a fresh tab's root pane. */
-async function execTabCreate(
-	cli: HerdrCli,
-	cwd: string,
-	workspaceId: string | undefined,
-): Promise<{ ok: true; paneId: string } | { ok: false; errorMessage: string }> {
-	const args = ["tab", "create", "--cwd", cwd, "--no-focus"];
-	if (workspaceId) args.splice(2, 0, "--workspace", workspaceId);
-	const result = await cli.exec(args);
-	if (!result.ok) {
-		return { ok: false, errorMessage: result.errorMessage ?? (result.stderr.trim() || "tab create refused") };
-	}
-	const paneId = findString(result.json, "pane_id");
-	if (!paneId) return { ok: false, errorMessage: "herdr did not report a tab root pane id" };
-	return { ok: true, paneId };
-}
-
 /**
- * Pick a split target under the live caller-split budget.
+ * Pick a split target, stack-first.
  *
- * Prefer surviving created panes (newest first, wide/tall heuristic) — run
- * panes have no split cap. Only if those all fail — or none exist — take a
- * caller slot (right when the caller is whole, down beside one live child).
- * A failed stack target does not skip the remaining created panes and jump
- * straight to the caller; the caller is last resort. With two caller children
- * already live, allocation overflows to a fresh tab so launches keep working
- * while the advisor pane stays intact.
+ * Prefer surviving created panes (newest first, wide/tall heuristic). Only if
+ * those all fail — or none exist — split the caller. A failed stack target
+ * does not skip the remaining created panes and jump straight to the caller;
+ * the caller is last resort, but always available: a launch never fails just
+ * because earlier panes closed.
  */
-export async function splitWithCallerBudget(
+export async function splitStackFirst(
 	cli: HerdrCli,
 	cwd: string,
 	params: {
 		stackTargets: readonly string[];
 		callerPaneId: string;
 		liveCallerSplits: number;
-		workspaceId?: string | undefined;
 	},
-): Promise<SplitWithCallerBudgetResult> {
+): Promise<SplitStackFirstResult> {
 	let lastError = "pane split refused";
 	const stackTargets = params.stackTargets.filter((id) => id !== params.callerPaneId);
 
@@ -169,13 +155,7 @@ export async function splitWithCallerBudget(
 		lastError = attempt.errorMessage;
 	}
 
-	if (params.liveCallerSplits >= CALLER_SPLIT_CAP) {
-		const overflow = await execTabCreate(cli, cwd, params.workspaceId);
-		if (overflow.ok) return { ok: true, paneId: overflow.paneId, consumedCallerSplit: false };
-		return { ok: false, errorMessage: overflow.errorMessage };
-	}
-
-	const direction = callerSplitDirection(params.liveCallerSplits);
+	const direction = await callerSplitDirection(cli, params.callerPaneId, params.liveCallerSplits);
 	const attempt = await execSplit(cli, params.callerPaneId, direction, cwd);
 	if (attempt.ok) return { ok: true, paneId: attempt.paneId, consumedCallerSplit: true };
 	return { ok: false, errorMessage: attempt.errorMessage || lastError };
@@ -198,16 +178,14 @@ function stackTargetsFor(
 }
 
 /**
- * Shared caller-split budget + surviving-target view for every allocator
+ * Shared caller-split bookkeeping + surviving-target view for every allocator
  * of this `ctx.paneId`. The mutex covers the full split bookkeeping so a
  * concurrent acquire cannot both observe 0 and both split `--direction right`.
- * Tab-overflow panes join the surviving list, so later helpers stack in the
- * overflow tab instead of opening one tab per launch.
  */
 function createCallerSplitCoordinator(cli: HerdrCli, ctx: HerdrContext) {
 	const callerPaneId = ctx.paneId;
 	const surviving: string[] = [];
-	// Live caller children; membership frees a budget slot when the pane closes.
+	// Live caller children; only used to pick tidy split directions.
 	const callerChildren = new Set<string>();
 	let tail = Promise.resolve();
 
@@ -232,11 +210,10 @@ function createCallerSplitCoordinator(cli: HerdrCli, ctx: HerdrContext) {
 	}
 
 	async function splitUnlocked(cwd: string, preferredStack: readonly string[]): Promise<string> {
-		const outcome = await splitWithCallerBudget(cli, cwd, {
+		const outcome = await splitStackFirst(cli, cwd, {
 			stackTargets: stackTargetsFor(preferredStack, surviving, callerPaneId),
 			callerPaneId,
 			liveCallerSplits: callerChildren.size,
-			workspaceId: ctx.workspaceId,
 		});
 		if (!outcome.ok) {
 			throw new Error(`herdr pane split failed: ${outcome.errorMessage}`);
@@ -275,7 +252,7 @@ export function createPaneManager(cli: HerdrCli, ctx: HerdrContext): PaneManager
 
 	return {
 		async acquire(cwd, label) {
-			// Full acquire is serialized so pool checks and splits share one budget.
+			// Full acquire is serialized so pool checks and splits share one view.
 			return coordinator.exclusive(async () => {
 				const candidates = idle.splice(0, idle.length);
 				const stillIdle: string[] = [];

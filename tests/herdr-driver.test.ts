@@ -923,7 +923,7 @@ test("pane manager: a second concurrent caller split goes down", async () => {
 	assert.equal(splitDirection(callerSplits[1]), "down", "both children live: second slot splits down");
 });
 
-test("pane manager: two live caller children with no usable stack target overflow to a new tab", async () => {
+test("pane manager: two live caller children with no usable stack target still split the caller", async () => {
 	const fake = createFakeCli();
 	const dead = new Set<string>();
 	let nextPane = 100;
@@ -938,19 +938,23 @@ test("pane manager: two live caller children with no usable stack target overflo
 	dead.add(first.paneId);
 	const second = await panes.acquire(cwd, "two");
 	dead.add(second.paneId);
-	// Both caller slots are live and neither child accepts a split: overflow.
+	// Both caller children are live and neither accepts a split: the caller
+	// remains the fallback so the launch still succeeds inside the tab.
 	const third = await panes.acquire(cwd, "three");
 	assert.equal(third.reused, false);
-	assert.equal(splitCalls(fake.execCalls).filter((args) => args[2] === "w1:p1").length, 2);
+	const callerSplits = splitCalls(fake.execCalls).filter((args) => args[2] === "w1:p1");
+	assert.equal(callerSplits.length, 3, "no cap: the caller hosts the third split");
+	assert.equal(splitDirection(callerSplits[0]), "right");
+	assert.equal(splitDirection(callerSplits[1]), "down");
+	assert.equal(splitDirection(callerSplits[2]), "right", "third follows live wide geometry");
 	assert.ok(
-		fake.execCalls.some((args) => args[0] === "tab" && args[1] === "create"),
-		"overflow created a fresh tab instead of a third caller split",
+		!fake.execCalls.some((args) => args[0] === "tab" && args[1] === "create"),
+		"no tab is ever created for pane allocation",
 	);
-	// The overflow pane is a surviving target: the next helper stacks on it.
+	// The new caller child is a surviving target: the next helper stacks on it.
 	const fourth = await panes.acquire(cwd, "four");
 	assert.equal(fourth.reused, false);
 	assert.equal(splitCalls(fake.execCalls).at(-1)?.[2], third.paneId);
-	assert.equal(fake.execCalls.filter((args) => args[0] === "tab" && args[1] === "create").length, 1);
 });
 
 test("pane manager: failed stack target prefers other created panes before the caller", async () => {
