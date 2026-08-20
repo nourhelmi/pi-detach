@@ -127,7 +127,7 @@ const MAPPED_CONFIG = {
 	models: {
 		"openai-codex/gpt-5.6-sol": {
 			character: "Workhorse.",
-			thinking: ["high", "xhigh", "max"],
+			thinking: ["medium", "high", "xhigh", "max"],
 			defaultThinking: "high",
 		},
 		"openai-codex/gpt-5.6-luna": {
@@ -165,6 +165,62 @@ test("role launch picks model and thinking from the model map with turn-cap flag
 	);
 	assert.equal(launch.thinking, "xhigh");
 	assert.equal(launch.maxTurns, 6);
+});
+
+test("planner and checker accept Sol medium alongside Terra xhigh when the map allows them", async () => {
+	const path = await configFile({
+		...MAPPED_CONFIG,
+		models: {
+			...MAPPED_CONFIG.models,
+			"openai-codex/gpt-5.6-terra": {
+				character: "Adversarial checker.",
+				thinking: ["xhigh"],
+				defaultThinking: "xhigh",
+			},
+		},
+		profiles: {
+			planner: {
+				skill: "advisor-role-planner",
+				allowedModels: ["openai-codex/gpt-5.6-sol"],
+				maxTurns: 3,
+			},
+			checker: {
+				skill: "advisor-role-checker",
+				allowedModels: [
+					"openai-codex/gpt-5.6-terra",
+					"openai-codex/gpt-5.6-sol",
+				],
+				maxTurns: 5,
+			},
+		},
+	});
+	const planner = await resolveAgentLaunch({
+		role: "planner",
+		model: "openai-codex/gpt-5.6-sol",
+		thinking: "medium",
+		prompt: "Plan the fixed work.",
+		label: "Sol planner",
+		configPath: path,
+	});
+	const sol = await resolveAgentLaunch({
+		role: "checker",
+		model: "openai-codex/gpt-5.6-sol",
+		thinking: "medium",
+		prompt: "Run the standard review.",
+		label: "Sol checker",
+		configPath: path,
+	});
+	const terra = await resolveAgentLaunch({
+		role: "checker",
+		model: "openai-codex/gpt-5.6-terra",
+		thinking: "xhigh",
+		prompt: "Run the adversarial review.",
+		label: "Terra checker",
+		configPath: path,
+	});
+	assert.match(planner.command, /--model gpt-5\.6-sol --thinking medium/);
+	assert.match(sol.command, /--model gpt-5\.6-sol --thinking medium/);
+	assert.match(terra.command, /--model gpt-5\.6-terra --thinking xhigh/);
 });
 
 test("role launch applies the map's default thinking when none is requested", async () => {

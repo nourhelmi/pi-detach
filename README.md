@@ -88,7 +88,7 @@ Pi is the default runtime:
 {
   "role": "checker",
   "model": "openai-codex/gpt-5.6-sol",
-  "thinking": "high",
+  "thinking": "medium",
   "prompt": "Review the assigned builder diff for correctness and missing behavior.",
   "anchor": "result.md contains evidence-backed findings or a supported approval",
   "requiredSkills": ["review-pr"],
@@ -144,7 +144,7 @@ Profile file shape:
   "models": {
     "openai-codex/gpt-5.6-sol": {
       "character": "Workhorse for implementation, planning, and review.",
-      "thinking": ["high", "xhigh", "max"],
+      "thinking": ["medium", "high", "xhigh", "max"],
       "defaultThinking": "high"
     }
   },
