@@ -427,6 +427,60 @@ test("an agent run settles when its status wait fires", async () => {
 	assert.equal(blocked?.killedByDriver, true, "loser waits are cancelled");
 });
 
+test("an agent run stays supervised through transient compaction", async () => {
+	const fake = createFakeCli();
+	fake.respond("agent start", () =>
+		ok({ result: { agent: { pane_id: "w1:p7" }, type: "agent_started" } }),
+	);
+	let reads = 0;
+	fake.respond("pane read", () => {
+		reads += 1;
+		return ok(
+			undefined,
+			reads === 1
+				? "Error: This operation was aborted\n◐ OpenAI compaction running…\nCompacting context..."
+				: "◐ OpenAI compaction running…\n✓ OpenAI compaction complete\ncontinued task\nfinal answer",
+		);
+	});
+	const registry = herdrRegistry(fake);
+	const { record, completion } = await registry.start({
+		kind: "agent",
+		command: "pi",
+		cwd,
+		label: "compacting-worker",
+		prompt: "Keep working after compaction.",
+		closeOnSettle: true,
+	});
+
+	fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+	fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+	await flushAsync();
+
+	let completed = false;
+	void completion.then(() => {
+		completed = true;
+	});
+	await flushAsync();
+	assert.equal(completed, false, "transient done does not settle the detached run");
+	assert.equal(closedPanes(fake.execCalls).length, 0, "pane remains alive while compaction runs");
+
+	const workingWaiters = fake.waiters.filter((waiter) => waiter.args.includes("working"));
+	assert.equal(workingWaiters.length, 2, "driver waits for the post-compaction continuation");
+	workingWaiters.at(-1)?.resolveWith(ok({}));
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+	const doneWaiters = fake.waiters.filter((waiter) => waiter.args.includes("done"));
+	assert.equal(doneWaiters.length, 2, "driver rearms settlement after continuation starts");
+	fake.respond("agent get", () => agentGet("w1:p7", record.agentName ?? "", "done"));
+	doneWaiters.at(-1)?.resolveWith(ok({}));
+
+	const finished = await completion;
+	assert.equal(finished.agentState, "done");
+	assert.match(registry.tail(record.id, 10), /final answer/);
+	await flushAsync();
+	assert.deepEqual(closedPanes(fake.execCalls), ["w1:p7"]);
+});
+
 test("agent start retries Herdr's transient unavailable-shell refusal", async () => {
 	const fake = createFakeCli();
 	let starts = 0;
