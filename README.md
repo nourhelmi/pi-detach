@@ -98,9 +98,10 @@ Pi is the default runtime:
 
 A role resolves through `~/.pi/agent/bg-agent-profiles.json`. The profile pins
 the guardrails only: hidden role skill, tool restrictions, CLI arguments, anchor
-policy, and prompt-cycle cap. Profiles never pin a model. Every role launch
-chooses `model` ("provider/model-id") and `thinking` per call; when the config
-has a `models` map, the chosen model and thinking level must be in it. A
+policy, prompt-cycle cap, and optional per-model reasoning constraints. Profiles
+never choose a model. Every role launch chooses `model` ("provider/model-id")
+and `thinking` per call; when the config has a `models` map, the chosen model and
+thinking level must be in it and in any role `allowedThinkingByModel` entry. A
 per-launch `maxTurns` overrides the profile cap and is forwarded through the
 profile's `turnCapFlag`. `bg_agent` submits a structured task packet and
 follows the promote-after-30s contract. The parent is woken when the worker
@@ -149,13 +150,17 @@ Profile file shape:
     }
   },
   "profiles": {
-    "scout": {
+    "checker": {
       "agent": "pi",
-      "skill": "advisor-role-scout",
-      "excludeTools": ["edit", "bg_agent"],
-      "cliArgs": ["--advisor-worker-role", "scout"],
+      "skill": "advisor-role-checker",
+      "excludeTools": ["bg_agent"],
+      "allowedModels": ["openai-codex/gpt-5.6-sol"],
+      "allowedThinkingByModel": {
+        "openai-codex/gpt-5.6-sol": ["medium"]
+      },
+      "cliArgs": ["--advisor-worker-role", "checker"],
       "turnCapFlag": "--advisor-worker-max-turns",
-      "maxTurns": 3,
+      "maxTurns": 5,
       "requireAnchor": true
     }
   }

@@ -37,6 +37,12 @@ const AgentProfileSchema = Type.Object(
 		excludeTools: Type.Optional(Type.Array(NonEmptyString)),
 		cliArgs: Type.Optional(Type.Array(NonEmptyString)),
 		allowedModels: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
+		allowedThinkingByModel: Type.Optional(
+			Type.Record(
+				Type.String({ pattern: SAFE_ARGUMENT.source }),
+				Type.Array(ThinkingLevelSchema, { minItems: 1 }),
+			),
+		),
 		turnCapFlag: Type.Optional(Type.String({ pattern: "^--[a-z0-9][a-z0-9-]*$" })),
 		maxTurns: Type.Optional(Type.Integer({ minimum: 1 })),
 		requireAnchor: Type.Optional(Type.Boolean()),
@@ -209,6 +215,12 @@ function selectIdentity(
 	if (entry?.thinking?.length && (!thinking || !entry.thinking.includes(thinking))) {
 		throw new Error(
 			`Model ${key} allows thinking ${entry.thinking.join(", ")}; requested ${thinking ?? "none"}`,
+		);
+	}
+	const roleThinking = profile?.allowedThinkingByModel?.[key];
+	if (roleThinking?.length && (!thinking || !roleThinking.includes(thinking))) {
+		throw new Error(
+			`Role allows ${key} thinking ${roleThinking.join(", ")}; requested ${thinking ?? "none"}`,
 		);
 	}
 	const identity: LaunchIdentity = { provider, model };

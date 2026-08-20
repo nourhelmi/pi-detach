@@ -167,12 +167,14 @@ test("role launch picks model and thinking from the model map with turn-cap flag
 	assert.equal(launch.maxTurns, 6);
 });
 
-test("planner and checker accept Sol medium alongside Terra xhigh when the map allows them", async () => {
+test("only checker accepts Sol medium alongside Terra xhigh", async () => {
+	const solId = "openai-codex/gpt-5.6-sol";
+	const terraId = "openai-codex/gpt-5.6-terra";
 	const path = await configFile({
 		...MAPPED_CONFIG,
 		models: {
 			...MAPPED_CONFIG.models,
-			"openai-codex/gpt-5.6-terra": {
+			[terraId]: {
 				character: "Adversarial checker.",
 				thinking: ["xhigh"],
 				defaultThinking: "xhigh",
@@ -181,30 +183,35 @@ test("planner and checker accept Sol medium alongside Terra xhigh when the map a
 		profiles: {
 			planner: {
 				skill: "advisor-role-planner",
-				allowedModels: ["openai-codex/gpt-5.6-sol"],
+				allowedModels: [solId],
+				allowedThinkingByModel: { [solId]: ["high"] },
 				maxTurns: 3,
+			},
+			builder: {
+				skill: "advisor-role-builder",
+				allowedModels: [solId],
+				allowedThinkingByModel: { [solId]: ["high", "xhigh", "max"] },
+				maxTurns: 6,
 			},
 			checker: {
 				skill: "advisor-role-checker",
-				allowedModels: [
-					"openai-codex/gpt-5.6-terra",
-					"openai-codex/gpt-5.6-sol",
-				],
+				allowedModels: [terraId, solId],
+				allowedThinkingByModel: { [terraId]: ["xhigh"], [solId]: ["medium"] },
 				maxTurns: 5,
 			},
 		},
 	});
 	const planner = await resolveAgentLaunch({
 		role: "planner",
-		model: "openai-codex/gpt-5.6-sol",
-		thinking: "medium",
+		model: solId,
+		thinking: "high",
 		prompt: "Plan the fixed work.",
 		label: "Sol planner",
 		configPath: path,
 	});
 	const sol = await resolveAgentLaunch({
 		role: "checker",
-		model: "openai-codex/gpt-5.6-sol",
+		model: solId,
 		thinking: "medium",
 		prompt: "Run the standard review.",
 		label: "Sol checker",
@@ -212,15 +219,28 @@ test("planner and checker accept Sol medium alongside Terra xhigh when the map a
 	});
 	const terra = await resolveAgentLaunch({
 		role: "checker",
-		model: "openai-codex/gpt-5.6-terra",
+		model: terraId,
 		thinking: "xhigh",
 		prompt: "Run the adversarial review.",
 		label: "Terra checker",
 		configPath: path,
 	});
-	assert.match(planner.command, /--model gpt-5\.6-sol --thinking medium/);
+	assert.match(planner.command, /--model gpt-5\.6-sol --thinking high/);
 	assert.match(sol.command, /--model gpt-5\.6-sol --thinking medium/);
 	assert.match(terra.command, /--model gpt-5\.6-terra --thinking xhigh/);
+	for (const role of ["planner", "builder"] as const) {
+		await assert.rejects(
+			resolveAgentLaunch({
+				role,
+				model: solId,
+				thinking: "medium",
+				prompt: "Do not route medium Sol here.",
+				label: `${role} medium Sol`,
+				configPath: path,
+			}),
+			/Role allows openai-codex\/gpt-5\.6-sol thinking .+; requested medium/,
+		);
+	}
 });
 
 test("role launch applies the map's default thinking when none is requested", async () => {
