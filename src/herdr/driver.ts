@@ -77,6 +77,23 @@ function isUnavailableShell(result: CliResult): boolean {
 	return detail.includes("not an available shell");
 }
 
+function isCompactionRunning(output: string): boolean {
+	// Only inspect the live tail so an old transcript or a tool result that
+	// merely mentions compaction cannot suppress a genuine final settlement.
+	const normalized = output.slice(-4_000).toLowerCase();
+	const startedAt = Math.max(
+		normalized.lastIndexOf("openai compaction running"),
+		normalized.lastIndexOf("compacting context"),
+	);
+	if (startedAt < 0) return false;
+	const finishedAt = Math.max(
+		normalized.lastIndexOf("openai compaction complete"),
+		normalized.lastIndexOf("openai compaction failed"),
+		normalized.lastIndexOf("compaction failed:"),
+	);
+	return startedAt > finishedAt;
+}
+
 export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 	const { cli, panes, ledger, reapOrphans } = deps;
 	const toasts = toastsEnabled(deps.env ?? process.env);
@@ -453,8 +470,12 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			controller.finish(outcome);
 		}
 
-		async function settle(state: AgentSettledState, note?: string): Promise<void> {
-			const output = await readPane(paneId).catch(() => undefined);
+		async function settle(
+			state: AgentSettledState,
+			note?: string,
+			capturedOutput?: string,
+		): Promise<void> {
+			const output = capturedOutput ?? await readPane(paneId).catch(() => undefined);
 			finalize(
 				{
 					agentState: state,
@@ -467,51 +488,98 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			);
 		}
 
-		void (async () => {
-			const working = cli.spawnWaiter([
+		function waitForWorking(timeoutMs: number): Promise<CliResult> {
+			const waiter = cli.spawnWaiter([
 				"agent",
 				"wait",
 				paneId,
 				"--until",
 				"working",
 				"--timeout",
-				String(AGENT_WORKING_TIMEOUT_MS),
+				String(timeoutMs),
 			]);
-			waiters.push(working);
-			const workingResult = await working.promise;
-			if (finished) return;
-			if (!workingResult.ok) {
-				if (workingResult.errorCode === "cancelled") return;
-				await settle(
-					"stalled",
-					"the prompt did not visibly start a turn within 20s — check the pane",
-				);
-				return;
-			}
+			waiters.push(waiter);
+			return waiter.promise;
+		}
+
+		function waitForSettledState(): Promise<{
+			state: AgentSettledState;
+			note?: string;
+		}> {
 			const states: AgentSettledState[] = ["done", "idle", "blocked"];
-			let failures = 0;
-			for (const state of states) {
-				const waiter = cli.spawnWaiter([
-					"agent",
-					"wait",
-					paneId,
-					"--until",
-					state,
-					"--timeout",
-					String(WAIT_FOREVER_MS),
-				]);
-				waiters.push(waiter);
-				void waiter.promise.then((result) => {
-					if (finished) return;
-					if (result.ok) {
-						void settle(state);
-					} else if (result.errorCode !== "cancelled") {
+			return new Promise((resolvePromise) => {
+				let resolved = false;
+				let failures = 0;
+				const cycleWaiters: Waiter[] = [];
+				for (const state of states) {
+					const waiter = cli.spawnWaiter([
+						"agent",
+						"wait",
+						paneId,
+						"--until",
+						state,
+						"--timeout",
+						String(WAIT_FOREVER_MS),
+					]);
+					cycleWaiters.push(waiter);
+					waiters.push(waiter);
+					void waiter.promise.then((result) => {
+						if (resolved || finished) return;
+						if (result.ok) {
+							resolved = true;
+							for (const sibling of cycleWaiters) {
+								if (sibling !== waiter) sibling.kill();
+							}
+							resolvePromise({ state });
+							return;
+						}
+						if (result.errorCode === "cancelled") return;
 						failures += 1;
 						if (failures >= states.length) {
-							void settle("unknown", "all status waits failed — herdr may have restarted");
+							resolved = true;
+							resolvePromise({
+								state: "unknown",
+								note: "all status waits failed — herdr may have restarted",
+							});
 						}
-					}
-				});
+					});
+				}
+			});
+		}
+
+		void (async () => {
+			let workingTimeoutMs = AGENT_WORKING_TIMEOUT_MS;
+			while (!finished) {
+				const workingResult = await waitForWorking(workingTimeoutMs);
+				if (finished) return;
+				if (!workingResult.ok) {
+					if (workingResult.errorCode === "cancelled") return;
+					await settle(
+						"stalled",
+						workingTimeoutMs === AGENT_WORKING_TIMEOUT_MS
+							? "the prompt did not visibly start a turn within 20s — check the pane"
+							: "the agent did not resume after compaction — check the pane",
+					);
+					return;
+				}
+
+				const settled = await waitForSettledState();
+				if (finished) return;
+				const output = await readPane(paneId).catch(() => undefined);
+				if (
+					(settled.state === "done" || settled.state === "idle")
+					&& output !== undefined
+					&& isCompactionRunning(output)
+				) {
+					// Pi can briefly expose an idle/done detector state after an extension
+					// aborts a turn to compact. The same live agent will start another turn
+					// when compaction queues its continuation, so keep supervising instead
+					// of reporting success and closing the pane mid-compaction.
+					workingTimeoutMs = WAIT_FOREVER_MS;
+					continue;
+				}
+				await settle(settled.state, settled.note, output);
+				return;
 			}
 		})();
 
