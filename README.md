@@ -25,8 +25,9 @@ a surface, and the surface disappears when the work is done.**
   itself, like a task chip completing; on failure it stays, renamed `✗`, for
   inspection (and is recycled by the next promoted run).
 - `bg_watch` (dev servers) runs in a pane from birth; `bg_agent` starts Pi in
-  a sibling pane in the caller's tab, so the worker stays visible beside the
-  advisor. Successful panes close automatically; blocked and failed panes stay.
+  a sibling pane in the caller's tab, so the helper stays visible beside the
+  calling session. Successful panes close automatically; blocked and failed panes
+  stay.
 
 Nothing about how you use the tools changes — the backend is picked
 per-session by detecting `HERDR_ENV`.
@@ -86,26 +87,26 @@ Pi is the default runtime:
 
 ```jsonc
 {
-  "role": "checker",
-  "model": "openai-codex/gpt-5.6-sol",
-  "thinking": "medium",
+  "role": "reviewer",
   "prompt": "Review the assigned builder diff for correctness and missing behavior.",
   "anchor": "result.md contains evidence-backed findings or a supported approval",
   "requiredSkills": ["review-pr"],
-  "label": "auth-checker"
+  "label": "auth-reviewer"
 }
 ```
 
 A role resolves through `~/.pi/agent/bg-agent-profiles.json`. The profile pins
-the guardrails only: hidden role skill, tool restrictions, CLI arguments, anchor
-policy, prompt-cycle cap, and optional per-model reasoning constraints. Profiles
-never choose a model. Every role launch chooses `model` ("provider/model-id")
-and `thinking` per call; when the config has a `models` map, the chosen model and
-thinking level must be in it and in any role `allowedThinkingByModel` entry. A
-per-launch `maxTurns` overrides the profile cap and is forwarded through the
-profile's `turnCapFlag`. `bg_agent` submits a structured task packet and
-follows the promote-after-30s contract. The parent is woken when the worker
-settles as `done`, `idle`, `blocked`, or `stalled`.
+transport guardrails only: forced role skill, included or excluded tools, safe
+CLI arguments, optional anchor requirement, and prompt-cycle/turn cap. Model
+selection is not role policy. With no `model` or `thinking`, the role uses Pi's
+default runtime identity. If supplied, `model` ("provider/model-id") and
+`thinking` are forwarded to Pi; Pi and its provider decide whether that identity
+exists and supports the reasoning level. `thinking` requires `model`.
+
+A per-launch `maxTurns` overrides the profile cap and is forwarded through the
+profile's `turnCapFlag` when configured. `bg_agent` submits a structured task
+packet and follows the promote-after-30s contract. The caller is woken when the
+helper settles as `done`, `idle`, `blocked`, or `stalled`.
 
 Successful `done`/`idle` panes close after their transcript is captured. Blocked,
 stalled, and failed panes remain visible. Preserve a successful pane only for a
@@ -114,8 +115,8 @@ planned follow-up:
 ```jsonc
 {
   "role": "builder",
-  "model": "openai-codex/gpt-5.6-sol",
-  "thinking": "high",
+  "model": "anthropic/claude-sonnet-4-5",
+  "thinking": "medium",
   "prompt": "Implement the fixed task packet.",
   "anchor": "localized typecheck and affected tests pass",
   "requiredSkills": ["backend-development", "testing-development"],
@@ -127,7 +128,7 @@ planned follow-up:
 Then reuse it by name:
 
 ```jsonc
-{ "name": "auth-builder-a3f9k", "prompt": "Address these bounded checker findings: …", "keepAlive": true }
+{ "name": "auth-builder-a3f9k", "prompt": "Address these bounded reviewer findings: …", "keepAlive": true }
 ```
 
 Without a role, `bg_agent` starts plain interactive Pi. An explicit compatibility
@@ -142,24 +143,14 @@ Profile file shape:
 ```jsonc
 {
   "defaultAgent": "pi",
-  "models": {
-    "openai-codex/gpt-5.6-sol": {
-      "character": "Workhorse for implementation, planning, and review.",
-      "thinking": ["medium", "high", "xhigh", "max"],
-      "defaultThinking": "high"
-    }
-  },
   "profiles": {
-    "checker": {
+    "reviewer": {
       "agent": "pi",
-      "skill": "advisor-role-checker",
+      "skill": "role-reviewer",
+      "tools": ["read", "bash"],
       "excludeTools": ["bg_agent"],
-      "allowedModels": ["openai-codex/gpt-5.6-sol"],
-      "allowedThinkingByModel": {
-        "openai-codex/gpt-5.6-sol": ["medium"]
-      },
-      "cliArgs": ["--advisor-worker-role", "checker"],
-      "turnCapFlag": "--advisor-worker-max-turns",
+      "cliArgs": ["--worker-role", "reviewer"],
+      "turnCapFlag": "--worker-max-turns",
       "maxTurns": 5,
       "requireAnchor": true
     }
@@ -167,8 +158,18 @@ Profile file shape:
 }
 ```
 
-Normal Pi skills remain available. A profile forces its hidden role skill; it
-does not disable unrelated project skills. Mark skills that must never load
+`cliArgs` and `turnCapFlag` are forwarded only when configured, so use flags
+supported by your Pi installation or role extension. Every generated argument
+must use the restricted safe-argument syntax.
+
+Older configs may still contain top-level `models` and profile-level
+`allowedModels` or `allowedThinkingByModel`. These fields are deprecated,
+accepted for migration compatibility, and ignored during launch resolution:
+they never select, default, or reject a runtime identity. Remove them when
+convenient.
+
+Normal Pi skills remain available. A profile forces its configured role skill;
+it does not disable unrelated project skills. Mark skills that must never load
 automatically with `disable-model-invocation: true`.
 
 > Tip: trust a repository before unattended work. `bg_agent` fails visibly when
@@ -185,8 +186,8 @@ detaching everything.
 **Fan-out is just parallel tool calls.** Issue several `bg_run`/`bg_agent`
 calls in one message and they execute concurrently, each detaching on its own
 schedule. Promoted commands use viewer panes. Agents split into sibling panes
-in the caller's tab—right when the advisor is wide, down when it is narrow or
-tall—so their work remains visible while the advisor keeps focus.
+in the caller's tab—right when the caller is wide, down when it is narrow or
+tall—so their work remains visible while the caller keeps focus.
 
 **Visibility follows backgroundness.** Commands don't get panes; *background
 tasks* do. A pane appears only when a run is promoted, a watch starts, or an

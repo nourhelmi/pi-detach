@@ -1,9 +1,10 @@
 /**
  * @file bg-agent.ts — `bg_agent`, a helper Pi role agent in a visible Herdr tab.
  *
- * Starts an interactive Pi agent by default. Configured roles resolve model,
- * reasoning, skill, permissions, and prompt contracts before Herdr receives the
- * command. Explicit non-Pi commands remain available for compatibility.
+ * Starts an interactive Pi agent by default. Configured roles apply transport
+ * guardrails and prompt contracts before Herdr receives the command. Optional
+ * Pi model/reasoning arguments pass through to the runtime. Explicit non-Pi
+ * commands remain available for compatibility.
  */
 
 import { isAbsolute, resolve } from "node:path";
@@ -39,7 +40,7 @@ const BgAgentParameters = Type.Object({
 	model: Type.Optional(
 		Type.String({
 			description:
-				'Pi model as "provider/model-id", chosen from the configured model map. Required for every role launch.',
+				'Optional Pi model as "provider/model-id". Forwarded to Pi without profile allowlist enforcement.',
 		}),
 	),
 	thinking: Type.Optional(
@@ -55,7 +56,7 @@ const BgAgentParameters = Type.Object({
 			],
 			{
 				description:
-					"Reasoning level for the chosen model. Validated against the model map; defaults to the map's default for that model.",
+					"Optional Pi reasoning level. Requires model and is forwarded to Pi for provider validation.",
 			},
 		),
 	),
@@ -323,17 +324,17 @@ export function registerBgAgentTool(pi: ExtensionAPI, registry: Registry): void 
 		label: "Detach: Agent",
 		description:
 			"Start a helper Pi agent in a visible Herdr tab. Configured roles pin guardrails — role " +
-			"skill, permissions, anchor, and turn cap — while `model` and `thinking` are chosen per " +
-			"launch from the configured model map. An explicit `agent` command can override Pi for " +
+			"skill, tool permissions, safe CLI arguments, optional anchor, and turn cap. `model` and " +
+			"`thinking` are optional Pi runtime arguments, not role policy. An explicit `agent` command can override Pi for " +
 			"compatibility. Successful tabs close by default; set `keepAlive` only for a planned " +
 			"follow-up. Requires Pi to run inside Herdr.",
 		promptSnippet: "bg_agent — run a visible Pi role agent in Herdr; wakes you when it settles.",
 		promptGuidelines: [
-			"Use a configured `role` for new delegated work so skill, permissions, and turn cap are explicit.",
-			"Choose `model` and `thinking` per launch from the configured model map; pick the cheapest model whose character fits the task.",
-			"Every role launch needs a concrete `anchor`; list only the task skills that agent must load.",
+			"Use a configured `role` when delegated work needs a forced skill, tool restrictions, anchor policy, or turn cap.",
+			"Omit `model` and `thinking` to use Pi's default runtime identity; when supplied, they pass through to Pi.",
+			"Provide a concrete `anchor` when the selected role requires one; list only the task skills that agent must load.",
 			"Prompts must be self-contained — the helper agent shares no context with this session.",
-			"Fan out several bg_agent calls in one message only for independent graph nodes.",
+			"Fan out several bg_agent calls in one message only for independent tasks.",
 			"Use `keepAlive: true` only when the same maker has a planned follow-up; successful tabs otherwise close automatically.",
 			"When a run reports the agent is blocked, answer it with the same `name`, or use Herdr pane keys for a menu.",
 			"Never poll a detached agent run; its settling is delivered to you automatically.",

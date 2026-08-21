@@ -8,11 +8,11 @@
  * dropped from the pool.
  *
  * Layout: helpers stay inside the caller's tab and prefer stacking off
- * surviving run panes with the wide/tall heuristic, so the caller (advisor)
+ * surviving run panes with the wide/tall heuristic, so the caller's Pi
  * pane is only split when no run pane can host the split. There is no hard
  * cap and no failure path: a launch always gets a pane. Caller splits stay
  * tidy by tracking LIVE caller children — the first concurrent split goes
- * right (advisor keeps the left half), the second goes down, and any further
+ * right (the caller keeps the left half), the second goes down, and any further
  * concurrent split follows the caller's live wide/tall geometry. Because each
  * new pane immediately becomes a stack target, deep concurrent carving of the
  * caller only happens when every other pane is gone or refuses to split.

@@ -16,18 +16,6 @@ const ThinkingLevelSchema = Type.Union([
 	Type.Literal("xhigh"),
 	Type.Literal("max"),
 ]);
-// The model map is the launch-time "intelligence map": which models a caller may
-// pick, which reasoning levels each allows, and a character note that guides the
-// choice. When the map is non-empty, every Pi launch that names a model (or runs
-// a role) must resolve to a mapped model — this is how retired models stay out.
-const ModelEntrySchema = Type.Object(
-	{
-		character: Type.Optional(NonEmptyString),
-		thinking: Type.Optional(Type.Array(ThinkingLevelSchema, { minItems: 1 })),
-		defaultThinking: Type.Optional(ThinkingLevelSchema),
-	},
-	{ additionalProperties: false },
-);
 const AgentProfileSchema = Type.Object(
 	{
 		description: Type.Optional(NonEmptyString),
@@ -36,13 +24,10 @@ const AgentProfileSchema = Type.Object(
 		tools: Type.Optional(Type.Array(NonEmptyString)),
 		excludeTools: Type.Optional(Type.Array(NonEmptyString)),
 		cliArgs: Type.Optional(Type.Array(NonEmptyString)),
-		allowedModels: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
-		allowedThinkingByModel: Type.Optional(
-			Type.Record(
-				Type.String({ pattern: SAFE_ARGUMENT.source }),
-				Type.Array(ThinkingLevelSchema, { minItems: 1 }),
-			),
-		),
+		// Deprecated policy fields are intentionally accepted without validation
+		// and discarded after parsing so they cannot block a transport launch.
+		allowedModels: Type.Optional(Type.Unknown()),
+		allowedThinkingByModel: Type.Optional(Type.Unknown()),
 		turnCapFlag: Type.Optional(Type.String({ pattern: "^--[a-z0-9][a-z0-9-]*$" })),
 		maxTurns: Type.Optional(Type.Integer({ minimum: 1 })),
 		requireAnchor: Type.Optional(Type.Boolean()),
@@ -52,19 +37,39 @@ const AgentProfileSchema = Type.Object(
 const AgentProfilesConfigSchema = Type.Object(
 	{
 		defaultAgent: Type.Optional(NonEmptyString),
-		models: Type.Optional(Type.Record(Type.String(), ModelEntrySchema)),
+		// Deprecated intelligence metadata, retained only for config migration.
+		models: Type.Optional(Type.Unknown()),
 		profiles: Type.Optional(Type.Record(Type.String(), AgentProfileSchema)),
 	},
 	{ additionalProperties: false },
 );
 
-export type AgentProfile = Static<typeof AgentProfileSchema>;
-export type ModelEntry = Static<typeof ModelEntrySchema>;
 export type ThinkingLevel = Static<typeof ThinkingLevelSchema>;
+
+export interface ModelEntry {
+	character?: string;
+	thinking?: ThinkingLevel[];
+	defaultThinking?: ThinkingLevel;
+}
+
+export interface AgentProfile {
+	description?: string;
+	agent?: string;
+	skill?: string;
+	tools?: string[];
+	excludeTools?: string[];
+	cliArgs?: string[];
+	/** @deprecated Accepted for config compatibility but ignored at launch. */
+	allowedModels?: string[];
+	/** @deprecated Accepted for config compatibility but ignored at launch. */
+	allowedThinkingByModel?: Record<string, ThinkingLevel[]>;
+	turnCapFlag?: string;
+	maxTurns?: number;
+	requireAnchor?: boolean;
+}
 
 interface AgentProfilesConfig {
 	defaultAgent: string;
-	models: Record<string, ModelEntry>;
 	profiles: Record<string, AgentProfile>;
 }
 
@@ -121,23 +126,17 @@ function parseConfig(contents: string, path: string): AgentProfilesConfig {
 	} catch {
 		throw new Error(`Invalid bg_agent profile config ${path}`);
 	}
-	const profiles = parsed.profiles ?? {};
+	const profiles = (parsed.profiles ?? {}) as Record<string, AgentProfile>;
 	for (const name of Object.keys(profiles)) {
 		if (!SAFE_SKILL.test(name)) throw new Error(`profile name ${name} is not a valid role slug`);
 	}
-	const models = parsed.models ?? {};
-	for (const key of Object.keys(models)) {
-		if (!SAFE_ARGUMENT.test(key) || !key.includes("/")) {
-			throw new Error(`model map key ${key} must be a safe "provider/model-id" pair`);
-		}
-	}
-	return { defaultAgent: parsed.defaultAgent ?? "pi", models, profiles };
+	return { defaultAgent: parsed.defaultAgent ?? "pi", profiles };
 }
 
 async function loadConfig(path: string): Promise<AgentProfilesConfig> {
 	const contents = await readConfig(path);
 	return contents === undefined
-		? { defaultAgent: "pi", models: {}, profiles: {} }
+		? { defaultAgent: "pi", profiles: {} }
 		: parseConfig(contents, path);
 }
 
@@ -166,15 +165,6 @@ function sessionName(label: string): string {
 	);
 }
 
-function describeModelMap(models: Record<string, ModelEntry>): string {
-	const lines = Object.entries(models).map(([id, entry]) => {
-		const levels = entry.thinking?.length ? ` [${entry.thinking.join("|")}]` : "";
-		const character = entry.character ? ` — ${entry.character}` : "";
-		return `- ${id}${levels}${character}`;
-	});
-	return lines.join("\n") || "none configured";
-}
-
 function splitModel(value: string): { provider: string; model: string } {
 	const separator = value.indexOf("/");
 	if (separator < 1 || separator === value.length - 1) {
@@ -183,48 +173,19 @@ function splitModel(value: string): { provider: string; model: string } {
 	return { provider: value.slice(0, separator), model: value.slice(separator + 1) };
 }
 
-/**
- * Resolve the effective model/reasoning/turn-cap for a launch. Model and
- * reasoning are chosen per launch only — profiles never pin a model — and the
- * model map (when configured) is the hard boundary for what is allowed.
- */
+/** Resolve optional runtime identity and the profile's transport turn cap. */
 function selectIdentity(
 	options: ResolveAgentLaunchOptions,
-	config: AgentProfilesConfig,
 	profile?: AgentProfile,
 ): LaunchIdentity {
-	if (!options.model) {
-		throw new Error(
-			`bg_agent needs a model chosen from the model map:\n${describeModelMap(config.models)}`,
-		);
+	if (options.thinking && !options.model) throw new Error("bg_agent thinking requires a model");
+	const identity: LaunchIdentity = {};
+	if (options.model) {
+		const { provider, model } = splitModel(options.model);
+		identity.provider = provider;
+		identity.model = model;
+		if (options.thinking) identity.thinking = options.thinking;
 	}
-	const { provider, model } = splitModel(options.model);
-	const key = `${provider}/${model}`;
-	const entry = config.models[key];
-	if (Object.keys(config.models).length && !entry) {
-		throw new Error(
-			`Model ${key} is not in the model map. Allowed models:\n${describeModelMap(config.models)}`,
-		);
-	}
-	if (profile?.allowedModels && !profile.allowedModels.includes(key)) {
-		throw new Error(
-			`This role only allows models ${profile.allowedModels.join(", ")}; requested ${key}`,
-		);
-	}
-	const thinking = options.thinking ?? entry?.defaultThinking;
-	if (entry?.thinking?.length && (!thinking || !entry.thinking.includes(thinking))) {
-		throw new Error(
-			`Model ${key} allows thinking ${entry.thinking.join(", ")}; requested ${thinking ?? "none"}`,
-		);
-	}
-	const roleThinking = profile?.allowedThinkingByModel?.[key];
-	if (roleThinking?.length && (!thinking || !roleThinking.includes(thinking))) {
-		throw new Error(
-			`Role allows ${key} thinking ${roleThinking.join(", ")}; requested ${thinking ?? "none"}`,
-		);
-	}
-	const identity: LaunchIdentity = { provider, model };
-	if (thinking) identity.thinking = thinking;
 	const maxTurns = options.maxTurns ?? profile?.maxTurns;
 	if (maxTurns) identity.maxTurns = maxTurns;
 	return identity;
@@ -309,7 +270,7 @@ function resolveProfileLaunch(
 	if (!profile) {
 		throw new Error(`Unknown bg_agent role ${role}. Available roles: ${availableRoles(config)}`);
 	}
-	const identity = selectIdentity(options, config, profile);
+	const identity = selectIdentity(options, profile);
 	return {
 		command: buildPiCommand(profile, identity, config.defaultAgent, options.label),
 		prompt: rolePrompt(options, role, profile, identity.maxTurns),
@@ -336,11 +297,8 @@ export async function resolveAgentLaunch(
 	}
 	const config = await loadConfig(options.configPath ?? defaultConfigPath());
 	if (options.role) return resolveProfileLaunch(options, config);
-	if (options.thinking && !options.model) {
-		throw new Error("bg_agent thinking requires a model");
-	}
 	if (options.model) {
-		const identity = selectIdentity(options, config);
+		const identity = selectIdentity(options);
 		return {
 			command: buildPiCommand({}, identity, config.defaultAgent, options.label),
 			prompt: options.prompt,

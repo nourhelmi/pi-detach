@@ -104,7 +104,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 	const agentPaneStack: string[] = [];
 
 	// Fan-out launches execute concurrently. Serialize pane allocation so the
-	// advisor live-split cap is observed before another launch chooses its base.
+	// caller layout state is observed before another launch chooses its base.
 	let agentStartQueue = Promise.resolve();
 
 	async function paneAlive(id: string): Promise<boolean> {

@@ -386,15 +386,15 @@ test("an agent run settles when its status wait fires", async () => {
 	const started = fake.execCalls.find((args) => args[0] === "agent" && args[1] === "start");
 	assert.equal(started?.[started.indexOf("--kind") + 1], "codex", "kind derived from argv[0]");
 	assert.ok(started?.includes("--pane"), "agent starts in a pre-split pane");
-	const advisorSplit = fake.execCalls.find(
+	const callerSplit = fake.execCalls.find(
 		(args) => args[0] === "pane" && args[1] === "split" && args[2] === "w1:p1",
 	);
 	assert.equal(
-		advisorSplit?.[advisorSplit.indexOf("--direction") + 1],
+		callerSplit?.[callerSplit.indexOf("--direction") + 1],
 		"right",
 		"first caller split is always right",
 	);
-	assert.ok(advisorSplit?.includes("--no-focus"), "advisor retains focus");
+	assert.ok(callerSplit?.includes("--no-focus"), "caller retains focus");
 
 	const prompted = fake.execCalls.find((args) => args[0] === "agent" && args[1] === "prompt");
 	assert.equal(prompted?.[3], "Review the diff.");
@@ -581,7 +581,7 @@ test("a multiline Pi prompt is submitted atomically via agent prompt", async () 
 	);
 	fake.respond("pane read", () => ok(undefined, "role task finished"));
 	const registry = herdrRegistry(fake);
-	const prompt = "/skill:advisor-role-scout ROLE: scout\n\nTASK: inspect";
+	const prompt = "/skill:role-scout ROLE: scout\n\nTASK: inspect";
 	const { record, completion } = await registry.start({
 		kind: "agent",
 		command: "pi --model gpt-5.6-sol",
@@ -691,11 +691,11 @@ test("the first helper splits the caller; further agents stack off run panes", a
 	const starts = fake.execCalls.filter((args) => args[0] === "agent" && args[1] === "start");
 	assert.equal(starts.length, 3);
 	assert.ok(starts.every((args) => args.includes("--kind") && args.includes("--pane")));
-	const advisorSplits = fake.execCalls.filter(
+	const callerSplits = fake.execCalls.filter(
 		(args) => args[0] === "pane" && args[1] === "split" && args[2] === "w1:p1",
 	);
-	assert.equal(advisorSplits.length, 1, "caller is not split again while a run pane exists");
-	assert.equal(splitDirection(advisorSplits[0]), "right");
+	assert.equal(callerSplits.length, 1, "caller is not split again while a run pane exists");
+	assert.equal(splitDirection(callerSplits[0]), "right");
 	const workerSplit = fake.execCalls.find(
 		(args) => args[0] === "pane" && args[1] === "split" && args[2] === records[0]?.paneId,
 	);
@@ -706,7 +706,7 @@ test("the first helper splits the caller; further agents stack off run panes", a
 	await Promise.all(completions);
 });
 
-test("parallel agent starts preserve the advisor split cap", async () => {
+test("parallel agent starts coordinate caller splits", async () => {
 	const fake = createFakeCli();
 	let agentPane = 20;
 	fake.respond("agent start", (args) => {
@@ -728,10 +728,10 @@ test("parallel agent starts preserve the advisor split cap", async () => {
 		),
 	);
 	const records = launches.map(({ record }) => record);
-	const advisorSplits = fake.execCalls.filter(
+	const callerSplits = fake.execCalls.filter(
 		(args) => args[0] === "pane" && args[1] === "split" && args[2] === "w1:p1",
 	);
-	assert.equal(advisorSplits.length, 1, "parallel launches still only split the caller once while run panes live");
+	assert.equal(callerSplits.length, 1, "parallel launches still only split the caller once while run panes live");
 	const workerSplit = fake.execCalls.find(
 		(args) => args[0] === "pane" && args[1] === "split" && args[2] === records[0]?.paneId,
 	);
@@ -905,7 +905,7 @@ test("close-on-settle still closes when the confirm get matches this occupant", 
 	assert.equal(ledger.read().records.length, 0);
 });
 
-test("pane manager: first caller split is right even when the advisor is tall", async () => {
+test("pane manager: first caller split is right even when the caller is tall", async () => {
 	const fake = createFakeCli();
 	fake.respond("pane layout", () =>
 		ok({

@@ -181,10 +181,10 @@ test("dead-PID + working or blocked leaves the pane and the record", async () =>
 test("alive-PID records are never reaped even when the agent is settled", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "pi-detach-reaper-"));
 	seed(dir, "other-live", 777, [
-		{ paneId: "w2:p4", agentName: "other-advisor-agent", closeOnSettle: true },
+		{ paneId: "w2:p4", agentName: "other-caller-agent", closeOnSettle: true },
 	]);
 	const fake = createFakeCli();
-	fake.respond("agent get", () => agentInfo("w2:p4", "other-advisor-agent", "idle"));
+	fake.respond("agent get", () => agentInfo("w2:p4", "other-caller-agent", "idle"));
 
 	await reapOrphanAgentPanes({
 		cli: fake.cli,

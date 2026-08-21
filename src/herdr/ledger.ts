@@ -2,7 +2,7 @@
  * @file ledger.ts — per-session on-disk ledger of Herdr agent panes this Pi owns.
  *
  * Location: `~/.pi/detach/ledgers/<sessionId>.json` (same state root as run logs).
- * One file per Pi session so parallel advisors never share a write target.
+ * One file per Pi session so parallel callers never share a write target.
  * Writes are atomic (temp file + rename). The reaper in reaper.ts scans other
  * sessions' files; this module only mutates the current session's file.
  *
