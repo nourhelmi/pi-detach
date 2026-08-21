@@ -178,7 +178,6 @@ function selectIdentity(
 	options: ResolveAgentLaunchOptions,
 	profile?: AgentProfile,
 ): LaunchIdentity {
-	if (options.thinking && !options.model) throw new Error("bg_agent thinking requires a model");
 	const identity: LaunchIdentity = {};
 	if (options.model) {
 		const { provider, model } = splitModel(options.model);
@@ -295,6 +294,7 @@ export async function resolveAgentLaunch(
 			runtime: options.agent.split(/\s+/)[0] ?? options.agent,
 		};
 	}
+	if (options.thinking && !options.model) throw new Error("bg_agent thinking requires a model");
 	const config = await loadConfig(options.configPath ?? defaultConfigPath());
 	if (options.role) return resolveProfileLaunch(options, config);
 	if (options.model) {

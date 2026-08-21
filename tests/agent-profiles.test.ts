@@ -183,7 +183,7 @@ test("plain Pi launch forwards a supplied model and reasoning", async () => {
 	assert.equal(launch.prompt, "Summarize the log.");
 });
 
-test("thinking requires an explicit model", async () => {
+test("role thinking requires an explicit model", async () => {
 	await assert.rejects(
 		resolveAgentLaunch({
 			role: "reviewer",
@@ -192,6 +192,17 @@ test("thinking requires an explicit model", async () => {
 			anchor: "Report findings.",
 			label: "reviewer",
 			configPath: await configFile(GUARDED_PROFILE),
+		}),
+		/thinking requires a model/,
+	);
+});
+
+test("plain Pi thinking requires an explicit model", async () => {
+	await assert.rejects(
+		resolveAgentLaunch({
+			thinking: "high",
+			prompt: "Review.",
+			label: "thinking only",
 		}),
 		/thinking requires a model/,
 	);
