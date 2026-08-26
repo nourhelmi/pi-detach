@@ -24,8 +24,8 @@ a surface, and the surface disappears when the work is done.**
   gets a **live viewer pane** tailing its output. On success the pane closes
   itself, like a task chip completing; on failure it stays, renamed `✗`, for
   inspection (and is recycled by the next promoted run).
-- `bg_watch` (dev servers) runs in a pane from birth; `bg_agent` starts Pi in
-  a sibling pane in the caller's tab, so the helper stays visible beside the
+- `bg_watch` (dev servers) runs in a pane from birth; `bg_agent` starts its Pi,
+  Codex, or Claude role worker in a sibling pane in the caller's tab, so the helper stays visible beside the
   calling session. Successful panes close automatically; blocked and failed panes
   stay.
 
@@ -54,7 +54,7 @@ detached-process backend.
 | --- | --- |
 | `bg_run` | Run a command. Blocks, then auto-detaches after `promoteAfterMs` (default 30s). |
 | `bg_watch` | Start a process that never exits — dev server, file watcher, log tail. Silent while healthy. |
-| `bg_agent` | Start a visible Pi role agent beside the caller in the same Herdr tab; wakes you when it settles. |
+| `bg_agent` | Start a visible Pi, Codex, or Claude role agent beside the caller in the same Herdr tab; wakes you when it settles. |
 | `bg_output` | Read a run's captured log — live from the pane while running, from disk after. |
 | `bg_list` | Show every run from this session, its status, and its pane. |
 | `bg_stop` | Stop a run: SIGTERM locally, ctrl+c to a pane, esc to an agent. |
@@ -95,18 +95,16 @@ Pi is the default runtime:
 }
 ```
 
-A role resolves through `~/.pi/agent/bg-agent-profiles.json`. The profile pins
-transport guardrails only: forced role skill, included or excluded tools, safe
-CLI arguments, optional anchor requirement, and prompt-cycle/turn cap. Model
-selection is not role policy. With no `model` or `thinking`, the role uses Pi's
-default runtime identity. If supplied, `model` ("provider/model-id") and
-`thinking` are forwarded to Pi; Pi and its provider decide whether that identity
-exists and supports the reasoning level. `thinking` requires `model`.
+A role resolves through `~/.pi/agent/bg-agent-profiles.json`. The profile supplies
+the semantic role contract: role skill, optional portable skill path, anchor
+requirement, and instructional prompt-cycle cap. Model selection is not role
+policy. With no `model` or `thinking`, a Pi worker uses Pi's default runtime
+identity. If supplied, `model` ("provider/model-id") and `thinking` are forwarded
+to Pi. `thinking` requires `model`.
 
-A per-launch `maxTurns` overrides the profile cap and is forwarded through the
-profile's `turnCapFlag` when configured. `bg_agent` submits a structured task
-packet and follows the promote-after-30s contract. The caller is woken when the
-helper settles as `done`, `idle`, `blocked`, or `stalled`.
+`bg_agent` submits a structured task packet and follows the promote-after-30s
+contract. The caller is woken when the helper settles as `done`, `idle`,
+`blocked`, or `stalled`.
 
 Successful `done`/`idle` panes close after their transcript is captured. Blocked,
 stalled, and failed panes remain visible. Preserve a successful pane only for a
@@ -138,6 +136,40 @@ command is still supported with `agent`, but role and agent cannot be combined:
 { "agent": "codex", "prompt": "One legacy interactive task", "label": "legacy" }
 ```
 
+Every configured semantic role can instead use its selected provider's native
+harness. Set `harness: "native"` per launch, or set
+`PI_DETACH_WORKER_HARNESS=native` once for the parent session. When the parent
+variable is set, it is authoritative and a conflicting per-launch override is
+rejected:
+
+```jsonc
+{
+  "role": "builder",
+  "harness": "native",
+  "model": "openai-codex/gpt-5.6-luna",
+  "thinking": "max",
+  "prompt": "Implement the locked packet and write the requested result artifact.",
+  "anchor": "affected tests pass"
+}
+```
+
+Native routing is provider-based:
+
+- `openai-codex` or `openai` → Codex CLI;
+- `claude-bridge` or `anthropic` → Claude Code;
+- any other provider → a visible launch error.
+
+Pi-detach translates the selected model and reasoning to native flags, runs the
+native CLI unattended, injects the same role/task/anchor/skills packet, and adds
+a durable result-artifact instruction. It reserves the empty artifact before
+launch and validates a nonempty result with Status, Claims, Evidence, Files,
+Decisions, and Remaining Risk headings before accepting successful settlement.
+Missing or malformed results become `stalled` and retain their pane. The path defaults to
+`$ADVISOR_STATE_ROOT/runs/native/<uuid>/result.md` (or a temporary fallback) and
+is included in `bg_agent` details and completion output. Successful native panes
+close on settlement exactly like successful Pi panes; blocked or failed panes
+remain visible.
+
 Profile file shape:
 
 ```jsonc
@@ -147,20 +179,29 @@ Profile file shape:
     "reviewer": {
       "agent": "pi",
       "skill": "role-reviewer",
-      "tools": ["read", "bash"],
-      "excludeTools": ["bg_agent"],
-      "cliArgs": ["--worker-role", "reviewer"],
-      "turnCapFlag": "--worker-max-turns",
+      "skillPath": "skills/roles/reviewer/SKILL.md",
       "maxTurns": 5,
+      "requireAnchor": true
+    },
+    "builder": {
+      "agent": "pi",
+      "skill": "role-builder",
+      "skillPath": "skills/roles/builder/SKILL.md",
+      "maxTurns": 6,
       "requireAnchor": true
     }
   }
 }
 ```
 
-`cliArgs` and `turnCapFlag` are forwarded only when configured, so use flags
-supported by your Pi installation or role extension. Every generated argument
-must use the restricted safe-argument syntax.
+`skillPath` is resolved relative to the profile file and gives any harness a
+plain filesystem location for the role skill. Task packets also identify the
+profile-adjacent `skills/` root so native workers can resolve named required
+skills without Pi slash syntax or harness-specific symlinks. In Pi mode, legacy `cliArgs`,
+`turnCapFlag`, `tools`, and `excludeTools` fields are still supported when
+configured. Native mode intentionally constructs its own Codex/Claude command;
+Pi-only tool filters are rejected and role boundaries remain instructional.
+Every generated argument uses the restricted safe-argument syntax.
 
 Older configs may still contain top-level `models` and profile-level
 `allowedModels` or `allowedThinkingByModel`. These fields are deprecated,
@@ -168,12 +209,14 @@ accepted for migration compatibility, and ignored during launch resolution:
 they never select, default, or reject a runtime identity. Remove them when
 convenient.
 
-Normal Pi skills remain available. A profile forces its configured role skill;
-it does not disable unrelated project skills. Mark skills that must never load
-automatically with `disable-model-invocation: true`.
+The prompt instructs every harness to load the profile's configured role skill
+before starting; it does not disable unrelated project skills. Pi installations
+may still mark skills that must never load automatically with
+`disable-model-invocation: true`.
 
 > Tip: trust a repository before unattended work. `bg_agent` fails visibly when
-> Pi is waiting on first-run input and never falls back to a hidden process.
+> a selected runtime is waiting on first-run input and never falls back to a
+> hidden process.
 
 ## Design
 

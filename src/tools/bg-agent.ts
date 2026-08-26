@@ -1,13 +1,13 @@
 /**
- * @file bg-agent.ts — `bg_agent`, a helper Pi role agent in a visible Herdr tab.
+ * @file bg-agent.ts — `bg_agent`, a helper role agent in a visible Herdr tab.
  *
- * Starts an interactive Pi agent by default. Configured roles apply transport
- * guardrails and prompt contracts before Herdr receives the command. Optional
- * Pi model/reasoning arguments pass through to the runtime. Explicit non-Pi
- * commands remain available for compatibility.
+ * Starts an interactive Pi agent by default. Configured roles apply prompt
+ * contracts before Herdr receives the command. A role can run in Pi or route
+ * its selected model through the provider's native Codex/Claude harness.
  */
 
-import { isAbsolute, resolve } from "node:path";
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, resolve } from "node:path";
 import type {
 	AgentToolResult,
 	ExtensionAPI,
@@ -19,6 +19,7 @@ import {
 	resolveAgentLaunch,
 	type ResolvedAgentLaunch,
 	type ThinkingLevel,
+	type WorkerHarness,
 } from "../agent-profiles.ts";
 import { formatDuration } from "../format.ts";
 import type { Registry } from "../registry.ts";
@@ -34,13 +35,19 @@ const BgAgentParameters = Type.Object({
 	role: Type.Optional(
 		Type.String({
 			description:
-				"Configured Pi role profile (guardrails: role skill, permissions, turn cap). Cannot be combined with agent.",
+				"Configured semantic role contract (role skill, anchor, and instructional turn cap). The selected harness determines runtime. Cannot be combined with agent.",
+		}),
+	),
+	harness: Type.Optional(
+		Type.Union([Type.Literal("pi"), Type.Literal("native")], {
+			description:
+				"Worker harness for a configured role. Defaults to the advisor session preference, then Pi.",
 		}),
 	),
 	model: Type.Optional(
 		Type.String({
 			description:
-				'Optional Pi model as "provider/model-id". Forwarded to Pi without profile allowlist enforcement.',
+				'Optional model as "provider/model-id". Forwarded to Pi or translated when native mode selects Codex/Claude.',
 		}),
 	),
 	thinking: Type.Optional(
@@ -56,7 +63,7 @@ const BgAgentParameters = Type.Object({
 			],
 			{
 				description:
-					"Optional Pi reasoning level. Requires model and is forwarded to Pi for provider validation.",
+					"Optional reasoning level. Requires model and is forwarded to Pi or translated when native mode selects Codex/Claude.",
 			},
 		),
 	),
@@ -71,9 +78,14 @@ const BgAgentParameters = Type.Object({
 			description: "Concrete command, evidence condition, or artifact that proves the task is done.",
 		}),
 	),
+	resultPath: Type.Optional(
+		Type.String({
+			description: "Optional durable result.md path for a native role worker. Generated automatically when omitted.",
+		}),
+	),
 	requiredSkills: Type.Optional(
 		Type.Array(Type.String(), {
-			description: "Pi skill names that the role must load for this task.",
+			description: "Skill names that the role must load for this task.",
 			maxItems: 12,
 		}),
 	),
@@ -117,6 +129,7 @@ interface Details {
 	model?: string;
 	thinking?: string;
 	maxTurns?: number;
+	resultPath?: string;
 	reusable?: boolean;
 	durationMs: number;
 }
@@ -136,12 +149,25 @@ function launchDetails(launch: ResolvedAgentLaunch): Partial<Details> {
 		...(launch.model ? { model: launch.model } : {}),
 		...(launch.thinking ? { thinking: launch.thinking } : {}),
 		...(launch.maxTurns ? { maxTurns: launch.maxTurns } : {}),
+		...(launch.resultPath ? { resultPath: launch.resultPath } : {}),
 	};
 }
 
 function workingDirectory(requested: string | undefined, current: string): string {
 	if (!requested) return current;
 	return isAbsolute(requested) ? requested : resolve(current, requested);
+}
+
+async function reserveResultArtifact(path: string): Promise<void> {
+	await mkdir(dirname(path), { recursive: true });
+	try {
+		await writeFile(path, "", { encoding: "utf8", flag: "wx" });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+			throw new Error(`native result artifact already exists: ${path}`);
+		}
+		throw error;
+	}
 }
 
 export function agentLabel(params: BgAgentParams): string {
@@ -175,19 +201,34 @@ export function agentLabel(params: BgAgentParams): string {
 	return `${prefix} ${words.join(" ") || "task"}`;
 }
 
+export function workerHarness(params: BgAgentParams): WorkerHarness | undefined {
+	const requested = params.harness === "pi" || params.harness === "native" ? params.harness : undefined;
+	const value = process.env.PI_DETACH_WORKER_HARNESS;
+	const configured = value === "pi" || value === "native" ? value : undefined;
+	if (requested && configured && requested !== configured) {
+		throw new Error(
+			`bg_agent harness ${requested} conflicts with the parent session harness ${configured}`,
+		);
+	}
+	return requested ?? configured;
+}
+
 async function prepareLaunch(params: BgAgentParams, label: string): Promise<ResolvedAgentLaunch> {
 	if (params.name) {
 		return { command: params.agent ?? "pi", prompt: params.prompt, runtime: "existing" };
 	}
+	const harness = workerHarness(params);
 	return resolveAgentLaunch({
 		...(params.agent ? { agent: params.agent } : {}),
 		...(params.role ? { role: params.role } : {}),
 		...(params.model ? { model: params.model } : {}),
 		...(params.thinking ? { thinking: params.thinking as ThinkingLevel } : {}),
 		...(params.maxTurns !== undefined ? { maxTurns: params.maxTurns } : {}),
+		...(harness ? { harness } : {}),
 		prompt: params.prompt,
 		label,
 		...(params.anchor ? { anchor: params.anchor } : {}),
+		...(params.resultPath ? { resultPath: params.resultPath } : {}),
 		...(params.requiredSkills ? { requiredSkills: params.requiredSkills } : {}),
 	});
 }
@@ -228,7 +269,8 @@ function promotedResult(
 				type: "text",
 				text:
 					`Agent ${record.agentName} is working in pane ${record.paneId} — detached after ${waited} as ${record.id}.\n` +
-					`You will be woken when it settles. ${lifecycle}`,
+					`You will be woken when it settles. ${lifecycle}` +
+					(launch.resultPath ? `\nResult artifact: ${launch.resultPath}` : ""),
 			},
 		],
 		details: {
@@ -265,7 +307,8 @@ function settledResult(
 	const state = finished.agentState ?? "unknown";
 	const header =
 		`Agent ${finished.agentName} settled: ${state} in ${formatDuration(duration)} ` +
-		`(pane ${finished.paneId}). ${settledFollowUp(finished, keepAlive)}`;
+		`(pane ${finished.paneId}). ${settledFollowUp(finished, keepAlive)}` +
+		(launch.resultPath ? `\nResult artifact: ${launch.resultPath}` : "");
 	return {
 		content: [{ type: "text", text: tail.trim() ? `${header}\n\n${tail.trimEnd()}` : header }],
 		details: {
@@ -290,6 +333,8 @@ async function executeAgent(options: ExecuteAgentOptions): Promise<AgentToolResu
 	let started: Awaited<ReturnType<Registry["start"]>>;
 	try {
 		launch = await prepareLaunch(params, label);
+		if (launch.resultPath) await reserveResultArtifact(launch.resultPath);
+
 		started = await registry.start({
 			kind: "agent",
 			command: launch.command,
@@ -298,6 +343,7 @@ async function executeAgent(options: ExecuteAgentOptions): Promise<AgentToolResu
 			prompt: launch.prompt,
 			...(params.name ? { reuseName: params.name } : {}),
 			closeOnSettle: !params.keepAlive,
+			...(launch.resultPath ? { requiredArtifactPath: launch.resultPath } : {}),
 		});
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
@@ -323,14 +369,14 @@ export function registerBgAgentTool(pi: ExtensionAPI, registry: Registry): void 
 		name: "bg_agent",
 		label: "Detach: Agent",
 		description:
-			"Start a helper Pi agent in a visible Herdr tab. Configured roles pin guardrails — role " +
-			"skill, tool permissions, safe CLI arguments, optional anchor, and turn cap. `model` and " +
-			"`thinking` are optional Pi runtime arguments, not role policy. An explicit `agent` command can override Pi for " +
+			"Start a helper agent in a visible Herdr tab. Configured semantic roles carry " +
+			"instructional role skills, optional anchors, and turn caps. `harness`, `model`, and " +
+			"`thinking` select Pi or a provider-native Codex/Claude runtime. An explicit `agent` command can override Pi for " +
 			"compatibility. Successful tabs close by default; set `keepAlive` only for a planned " +
 			"follow-up. Requires Pi to run inside Herdr.",
-		promptSnippet: "bg_agent — run a visible Pi role agent in Herdr; wakes you when it settles.",
+		promptSnippet: "bg_agent — run a visible role agent in Herdr; wakes you when it settles.",
 		promptGuidelines: [
-			"Use a configured `role` when delegated work needs a forced skill, tool restrictions, anchor policy, or turn cap.",
+			"Use a configured `role` when delegated work needs a role skill, anchor policy, or turn cap.",
 			"Omit `model` and `thinking` to use Pi's default runtime identity; when supplied, they pass through to Pi.",
 			"Provide a concrete `anchor` when the selected role requires one; list only the task skills that agent must load.",
 			"Prompts must be self-contained — the helper agent shares no context with this session.",

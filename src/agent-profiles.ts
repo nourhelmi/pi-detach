@@ -1,10 +1,11 @@
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 
-const SAFE_ARGUMENT = /^[a-zA-Z0-9_./:@,+-]+$/;
+const SAFE_ARGUMENT = /^[a-zA-Z0-9_./:@,=+-]+$/;
 const SAFE_SKILL = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const NonEmptyString = Type.String({ minLength: 1 });
 const ThinkingLevelSchema = Type.Union([
@@ -21,6 +22,7 @@ const AgentProfileSchema = Type.Object(
 		description: Type.Optional(NonEmptyString),
 		agent: Type.Optional(NonEmptyString),
 		skill: Type.Optional(Type.String({ pattern: SAFE_SKILL.source })),
+		skillPath: Type.Optional(NonEmptyString),
 		tools: Type.Optional(Type.Array(NonEmptyString)),
 		excludeTools: Type.Optional(Type.Array(NonEmptyString)),
 		cliArgs: Type.Optional(Type.Array(NonEmptyString)),
@@ -45,6 +47,7 @@ const AgentProfilesConfigSchema = Type.Object(
 );
 
 export type ThinkingLevel = Static<typeof ThinkingLevelSchema>;
+export type WorkerHarness = "pi" | "native";
 
 export interface ModelEntry {
 	character?: string;
@@ -56,6 +59,7 @@ export interface AgentProfile {
 	description?: string;
 	agent?: string;
 	skill?: string;
+	skillPath?: string;
 	tools?: string[];
 	excludeTools?: string[];
 	cliArgs?: string[];
@@ -71,6 +75,7 @@ export interface AgentProfile {
 interface AgentProfilesConfig {
 	defaultAgent: string;
 	profiles: Record<string, AgentProfile>;
+	baseDir: string;
 }
 
 export interface ResolveAgentLaunchOptions {
@@ -79,10 +84,12 @@ export interface ResolveAgentLaunchOptions {
 	model?: string;
 	thinking?: ThinkingLevel;
 	maxTurns?: number;
+	harness?: WorkerHarness;
 	prompt: string;
 	label: string;
 	anchor?: string;
 	requiredSkills?: string[];
+	resultPath?: string;
 	configPath?: string;
 }
 
@@ -95,6 +102,7 @@ export interface ResolvedAgentLaunch {
 	model?: string;
 	thinking?: string;
 	maxTurns?: number;
+	resultPath?: string;
 }
 
 interface LaunchIdentity {
@@ -130,13 +138,13 @@ function parseConfig(contents: string, path: string): AgentProfilesConfig {
 	for (const name of Object.keys(profiles)) {
 		if (!SAFE_SKILL.test(name)) throw new Error(`profile name ${name} is not a valid role slug`);
 	}
-	return { defaultAgent: parsed.defaultAgent ?? "pi", profiles };
+	return { defaultAgent: parsed.defaultAgent ?? "pi", profiles, baseDir: dirname(path) };
 }
 
 async function loadConfig(path: string): Promise<AgentProfilesConfig> {
 	const contents = await readConfig(path);
 	return contents === undefined
-		? { defaultAgent: "pi", profiles: {} }
+		? { defaultAgent: "pi", profiles: {}, baseDir: dirname(path) }
 		: parseConfig(contents, path);
 }
 
@@ -190,21 +198,40 @@ function selectIdentity(
 	return identity;
 }
 
-function buildPiCommand(
+function runtimeKind(executable: string): string {
+	return executable.split("/").pop() ?? executable;
+}
+
+function buildAgentCommand(
 	profile: AgentProfile,
 	identity: LaunchIdentity,
 	defaultAgent: string,
 	label: string,
 ): string {
 	const executable = profile.agent ?? defaultAgent;
+	const runtime = runtimeKind(executable);
 	const args = [commandArgument(executable, "agent")];
-	if (identity.provider) args.push("--provider", commandArgument(identity.provider, "provider"));
-	if (identity.model) args.push("--model", commandArgument(identity.model, "model"));
-	if (identity.thinking) args.push("--thinking", identity.thinking);
-	args.push("--name", sessionName(label));
-	if (profile.tools?.length) args.push("--tools", commandArgument(profile.tools.join(","), "tools"));
-	if (profile.excludeTools?.length) {
-		args.push("--exclude-tools", commandArgument(profile.excludeTools.join(","), "excludeTools"));
+	if (runtime === "pi") {
+		if (identity.provider) args.push("--provider", commandArgument(identity.provider, "provider"));
+		if (identity.model) args.push("--model", commandArgument(identity.model, "model"));
+		if (identity.thinking) args.push("--thinking", identity.thinking);
+		args.push("--name", sessionName(label));
+		if (profile.tools?.length) args.push("--tools", commandArgument(profile.tools.join(","), "tools"));
+		if (profile.excludeTools?.length) {
+			args.push("--exclude-tools", commandArgument(profile.excludeTools.join(","), "excludeTools"));
+		}
+	} else {
+		if (profile.tools?.length || profile.excludeTools?.length) {
+			throw new Error(`bg_agent role tools and excludeTools only configure Pi, not ${runtime}`);
+		}
+		if (identity.model) args.push("--model", commandArgument(identity.model, "model"));
+		if (identity.thinking && runtime === "codex") {
+			args.push("-c", `model_reasoning_effort=${identity.thinking}`);
+		} else if (identity.thinking && runtime === "claude") {
+			args.push("--effort", identity.thinking);
+		} else if (identity.thinking) {
+			throw new Error(`bg_agent does not know the native thinking flag for ${runtime}`);
+		}
 	}
 	for (const argument of profile.cliArgs ?? []) args.push(commandArgument(argument, "cliArgs"));
 	if (profile.turnCapFlag && identity.maxTurns) {
@@ -212,12 +239,41 @@ function buildPiCommand(
 	}
 	return args.join(" ");
 }
+function nativeRuntime(provider: string | undefined): "codex" | "claude" {
+	if (provider === "openai-codex" || provider === "openai") return "codex";
+	if (provider === "claude-bridge" || provider === "anthropic") return "claude";
+	throw new Error(
+		`bg_agent native harness requires an OpenAI Codex or Anthropic model, got ${provider ?? "no provider"}`,
+	);
+}
+
+function buildNativeCommand(identity: LaunchIdentity): { command: string; runtime: "codex" | "claude" } {
+	if (!identity.model) throw new Error("bg_agent native harness requires an explicit model");
+	const runtime = nativeRuntime(identity.provider);
+	const args = [runtime, "--model", commandArgument(identity.model, "model")];
+	if (runtime === "codex") {
+		if (identity.thinking) args.push("-c", `model_reasoning_effort=${identity.thinking}`);
+		args.push("-c", "approval_policy=never", "--sandbox", "danger-full-access");
+	} else {
+		if (identity.thinking) args.push("--effort", identity.thinking);
+		args.push("--dangerously-skip-permissions");
+	}
+	return { command: args.join(" "), runtime };
+}
+
+function nativeResultPath(value: string | undefined): string {
+	if (value?.trim()) return resolve(value);
+	const root = process.env.ADVISOR_STATE_ROOT ?? join(tmpdir(), "pi-detach");
+	return join(root, "runs", "native", randomUUID(), "result.md");
+}
 
 function rolePrompt(
 	options: ResolveAgentLaunchOptions,
 	role: string,
 	profile: AgentProfile,
+	config: AgentProfilesConfig,
 	maxTurns: number | undefined,
+	resultPath: string | undefined,
 ): string {
 	if (profile.requireAnchor && !options.anchor?.trim()) {
 		throw new Error(`bg_agent role ${role} requires a concrete anchor`);
@@ -236,11 +292,26 @@ function rolePrompt(
 		options.anchor?.trim() || "Return the requested bounded result with direct evidence.",
 		"",
 		"REQUIRED SKILLS:",
+		"Load and follow each listed skill before starting.",
+		`Named skills are installed under ${join(config.baseDir, "skills")}. Resolve a named skill to <skill-root>/<name>/SKILL.md when present; otherwise use the harness's native skill discovery.`,
 		skills.length ? skills.map((skill) => `- ${skill}`).join("\n") : "- None beyond the role contract.",
 	];
 	if (maxTurns) packet.push("", `TURN CAP: ${maxTurns}`);
-	const body = packet.join("\n");
-	return profile.skill ? `/skill:${profile.skill} ${body}` : body;
+	if (resultPath) {
+		packet.push(
+			"",
+			"RESULT ARTIFACT:",
+			`Create the parent directory and write the durable bounded result to ${resultPath}.`,
+			"Include Status, Claims, Evidence, Files, Decisions, and Remaining Risk. Return this path in the final response.",
+		);
+	}
+	if (profile.skill) {
+		const location = profile.skillPath
+			? ` at ${resolve(config.baseDir, profile.skillPath)}`
+			: "";
+		packet.unshift(`Load and follow the ${profile.skill} skill${location} before starting.`, "");
+	}
+	return packet.join("\n");
 }
 
 function availableRoles(config: AgentProfilesConfig): string {
@@ -270,20 +341,27 @@ function resolveProfileLaunch(
 		throw new Error(`Unknown bg_agent role ${role}. Available roles: ${availableRoles(config)}`);
 	}
 	const identity = selectIdentity(options, profile);
+	if (options.harness === "native" && (profile.tools?.length || profile.excludeTools?.length)) {
+		throw new Error(`bg_agent role ${role} uses Pi-only tool filtering that cannot be applied to a native harness`);
+	}
+	const native = options.harness === "native" ? buildNativeCommand(identity) : undefined;
+	const resultPath = native ? nativeResultPath(options.resultPath) : undefined;
 	return {
-		command: buildPiCommand(profile, identity, config.defaultAgent, options.label),
-		prompt: rolePrompt(options, role, profile, identity.maxTurns),
+		command: native?.command ?? buildAgentCommand(profile, identity, config.defaultAgent, options.label),
+		prompt: rolePrompt(options, role, profile, config, identity.maxTurns, resultPath),
 		role,
-		runtime: (profile.agent ?? config.defaultAgent).split(/\s+/)[0] ?? "pi",
+		runtime: native?.runtime ?? (profile.agent ?? config.defaultAgent).split(/\s+/)[0] ?? "pi",
+		...(resultPath ? { resultPath } : {}),
 		...identityDetails(identity),
 	};
 }
 
-/** Resolve a visible helper launch from an explicit command or a configured Pi role profile. */
+/** Resolve a visible helper launch from an explicit command or a configured role profile. */
 export async function resolveAgentLaunch(
 	options: ResolveAgentLaunchOptions,
 ): Promise<ResolvedAgentLaunch> {
 	if (options.agent && options.role) throw new Error("Choose either agent or role, not both");
+	if (options.agent && options.harness) throw new Error("harness cannot be combined with an explicit agent command");
 	if (options.agent && (options.model || options.thinking || options.maxTurns !== undefined)) {
 		throw new Error("model, thinking, and maxTurns configure Pi launches, not explicit agent commands");
 	}
@@ -299,13 +377,15 @@ export async function resolveAgentLaunch(
 	if (options.role) return resolveProfileLaunch(options, config);
 	if (options.model) {
 		const identity = selectIdentity(options);
+		const native = options.harness === "native" ? buildNativeCommand(identity) : undefined;
 		return {
-			command: buildPiCommand({}, identity, config.defaultAgent, options.label),
+			command: native?.command ?? buildAgentCommand({}, identity, config.defaultAgent, options.label),
 			prompt: options.prompt,
-			runtime: config.defaultAgent.split(/\s+/)[0] ?? config.defaultAgent,
+			runtime: native?.runtime ?? config.defaultAgent.split(/\s+/)[0] ?? config.defaultAgent,
 			...identityDetails(identity),
 		};
 	}
+	if (options.harness === "native") throw new Error("bg_agent native harness requires an explicit model");
 	return {
 		command: config.defaultAgent,
 		prompt: options.prompt,

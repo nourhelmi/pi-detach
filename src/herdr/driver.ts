@@ -15,6 +15,8 @@
  */
 
 import { type CliResult, findString, type HerdrCli, type Waiter } from "./cli.ts";
+import { readFile } from "node:fs/promises";
+
 import { type HerdrContext, toastsEnabled } from "./context.ts";
 import type { AgentPaneLedger } from "./ledger.ts";
 import { isIdleShell, type PaneManager } from "./panes.ts";
@@ -92,6 +94,41 @@ function isCompactionRunning(output: string): boolean {
 		normalized.lastIndexOf("compaction failed:"),
 	);
 	return startedAt > finishedAt;
+}
+
+const REQUIRED_ARTIFACT_HEADINGS = [
+	"Status",
+	"Claims",
+	"Evidence",
+	"Files",
+	"Decisions",
+	"Remaining Risk",
+];
+
+export async function settlementArtifactIssue(path: string): Promise<string | undefined> {
+	let content: string;
+	try {
+		content = await readFile(path, "utf8");
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		return code === "ENOENT" ? `missing ${path}` : `could not read ${path}: ${(error as Error).message}`;
+	}
+	if (!content.trim()) return `empty ${path}`;
+	const missing: string[] = [];
+	const empty: string[] = [];
+	for (const heading of REQUIRED_ARTIFACT_HEADINGS) {
+		const match = new RegExp(`^#{1,6}\\s+${heading}\\s*$`, "im").exec(content);
+		if (!match) {
+			missing.push(heading);
+			continue;
+		}
+		const remainder = content.slice(match.index + match[0].length);
+		const nextHeading = remainder.search(/^#{1,6}\s+\S.*$/m);
+		const body = (nextHeading >= 0 ? remainder.slice(0, nextHeading) : remainder).trim();
+		if (!body) empty.push(heading);
+	}
+	if (missing.length) return `${path} is missing headings: ${missing.join(", ")}`;
+	return empty.length ? `${path} has empty sections: ${empty.join(", ")}` : undefined;
 }
 
 export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
@@ -415,7 +452,10 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			agentName: name,
 			runId: record.id,
 			label: record.label,
-			closeOnSettle: Boolean(options.closeOnSettle),
+			// Required-artifact runs are closed by this live driver only after
+			// validation. A same-process reload must not let the generic reaper
+			// close a settled pane without that validation context.
+			closeOnSettle: Boolean(options.closeOnSettle && !options.requiredArtifactPath),
 		});
 
 		// herdr 0.8 `agent prompt` submits text + Enter atomically under the
@@ -463,8 +503,10 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			if (record.promoted && !outcome.killed) {
 				if (state === "blocked") {
 					toast(`⧗ ${record.label} needs input`, `agent ${name} is waiting in pane ${paneId}`, "request");
-				} else {
+				} else if (state === "done" || state === "idle") {
 					toast(`✓ ${record.label}`, `agent ${name} settled (${state})`, "done");
+				} else {
+					toast(`⚠ ${record.label} needs inspection`, `agent ${name} settled (${state}) in pane ${paneId}`, "request");
 				}
 			}
 			controller.finish(outcome);
@@ -476,13 +518,25 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			capturedOutput?: string,
 		): Promise<void> {
 			const output = capturedOutput ?? await readPane(paneId).catch(() => undefined);
+			let finalState = state;
+			let finalNote = note;
+			if (
+				(state === "done" || state === "idle")
+				&& options.requiredArtifactPath
+			) {
+				const issue = await settlementArtifactIssue(options.requiredArtifactPath);
+				if (issue) {
+					finalState = "stalled";
+					finalNote = `required result artifact is invalid: ${issue}`;
+				}
+			}
 			finalize(
 				{
-					agentState: state,
-					...(state === "blocked" || state === "done" || state === "idle"
+					agentState: finalState,
+					...(finalState === "blocked" || finalState === "done" || finalState === "idle"
 						? { exitCode: 0 }
 						: {}),
-					...(note ? { note } : {}),
+					...(finalNote ? { note: finalNote } : {}),
 				},
 				output,
 			);

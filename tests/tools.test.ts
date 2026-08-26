@@ -14,7 +14,7 @@ import type {
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import registerDetachExtension from "../extensions/index.ts";
-import { agentLabel } from "../src/tools/bg-agent.ts";
+import { agentLabel, workerHarness } from "../src/tools/bg-agent.ts";
 
 type AnyTool = ToolDefinition<any, any, any>;
 
@@ -102,6 +102,28 @@ test("bg_agent fallback labels use concise meaningful prompt words", () => {
 		agentLabel({ agent: "codex --model x", prompt: "Review the API changes" }),
 		"codex · Review API changes",
 	);
+});
+
+test("the parent session harness is authoritative over per-launch overrides", () => {
+	const previous = process.env.PI_DETACH_WORKER_HARNESS;
+	process.env.PI_DETACH_WORKER_HARNESS = "native";
+	try {
+		assert.equal(workerHarness({ role: "builder", prompt: "Build." }), "native");
+		assert.equal(workerHarness({ role: "builder", harness: "native", prompt: "Build." }), "native");
+		assert.throws(
+			() => workerHarness({ role: "builder", harness: "pi", prompt: "Build." }),
+			/conflicts with the parent session harness native/,
+		);
+		process.env.PI_DETACH_WORKER_HARNESS = "pi";
+		assert.equal(workerHarness({ role: "checker", prompt: "Check." }), "pi");
+		assert.throws(
+			() => workerHarness({ role: "checker", harness: "native", prompt: "Check." }),
+			/conflicts with the parent session harness pi/,
+		);
+	} finally {
+		if (previous === undefined) delete process.env.PI_DETACH_WORKER_HARNESS;
+		else process.env.PI_DETACH_WORKER_HARNESS = previous;
+	}
 });
 
 test("bg_run returns inline when the command finishes in time", async () => {

@@ -76,9 +76,9 @@ test("role launch needs no model and preserves skill, tool, anchor, and turn gua
 	assert.equal(launch.model, undefined);
 	assert.equal(launch.thinking, undefined);
 	assert.equal(launch.maxTurns, 4);
-	assert.match(launch.prompt, /^\/skill:role-reviewer ROLE: reviewer/);
+	assert.match(launch.prompt, /^Load and follow the role-reviewer skill before starting\.\n\nROLE: reviewer/);
 	assert.match(launch.prompt, /ANCHOR:\nReport evidence-backed findings\./);
-	assert.match(launch.prompt, /REQUIRED SKILLS:\n- review-pr/);
+	assert.match(launch.prompt, /REQUIRED SKILLS:\nLoad and follow each listed skill before starting\.[\s\S]+- review-pr/);
 	assert.match(launch.prompt, /TURN CAP: 4$/);
 });
 
@@ -259,6 +259,135 @@ test("rejects unknown roles and reports configured choices", async () => {
 	);
 });
 
+test("builds every semantic role in native Codex or Claude from the selected model", async () => {
+	const roles = ["scout", "planner", "reducer", "builder", "checker", "browser-verifier"];
+	const path = await configFile({
+		profiles: Object.fromEntries(
+			roles.map((role) => [role, {
+				agent: "pi",
+				skill: `advisor-role-${role}`,
+				skillPath: `skills/advisor-worker/roles/${role}/SKILL.md`,
+			}]),
+		),
+	});
+	for (const role of roles) {
+		const launch = await resolveAgentLaunch({
+			role,
+			model: "openai-codex/gpt-5.6-luna",
+			thinking: "max",
+			harness: "native",
+			prompt: "Complete the role task.",
+			resultPath: `/tmp/native-${role}/result.md`,
+			label: `codex ${role}`,
+			configPath: path,
+		});
+		assert.equal(launch.runtime, "codex");
+		assert.match(launch.prompt, new RegExp(`advisor-worker/roles/${role}/SKILL\\.md before starting`));
+	}
+	const codex = await resolveAgentLaunch({
+		role: "scout",
+		model: "openai-codex/gpt-5.6-luna",
+		thinking: "max",
+		harness: "native",
+		prompt: "Inspect.",
+		resultPath: "/tmp/native-scout/result.md",
+		label: "codex scout",
+		configPath: path,
+	});
+	assert.equal(
+		codex.command,
+		"codex --model gpt-5.6-luna -c model_reasoning_effort=max -c approval_policy=never --sandbox danger-full-access",
+	);
+	assert.doesNotMatch(codex.command, /--name|--provider/);
+	assert.match(codex.prompt, /advisor-worker\/roles\/scout\/SKILL\.md before starting/);
+	assert.match(codex.prompt, /Named skills are installed under .*\/skills/);
+	assert.match(codex.prompt, /RESULT ARTIFACT:\nCreate the parent directory.*\/tmp\/native-scout\/result\.md/);
+	assert.equal(codex.resultPath, "/tmp/native-scout/result.md");
+
+	const claude = await resolveAgentLaunch({
+		role: "checker",
+		model: "claude-bridge/claude-sonnet-5",
+		thinking: "high",
+		harness: "native",
+		prompt: "Check.",
+		label: "claude checker",
+		configPath: path,
+	});
+	assert.equal(
+		claude.command,
+		"claude --model claude-sonnet-5 --effort high --dangerously-skip-permissions",
+	);
+	assert.doesNotMatch(claude.command, /--name|--provider/);
+});
+
+test("native roles generate durable results under the advisor state root", async () => {
+	const path = await configFile({ profiles: { reducer: { agent: "pi", skill: "advisor-role-reducer" } } });
+	const previous = process.env.ADVISOR_STATE_ROOT;
+	process.env.ADVISOR_STATE_ROOT = "/tmp/advisor-native-state";
+	try {
+		const launch = await resolveAgentLaunch({
+			role: "reducer",
+			harness: "native",
+			model: "anthropic/claude-sonnet-5",
+			prompt: "Reduce.",
+			label: "reducer",
+			configPath: path,
+		});
+		assert.match(launch.resultPath ?? "", /^\/tmp\/advisor-native-state\/runs\/native\/[0-9a-f-]+\/result\.md$/);
+		assert.match(launch.prompt, new RegExp(`RESULT ARTIFACT:[\\s\\S]+${launch.resultPath?.replaceAll("/", "\\/")}`));
+	} finally {
+		if (previous === undefined) delete process.env.ADVISOR_STATE_ROOT;
+		else process.env.ADVISOR_STATE_ROOT = previous;
+	}
+});
+
+test("rejects native launches without a supported explicit model", async () => {
+	const path = await configFile({ profiles: { scout: { agent: "pi", skill: "advisor-role-scout" } } });
+	await assert.rejects(
+		resolveAgentLaunch({ role: "scout", harness: "native", prompt: "Inspect.", label: "scout", configPath: path }),
+		/requires an explicit model/,
+	);
+	await assert.rejects(
+		resolveAgentLaunch({
+			role: "scout",
+			harness: "native",
+			model: "cursor/grok-4.6",
+			prompt: "Inspect.",
+			label: "scout",
+			configPath: path,
+		}),
+		/requires an OpenAI Codex or Anthropic model/,
+	);
+});
+
+test("rejects Pi-only tool filtering on directly configured non-Pi roles", async () => {
+	const path = await configFile({ profiles: { builder: { agent: "codex", excludeTools: ["bg_agent"] } } });
+	await assert.rejects(
+		resolveAgentLaunch({
+			role: "builder",
+			prompt: "Build.",
+			label: "builder",
+			configPath: path,
+		}),
+		/tools and excludeTools only configure Pi, not codex/,
+	);
+});
+
+test("rejects Pi-only tool filtering when a semantic role selects native mode", async () => {
+	const path = await configFile({ profiles: { builder: { agent: "pi", excludeTools: ["bg_agent"] } } });
+	await assert.rejects(
+		resolveAgentLaunch({
+			role: "builder",
+			harness: "native",
+			model: "openai-codex/gpt-5.6-luna",
+			prompt: "Build.",
+			label: "builder",
+			configPath: path,
+		}),
+		/Pi-only tool filtering that cannot be applied to a native harness/,
+	);
+});
+
 test("keeps explicit non-Pi agent commands for compatibility", async () => {
 	const launch = await resolveAgentLaunch({
 		agent: "claude --model opus",
@@ -278,6 +407,15 @@ test("does not combine an explicit agent command with Pi launch options", async 
 			label: "builder",
 		}),
 		/Choose either agent or role/,
+	);
+	await assert.rejects(
+		resolveAgentLaunch({
+			agent: "codex",
+			harness: "native",
+			prompt: "Build.",
+			label: "builder",
+		}),
+		/harness cannot be combined/,
 	);
 	await assert.rejects(
 		resolveAgentLaunch({

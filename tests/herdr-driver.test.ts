@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
+import { rm, writeFile } from "node:fs/promises";
+
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { CliResult, HerdrCli, Waiter } from "../src/herdr/cli.ts";
-import { createHerdrDriver } from "../src/herdr/driver.ts";
+import { createHerdrDriver, settlementArtifactIssue } from "../src/herdr/driver.ts";
 import { createSessionLedger } from "../src/herdr/ledger.ts";
 import { createPaneManager } from "../src/herdr/panes.ts";
 import { startMarker } from "../src/herdr/sentinel.ts";
@@ -425,6 +427,135 @@ test("an agent run settles when its status wait fires", async () => {
 	);
 	const blocked = fake.waiters.find((w) => w.args.includes("blocked"));
 	assert.equal(blocked?.killedByDriver, true, "loser waits are cancelled");
+});
+
+test("result artifact validation rejects empty files and missing headings", async () => {
+	const artifactDir = mkdtempSync(join(tmpdir(), "pi-detach-artifact-validation-"));
+	const artifactPath = join(artifactDir, "result.md");
+	try {
+		await writeFile(artifactPath, "");
+		assert.match(await settlementArtifactIssue(artifactPath) ?? "", /empty .*result\.md/);
+		await writeFile(artifactPath, "# Status\nDone\n");
+		assert.match(
+			await settlementArtifactIssue(artifactPath) ?? "",
+			/missing headings: Claims, Evidence, Files, Decisions, Remaining Risk/,
+		);
+	} finally {
+		await rm(artifactDir, { force: true, recursive: true });
+	}
+});
+
+test("a missing required result artifact stalls settlement and keeps the pane", async () => {
+	const artifactDir = mkdtempSync(join(tmpdir(), "pi-detach-artifact-missing-"));
+	const artifactPath = join(artifactDir, "result.md");
+	try {
+		const fake = createFakeCli();
+		fake.respond("agent start", () =>
+			ok({ result: { agent: { pane_id: "w1:p7" }, type: "agent_started" } }),
+		);
+		fake.respond("pane read", () => ok(undefined, "Agent claimed success without writing the result."));
+		const ledger = createSessionLedger({
+			ledgerDir: artifactDir,
+			sessionId: "artifact-session",
+			ownerPid: 4242,
+		});
+		const registry = herdrRegistry(fake, { ledger });
+		const { completion } = await registry.start({
+			kind: "agent",
+			command: "codex",
+			cwd,
+			label: "builder",
+			prompt: "Build.",
+			closeOnSettle: true,
+			requiredArtifactPath: artifactPath,
+		});
+		fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+		await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+		fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+
+		const finished = await completion;
+		assert.equal(finished.agentState, "stalled");
+		assert.match(registry.tail(finished.id, 20), /required result artifact is invalid: missing/);
+		await flushAsync();
+		assert.deepEqual(closedPanes(fake.execCalls), [], "invalid-artifact pane remains visible");
+		assert.equal(ledger.read().records[0]?.closeOnSettle, false, "reload reaper cannot bypass artifact validation");
+	} finally {
+		await rm(artifactDir, { force: true, recursive: true });
+	}
+});
+
+test("heading-only result artifacts stall settlement and keep the pane", async () => {
+	const artifactDir = mkdtempSync(join(tmpdir(), "pi-detach-artifact-empty-sections-"));
+	const artifactPath = join(artifactDir, "result.md");
+	await writeFile(
+		artifactPath,
+		"# Status\n# Claims\n# Evidence\n# Files\n# Decisions\n# Remaining Risk\n",
+	);
+	try {
+		const fake = createFakeCli();
+		fake.respond("agent start", () =>
+			ok({ result: { agent: { pane_id: "w1:p7" }, type: "agent_started" } }),
+		);
+		fake.respond("pane read", () => ok(undefined, "Agent wrote headings without evidence."));
+		const registry = herdrRegistry(fake);
+		const { completion } = await registry.start({
+			kind: "agent",
+			command: "codex",
+			cwd,
+			label: "checker",
+			prompt: "Check.",
+			closeOnSettle: true,
+			requiredArtifactPath: artifactPath,
+		});
+		fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+		await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+		fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+
+		const finished = await completion;
+		assert.equal(finished.agentState, "stalled");
+		assert.match(registry.tail(finished.id, 20), /has empty sections: Status, Claims, Evidence, Files, Decisions, Remaining Risk/);
+		await flushAsync();
+		assert.deepEqual(closedPanes(fake.execCalls), [], "heading-only artifact pane remains visible");
+	} finally {
+		await rm(artifactDir, { force: true, recursive: true });
+	}
+});
+
+test("a valid required result artifact preserves successful close-on-settle", async () => {
+	const artifactDir = mkdtempSync(join(tmpdir(), "pi-detach-artifact-valid-"));
+	const artifactPath = join(artifactDir, "result.md");
+	await writeFile(
+		artifactPath,
+		"# Status\nDone\n# Claims\nBuilt\n# Evidence\nTests pass\n# Files\n- src/x.ts\n# Decisions\nNone\n# Remaining Risk\nNone\n",
+	);
+	try {
+		const fake = createFakeCli();
+		fake.respond("agent start", () =>
+			ok({ result: { agent: { pane_id: "w1:p7" }, type: "agent_started" } }),
+		);
+		fake.respond("pane read", () => ok(undefined, "Agent wrote the bounded result."));
+		const registry = herdrRegistry(fake);
+		const { record, completion } = await registry.start({
+			kind: "agent",
+			command: "codex",
+			cwd,
+			label: "builder",
+			prompt: "Build.",
+			closeOnSettle: true,
+			requiredArtifactPath: artifactPath,
+		});
+		fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+		await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+		fake.respond("agent get", () => agentGet("w1:p7", record.agentName ?? "", "done"));
+		fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+
+		const finished = await completion;
+		assert.equal(finished.agentState, "done");
+		await flushAsync();
+		assert.deepEqual(closedPanes(fake.execCalls), ["w1:p7"]);
+	} finally {
+		await rm(artifactDir, { force: true, recursive: true });
+	}
 });
 
 test("an agent run stays supervised through transient compaction", async () => {

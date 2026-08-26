@@ -48,6 +48,8 @@ export interface StartOptions {
 	reuseName?: string;
 	/** Agent runs: close the dedicated pane after a successful done/idle settlement. */
 	closeOnSettle?: boolean;
+	/** Agent runs: require this durable result artifact before treating done/idle as success. */
+	requiredArtifactPath?: string;
 	/** Skip the promoted-run viewer pane; the run stays visible in bg_list only. */
 	quiet?: boolean;
 }
