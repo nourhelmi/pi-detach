@@ -14,7 +14,8 @@ import type {
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import registerDetachExtension from "../extensions/index.ts";
-import { agentLabel, workerHarness } from "../src/tools/bg-agent.ts";
+import type { Registry } from "../src/registry.ts";
+import { agentLabel, agentTombstoneNote, workerHarness } from "../src/tools/bg-agent.ts";
 
 type AnyTool = ToolDefinition<any, any, any>;
 
@@ -75,7 +76,7 @@ test("registers the full toolset", () => {
 	const { tools, shutdown } = host();
 	assert.deepEqual(
 		[...tools.keys()].sort(),
-		["bg_agent", "bg_list", "bg_output", "bg_run", "bg_stop", "bg_watch"],
+		["bg_agent", "bg_await", "bg_list", "bg_output", "bg_run", "bg_stop", "bg_watch"],
 	);
 	shutdown();
 });
@@ -231,4 +232,66 @@ test("shutdown terminates everything still running", async () => {
 	await new Promise((r) => setTimeout(r, 100));
 	const listed = await call("bg_list", {});
 	assert.doesNotMatch(text(listed), new RegExp(`${watch.details.runId} · watch · running`));
+});
+
+test("bg_await resolves inline when the until condition matches the first probe", async () => {
+	const { call, shutdown } = host();
+	const result = await call("bg_await", {
+		command: "echo 'status: Succeeded'",
+		untilPattern: "succeeded",
+		intervalSeconds: 5,
+		timeoutSeconds: 60,
+	});
+	assert.equal(result.details.promoted, false);
+	assert.equal(result.details.exitCode, 0);
+	assert.match(text(result), /Until condition matched/);
+	shutdown();
+});
+
+test("bg_await flags a hard failure via failPattern", async () => {
+	const { call, shutdown } = host();
+	const result = await call("bg_await", {
+		command: "echo 'status: Aborted'; false",
+		failPattern: "aborted",
+		intervalSeconds: 5,
+		timeoutSeconds: 60,
+	});
+	assert.equal(result.details.exitCode, 1);
+	assert.match(text(result), /Failure condition matched/);
+	shutdown();
+});
+
+test("bg_await rejects an invalid pattern without starting a run", async () => {
+	const { call, shutdown } = host();
+	const result = await call("bg_await", { command: "true", untilPattern: "(" });
+	assert.equal(result.details.status, "failed");
+	assert.match(text(result), /not a valid regex/);
+	shutdown();
+});
+
+test("bg_agent name-reuse misses are explained by a session tombstone", () => {
+	const registry = {
+		list: () => [
+			{
+				id: "abc123",
+				kind: "agent",
+				backend: "herdr",
+				label: "checker · review",
+				command: "pi",
+				cwd: "/tmp",
+				status: "exited",
+				agentName: "checker-review-x",
+				agentState: "done",
+				resultPath: "/tmp/result.md",
+				startedAt: Date.now() - 120_000,
+				endedAt: Date.now() - 60_000,
+				durationMs: 60_000,
+			},
+		],
+	} as unknown as Registry;
+	const note = agentTombstoneNote(registry, "checker-review-x");
+	assert.ok(note);
+	assert.match(note, /settled done/);
+	assert.match(note, /\/tmp\/result\.md/);
+	assert.equal(agentTombstoneNote(registry, "other"), undefined);
 });

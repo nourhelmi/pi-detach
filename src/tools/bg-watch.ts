@@ -26,12 +26,14 @@ export function registerBgWatchTool(pi: ExtensionAPI, registry: Registry): void 
 		description:
 			"Start a long-lived process that is not expected to exit — a dev server, " +
 			"a file watcher, a log tail. Returns immediately and stays silent while healthy. " +
-			"You are only interrupted if it exits unexpectedly or prints a line matching " +
-			"errorPattern. Read its output at any time with bg_output.",
+			"You are only interrupted if it exits unexpectedly, prints a line matching " +
+			"errorPattern, or prints a line matching donePattern (a terminal condition: " +
+			"you are woken once and the watch is stopped). Read its output at any time with bg_output.",
 		promptSnippet: "bg_watch — start a dev server or watcher that runs quietly in the background.",
 		promptGuidelines: [
 			"Use bg_watch only for processes that never terminate on their own; use bg_run for anything that finishes.",
 			"Starting the same command in the same directory twice returns the existing run instead of a second process. The same command in a different worktree is a separate run and will start normally.",
+			"Give CI/deploy log watchers a donePattern for their terminal states (e.g. \"Succeeded|Failed|Aborted\") so the terminal line wakes you instead of you polling.",
 		],
 		parameters: Type.Object({
 			command: Type.String({ description: "Shell command to run." }),
@@ -46,6 +48,13 @@ export function registerBgWatchTool(pi: ExtensionAPI, registry: Registry): void 
 					description:
 						"Case-insensitive regex. A matching output line interrupts the session, " +
 						"at most once per minute per run.",
+				}),
+			),
+			donePattern: Type.Optional(
+				Type.String({
+					description:
+						"Case-insensitive regex marking the watched process's terminal condition. " +
+						"The first matching output line wakes the session once and stops the watch.",
 				}),
 			),
 		}),
@@ -64,6 +73,7 @@ export function registerBgWatchTool(pi: ExtensionAPI, registry: Registry): void 
 				cwd,
 				...(params.label ? { label: params.label } : {}),
 				...(params.errorPattern ? { errorPattern: params.errorPattern } : {}),
+				...(params.donePattern ? { donePattern: params.donePattern } : {}),
 			});
 
 			const where = record.paneId ? `\n  pane: ${record.paneId} (visible in herdr)` : "";

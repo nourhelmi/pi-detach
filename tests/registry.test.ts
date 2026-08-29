@@ -136,3 +136,22 @@ test("lists runs with newest first", async () => {
 	assert.equal(listed[0]?.label, "second");
 	assert.equal(listed.length, 2);
 });
+
+test("a done line notifies once and outranks the error pattern", async () => {
+	const registry = createRegistry();
+	const done: string[] = [];
+	const errors: string[] = [];
+	registry.onDoneLine((_record, line) => done.push(line));
+	registry.onErrorLine((_record, line) => errors.push(line));
+	const { completion } = await registry.start({
+		kind: "watch",
+		command: "echo waiting; echo 'Pipeline FAILED — terminal state'",
+		cwd,
+		donePattern: "terminal",
+		errorPattern: "failed",
+	});
+	await completion;
+	assert.deepEqual(errors, []);
+	assert.equal(done.length, 1);
+	assert.match(done[0] ?? "", /terminal state/);
+});

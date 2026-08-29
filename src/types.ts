@@ -30,6 +30,10 @@ export interface RunRecord {
 	promoted: boolean;
 	logPath: string;
 	errorPattern?: string;
+	/** Watch runs: a matching output line is terminal — notify once and stop the watch. */
+	donePattern?: string;
+	/** Agent runs: durable result artifact path, kept for post-settlement lookups. */
+	resultPath?: string | undefined;
 	/** Set when a herdr start failed and the run fell back to a local process. */
 	fallbackReason?: string | undefined;
 	/** Quiet runs never get a viewer pane when promoted (silent waiters). */
@@ -42,6 +46,8 @@ export interface StartOptions {
 	cwd: string;
 	label?: string;
 	errorPattern?: string;
+	/** Watch runs: terminal-condition regex; first match notifies once and stops the watch. */
+	donePattern?: string;
 	/** Agent runs: the prompt submitted after the agent is ready. */
 	prompt?: string;
 	/** Agent runs: reuse this live herdr agent instead of starting a new one. */
@@ -73,6 +79,7 @@ export interface RunSummary {
 	paneId?: string;
 	agentName?: string;
 	agentState?: AgentSettledState;
+	resultPath?: string;
 	exitCode?: number;
 	startedAt: number;
 	endedAt?: number;

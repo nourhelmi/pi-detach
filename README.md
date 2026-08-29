@@ -54,6 +54,7 @@ detached-process backend.
 | --- | --- |
 | `bg_run` | Run a command. Blocks, then auto-detaches after `promoteAfterMs` (default 30s). |
 | `bg_watch` | Start a process that never exits — dev server, file watcher, log tail. Silent while healthy. |
+| `bg_await` | Probe a command on an interval until a terminal condition, then wake the session once. Quiet by design. |
 | `bg_agent` | Start a visible Pi, Codex, or Claude role agent beside the caller in the same Herdr tab; wakes you when it settles. |
 | `bg_output` | Read a run's captured log — live from the pane while running, from disk after. |
 | `bg_list` | Show every run from this session, its status, and its pane. |
@@ -77,9 +78,26 @@ rather than killing it.
 ```
 
 Returns immediately and stays quiet. Interrupts the session only if the process
-dies on its own or prints a line matching `errorPattern` — at most once a minute
-per run. Stopping it with `bg_stop` is silent. In herdr mode the server runs in
-its own pane, so you can just look at it.
+dies on its own, prints a line matching `errorPattern` — at most once a minute
+per run — or prints a line matching `donePattern`, a terminal condition that
+wakes the session once and stops the watch (useful for CI/deploy log tails:
+`"donePattern": "Succeeded|Failed|Aborted"`). Stopping it with `bg_stop` is
+silent. In herdr mode the server runs in its own pane, so you can just look at it.
+
+### `bg_await`
+
+```jsonc
+{ "command": "curl -fsS https://ci.example/status", "untilPattern": "Succeeded", "failPattern": "Failed|Aborted", "intervalSeconds": 60, "timeoutSeconds": 3600 }
+```
+
+Replaces sleep/poll loops run through the session. A quiet background loop runs
+the probe once per interval and exits when the condition is met (exit 0), when
+`failPattern` matches (exit 1), or at the deadline (exit 124) — the session is
+woken exactly once, on the terminal state. Without `untilPattern` the wait
+completes when the probe itself exits 0, which fits `curl -f` health checks.
+Patterns are case-insensitive POSIX EREs. Waits that turn terminal within 15s
+resolve inline without detaching. No viewer pane is ever attached; progress is
+visible with `bg_output`, cancellation with `bg_stop`.
 
 ### `bg_agent` (Herdr only)
 

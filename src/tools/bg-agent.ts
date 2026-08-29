@@ -25,6 +25,23 @@ import { formatDuration } from "../format.ts";
 import type { Registry } from "../registry.ts";
 import type { RunRecord } from "../types.ts";
 
+/** Explains a dead reuse `name` from this session's history instead of a bare miss. */
+export function agentTombstoneNote(registry: Registry, name: string): string | undefined {
+	const past = registry
+		.list()
+		.find((run) => run.kind === "agent" && run.agentName === name && run.status !== "running");
+	if (!past) return undefined;
+	const ago = formatDuration(Date.now() - (past.endedAt ?? past.startedAt));
+	const artifact = past.resultPath
+		? `Its durable result artifact: ${past.resultPath} — read it instead of resuming.`
+		: `Read its transcript with bg_output({ runId: "${past.id}" }).`;
+	return (
+		`It settled ${past.agentState ?? "unknown"} ${ago} ago as run ${past.id} and its pane closed.\n` +
+		`${artifact}\n` +
+		"Launch a fresh agent for the follow-up (omit `name`), or pass keepAlive: true next time a follow-up is planned."
+	);
+}
+
 const DEFAULT_PROMOTE_AFTER_MS = 30_000;
 const INLINE_TAIL_LINES = 120;
 
@@ -346,7 +363,11 @@ async function executeAgent(options: ExecuteAgentOptions): Promise<AgentToolResu
 			...(launch.resultPath ? { requiredArtifactPath: launch.resultPath } : {}),
 		});
 	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
+		let message = error instanceof Error ? error.message : String(error);
+		if (params.name && message.includes("no live herdr agent named")) {
+			const tombstone = agentTombstoneNote(registry, params.name);
+			if (tombstone) message += `\n${tombstone}`;
+		}
 		return {
 			content: [{ type: "text", text: `bg_agent failed to start: ${message}` }],
 			details: { runId: "", promoted: false, status: "failed", durationMs: 0 },

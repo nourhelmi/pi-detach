@@ -35,6 +35,7 @@ interface LiveRun {
 	stream: WriteStream;
 	tail: string[];
 	pending: string;
+	doneMatched?: boolean;
 	completion: Promise<RunRecord>;
 	resolve: (record: RunRecord) => void;
 }
@@ -51,6 +52,7 @@ export interface Registry {
 	markPromoted(id: string): void;
 	onExit(handler: (record: RunRecord) => void): void;
 	onErrorLine(handler: (record: RunRecord, line: string) => void): void;
+	onDoneLine(handler: (record: RunRecord, line: string) => void): void;
 }
 
 function dedupeKey(cwd: string, command: string): string {
@@ -73,6 +75,7 @@ function summarize(record: RunRecord): RunSummary {
 		...(record.paneId !== undefined ? { paneId: record.paneId } : {}),
 		...(record.agentName !== undefined ? { agentName: record.agentName } : {}),
 		...(record.agentState !== undefined ? { agentState: record.agentState } : {}),
+		...(record.resultPath !== undefined ? { resultPath: record.resultPath } : {}),
 		...(record.exitCode !== undefined ? { exitCode: record.exitCode } : {}),
 		startedAt: record.startedAt,
 		...(record.endedAt !== undefined ? { endedAt: record.endedAt } : {}),
@@ -147,12 +150,21 @@ export interface RegistryOptions {
 	onPromoted?: (record: RunRecord, completion: Promise<RunRecord>) => void;
 }
 
+function matchesPattern(pattern: string, line: string): boolean {
+	try {
+		return new RegExp(pattern, "i").test(line);
+	} catch {
+		return line.toLowerCase().includes(pattern.toLowerCase());
+	}
+}
+
 export function createRegistry(options: RegistryOptions = {}): Registry {
 	const { herdrDriver, onPromoted } = options;
 	const runs = new Map<string, LiveRun>();
 	const active = new Map<string, string>();
 	const exitHandlers: ((record: RunRecord) => void)[] = [];
 	const errorLineHandlers: ((record: RunRecord, line: string) => void)[] = [];
+	const doneLineHandlers: ((record: RunRecord, line: string) => void)[] = [];
 
 	function absorb(live: LiveRun, chunk: string): void {
 		live.stream.write(chunk);
@@ -161,16 +173,14 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 		live.pending = parts.pop() ?? "";
 		for (const line of parts) {
 			live.tail.push(line);
-			if (live.record.errorPattern && live.record.status === "running") {
-				let matched = false;
-				try {
-					matched = new RegExp(live.record.errorPattern, "i").test(line);
-				} catch {
-					matched = line.toLowerCase().includes(live.record.errorPattern.toLowerCase());
-				}
-				if (matched) {
-					for (const handler of errorLineHandlers) handler(live.record, line);
-				}
+			if (live.record.status !== "running") continue;
+			if (live.record.donePattern && !live.doneMatched && matchesPattern(live.record.donePattern, line)) {
+				live.doneMatched = true;
+				for (const handler of doneLineHandlers) handler(live.record, line);
+				continue;
+			}
+			if (live.record.errorPattern && matchesPattern(live.record.errorPattern, line)) {
+				for (const handler of errorLineHandlers) handler(live.record, line);
 			}
 		}
 		if (live.tail.length > TAIL_LINES) {
@@ -212,6 +222,8 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 			promoted: options.kind === "watch",
 			logPath,
 			...(options.errorPattern ? { errorPattern: options.errorPattern } : {}),
+			...(options.donePattern ? { donePattern: options.donePattern } : {}),
+			...(options.requiredArtifactPath ? { resultPath: options.requiredArtifactPath } : {}),
 			...(options.quiet ? { quiet: true } : {}),
 		};
 
@@ -354,6 +366,9 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 		},
 		onErrorLine(handler) {
 			errorLineHandlers.push(handler);
+		},
+		onDoneLine(handler) {
+			doneLineHandlers.push(handler);
 		},
 	};
 }

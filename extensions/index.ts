@@ -30,6 +30,7 @@ import { createViewerManager } from "../src/herdr/viewer.ts";
 import { createNotifier } from "../src/notify.ts";
 import { createRegistry } from "../src/registry.ts";
 import { registerBgAgentTool } from "../src/tools/bg-agent.ts";
+import { registerBgAwaitTool } from "../src/tools/bg-await.ts";
 import { registerBgListTool } from "../src/tools/bg-list.ts";
 import { registerBgOutputTool } from "../src/tools/bg-output.ts";
 import { registerBgRunTool } from "../src/tools/bg-run.ts";
@@ -94,9 +95,14 @@ export default function registerDetachExtension(pi: ExtensionAPI): void {
 
 	registry.onExit((record) => notifier.runFinished(record));
 	registry.onErrorLine((record, line) => notifier.watchErrorLine(record, line));
+	registry.onDoneLine((record, line) => {
+		notifier.watchDoneLine(record, line);
+		registry.stop(record.id);
+	});
 
 	registerBgRunTool(pi, registry);
 	registerBgWatchTool(pi, registry);
+	registerBgAwaitTool(pi, registry);
 	registerBgAgentTool(pi, registry);
 	registerBgOutputTool(pi, registry);
 	registerBgListTool(pi, registry);

@@ -23,6 +23,7 @@ const CONTINUE_HINT =
 export interface Notifier {
 	runFinished(record: RunRecord): void;
 	watchErrorLine(record: RunRecord, line: string): void;
+	watchDoneLine(record: RunRecord, line: string): void;
 }
 
 function paneHint(record: RunRecord): string[] {
@@ -119,6 +120,19 @@ export function createNotifier(
 				CONTINUE_HINT,
 			].join("\n");
 			deliver("detach_watch_error", content, record);
+		},
+
+		watchDoneLine(record, line) {
+			const content = [
+				`[detach] watch ${record.id} · ${record.label} matched its done pattern — the watch is terminal and is being stopped:`,
+				...paneHint(record),
+				"",
+				line.trim(),
+				"",
+				`Full log: bg_output({ runId: "${record.id}" })`,
+				CONTINUE_HINT,
+			].join("\n");
+			deliver("detach_watch_done", content, record);
 		},
 	};
 }
