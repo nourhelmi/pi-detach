@@ -5,7 +5,10 @@
  */
 
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import type {
 	AgentToolResult,
@@ -15,7 +18,12 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import registerDetachExtension from "../extensions/index.ts";
 import type { Registry } from "../src/registry.ts";
-import { agentLabel, agentTombstoneNote, workerHarness } from "../src/tools/bg-agent.ts";
+import {
+	agentLabel,
+	agentTombstoneNote,
+	withReservedResultArtifact,
+	workerHarness,
+} from "../src/tools/bg-agent.ts";
 
 type AnyTool = ToolDefinition<any, any, any>;
 
@@ -294,4 +302,33 @@ test("bg_agent name-reuse misses are explained by a session tombstone", () => {
 	assert.match(note, /settled done/);
 	assert.match(note, /\/tmp\/result\.md/);
 	assert.equal(agentTombstoneNote(registry, "other"), undefined);
+});
+
+test("failed native starts remove only their reserved empty result", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-detach-result-start-failure-"));
+	const resultPath = join(dir, "result.md");
+	try {
+		await assert.rejects(
+			withReservedResultArtifact(resultPath, async () => {
+				assert.equal(existsSync(resultPath), true, "reservation exists before registry start");
+				throw new Error("start refused");
+			}),
+			/start refused/,
+		);
+		assert.equal(existsSync(resultPath), false, "owned placeholder is removed after start failure");
+	} finally {
+		await rm(dir, { force: true, recursive: true });
+	}
+});
+
+test("successfully started native runs retain their result reservation", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "pi-detach-result-started-"));
+	const resultPath = join(dir, "result.md");
+	try {
+		const value = await withReservedResultArtifact(resultPath, async () => "started");
+		assert.equal(value, "started");
+		assert.equal(existsSync(resultPath), true, "settlement owns validation of a started run");
+	} finally {
+		await rm(dir, { force: true, recursive: true });
+	}
 });

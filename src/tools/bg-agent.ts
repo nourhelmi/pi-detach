@@ -6,7 +6,7 @@
  * its selected model through the provider's native Codex/Claude harness.
  */
 
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, unlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import type {
 	AgentToolResult,
@@ -195,6 +195,21 @@ async function reserveResultArtifact(path: string): Promise<void> {
 	}
 }
 
+export async function withReservedResultArtifact<T>(
+	path: string,
+	start: () => Promise<T>,
+): Promise<T> {
+	await reserveResultArtifact(path);
+	try {
+		return await start();
+	} catch (error) {
+		// The exclusive reservation proves this invocation owns the placeholder.
+		// A successfully returned run keeps it for settlement validation.
+		await unlink(path).catch(() => undefined);
+		throw error;
+	}
+}
+
 export function agentLabel(params: BgAgentParams): string {
 	const role = params.role?.trim().split(/\s+/)[0];
 	if (params.label) {
@@ -359,9 +374,7 @@ async function executeAgent(options: ExecuteAgentOptions): Promise<AgentToolResu
 	let started: Awaited<ReturnType<Registry["start"]>>;
 	try {
 		launch = await prepareLaunch(params, label);
-		if (launch.resultPath) await reserveResultArtifact(launch.resultPath);
-
-		started = await registry.start({
+		const start = () => registry.start({
 			kind: "agent",
 			command: launch.command,
 			cwd,
@@ -371,6 +384,9 @@ async function executeAgent(options: ExecuteAgentOptions): Promise<AgentToolResu
 			closeOnSettle: !params.keepAlive,
 			...(launch.resultPath ? { requiredArtifactPath: launch.resultPath } : {}),
 		});
+		started = launch.resultPath
+			? await withReservedResultArtifact(launch.resultPath, start)
+			: await start();
 	} catch (error) {
 		let message = error instanceof Error ? error.message : String(error);
 		if (params.name && message.includes("no live herdr agent named")) {

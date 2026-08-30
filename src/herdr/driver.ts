@@ -9,9 +9,9 @@
  * process-info and settles the run as killed when the shell is back at its
  * prompt without a sentinel having matched.
  *
- * Agent runs (`bg_agent`) start a real agent with `herdr agent start`, submit
- * the prompt with `pane run`, confirm the agent went `working`, then race
- * blocking waits on done/idle/blocked and report how it settled.
+ * Agent runs (`bg_agent`) start a real agent with `herdr agent start`, bind
+ * prompt submission to an observed lifecycle transition, then supervise
+ * working/done/idle/blocked and report how the turn settled.
  */
 
 import { type CliResult, findString, type HerdrCli, type Waiter } from "./cli.ts";
@@ -37,6 +37,8 @@ const INTERRUPT_GRACE_MS = 3_000;
 const STOP_SETTLE_MS = 1_500;
 const AGENT_START_TIMEOUT_MS = 45_000;
 const AGENT_WORKING_TIMEOUT_MS = 20_000;
+const AGENT_PROMPT_WAIT_TIMEOUT_MS = 20_000;
+const AGENT_PROMPT_PROCESS_TIMEOUT_MS = AGENT_PROMPT_WAIT_TIMEOUT_MS + 5_000;
 // herdr 0.8 waits require an explicit --timeout; emulate the old indefinite wait.
 const WAIT_FOREVER_MS = 7 * 24 * 60 * 60 * 1000;
 const SHELL_READY_ATTEMPTS = 120;
@@ -76,7 +78,37 @@ function agentName(label: string, id: string): string {
 
 function isUnavailableShell(result: CliResult): boolean {
 	const detail = `${result.errorMessage ?? ""}\n${result.stderr}`.toLowerCase();
-	return detail.includes("not an available shell");
+	return result.errorCode === "agent_pane_busy" || detail.includes("not an available shell");
+}
+
+type ObservedAgentState = "working" | "done" | "idle" | "blocked";
+
+function observedAgentState(json: unknown): ObservedAgentState | undefined {
+	const raw = (findString(json, "agent_status") ?? findString(json, "status"))?.toLowerCase();
+	return raw === "working" || raw === "done" || raw === "idle" || raw === "blocked"
+		? raw
+		: undefined;
+}
+
+function isSameOccupant(
+	occupant: ReturnType<typeof occupantFrom>,
+	paneId: string,
+	name: string,
+): boolean {
+	return Boolean(occupant && occupant.paneId === paneId && occupant.agentName === name);
+}
+
+function generationChanged(
+	before: ReturnType<typeof occupantFrom>,
+	after: ReturnType<typeof occupantFrom>,
+): boolean {
+	return Boolean(
+		before
+			&& after
+			&& typeof before.stateChangeSeq === "number"
+			&& typeof after.stateChangeSeq === "number"
+			&& before.stateChangeSeq !== after.stateChangeSeq,
+	);
 }
 
 function isCompactionRunning(output: string): boolean {
@@ -458,13 +490,6 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			closeOnSettle: Boolean(options.closeOnSettle && !options.requiredArtifactPath),
 		});
 
-		// herdr 0.8 `agent prompt` submits text + Enter atomically under the
-		// pane's live bracketed-paste mode, so no multiline Enter retry is needed.
-		const prompted = await cli.exec(["agent", "prompt", name, options.prompt]);
-		if (!prompted.ok) {
-			throw new Error(`failed to submit prompt: ${prompted.errorMessage ?? prompted.stderr.trim()}`);
-		}
-
 		let finished = false;
 		const waiters: Waiter[] = [];
 		const timers: NodeJS.Timeout[] = [];
@@ -601,27 +626,115 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			});
 		}
 
-		void (async () => {
-			let workingTimeoutMs = AGENT_WORKING_TIMEOUT_MS;
-			while (!finished) {
-				const workingResult = await waitForWorking(workingTimeoutMs);
-				if (finished) return;
-				if (!workingResult.ok) {
-					if (workingResult.errorCode === "cancelled") return;
-					const output = await readPane(paneId).catch(() => undefined);
-					if (output !== undefined && isCompactionRunning(output)) {
-						workingTimeoutMs = WAIT_FOREVER_MS;
-						continue;
-					}
-					await settle(
-						"stalled",
-						workingTimeoutMs === AGENT_WORKING_TIMEOUT_MS
-							? "the prompt did not visibly start a turn within 20s — check the pane"
-							: "the agent did not resume after compaction — check the pane",
-						output,
-					);
-					return;
+		const beforePromptResult = await cli.exec(["agent", "get", paneId]);
+		const beforePrompt = beforePromptResult.ok ? occupantFrom(beforePromptResult.json) : undefined;
+		let promptState: ObservedAgentState | undefined;
+		let promptFailureNote: string | undefined;
+
+		// Bind submission to an observed post-prompt lifecycle transition. Herdr
+		// can otherwise accept text into a composer while a separate working-only
+		// waiter misses both an unsubmitted prompt and a fast working → idle turn.
+		const prompted = await cli.exec(
+			[
+				"agent",
+				"prompt",
+				name,
+				options.prompt,
+				"--wait",
+				"--until",
+				"working",
+				"--until",
+				"done",
+				"--until",
+				"idle",
+				"--until",
+				"blocked",
+				"--timeout",
+				String(AGENT_PROMPT_WAIT_TIMEOUT_MS),
+			],
+			{ timeoutMs: AGENT_PROMPT_PROCESS_TIMEOUT_MS },
+		);
+		if (prompted.ok) {
+			promptState = observedAgentState(prompted.json);
+		} else if (prompted.errorCode === "agent_prompt_stalled") {
+			const currentResult = await cli.exec(["agent", "get", paneId]);
+			const current = currentResult.ok ? occupantFrom(currentResult.json) : undefined;
+			if (isSameOccupant(current, paneId, name) && current?.status === "working") {
+				promptState = "working";
+			} else if (
+				isSameOccupant(beforePrompt, paneId, name)
+				&& isSameOccupant(current, paneId, name)
+				&& generationChanged(beforePrompt, current)
+				&& (current?.status === "done" || current?.status === "idle" || current?.status === "blocked")
+			) {
+				promptState = current.status;
+			} else if (
+				isSameOccupant(beforePrompt, paneId, name)
+				&& isSameOccupant(current, paneId, name)
+				&& typeof beforePrompt?.stateChangeSeq === "number"
+				&& beforePrompt.stateChangeSeq === current?.stateChangeSeq
+				&& current.status === "idle"
+			) {
+				// One guarded recovery for the observed Herdr failure mode: the full
+				// prompt is visibly left in the unchanged idle agent's composer.
+				const entered = await cli.exec(["pane", "send-keys", paneId, "enter"]);
+				if (!entered.ok) {
+					promptFailureNote = `prompt stalled and Enter recovery failed: ${entered.errorMessage ?? entered.stderr.trim()}`;
 				}
+			} else {
+				promptFailureNote = "prompt submission stalled without a safe same-agent recovery";
+			}
+		} else {
+			throw new Error(`failed to submit prompt: ${prompted.errorMessage ?? prompted.stderr.trim()}`);
+		}
+
+		void (async () => {
+			if (promptFailureNote) {
+				await settle("stalled", promptFailureNote);
+				return;
+			}
+			if (promptState === "done" || promptState === "idle" || promptState === "blocked") {
+				await settle(promptState);
+				return;
+			}
+			let workingTimeoutMs = AGENT_WORKING_TIMEOUT_MS;
+			let workingObserved = promptState === "working";
+			while (!finished) {
+				if (!workingObserved) {
+					const workingResult = await waitForWorking(workingTimeoutMs);
+					if (finished) return;
+					if (!workingResult.ok) {
+						if (workingResult.errorCode === "cancelled") return;
+						const currentResult = await cli.exec(["agent", "get", paneId]);
+						const current = currentResult.ok ? occupantFrom(currentResult.json) : undefined;
+						if (
+							isSameOccupant(current, paneId, name)
+							&& generationChanged(beforePrompt, current)
+							&& (current?.status === "done" || current?.status === "idle" || current?.status === "blocked")
+						) {
+							await settle(current.status);
+							return;
+						}
+						if (isSameOccupant(current, paneId, name) && current?.status === "working") {
+							workingObserved = true;
+							continue;
+						}
+						const output = await readPane(paneId).catch(() => undefined);
+						if (output !== undefined && isCompactionRunning(output)) {
+							workingTimeoutMs = WAIT_FOREVER_MS;
+							continue;
+						}
+						await settle(
+							"stalled",
+							workingTimeoutMs === AGENT_WORKING_TIMEOUT_MS
+								? "the prompt did not visibly start a turn within 20s — check the pane"
+								: "the agent did not resume after compaction — check the pane",
+							output,
+						);
+						return;
+					}
+				}
+				workingObserved = false;
 
 				const settled = await waitForSettledState();
 				if (finished) return;

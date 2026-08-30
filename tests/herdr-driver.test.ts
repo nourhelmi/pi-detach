@@ -43,10 +43,12 @@ interface FakeWaiter extends Waiter {
 function createFakeCli(): {
 	cli: HerdrCli;
 	execCalls: string[][];
+	execTimeouts: Array<number | undefined>;
 	waiters: FakeWaiter[];
 	respond: (prefix: string, handler: (args: string[]) => CliResult | Promise<CliResult>) => void;
 } {
 	const execCalls: string[][] = [];
+	const execTimeouts: Array<number | undefined> = [];
 	const waiters: FakeWaiter[] = [];
 	const routes: { prefix: string; handler: (args: string[]) => CliResult | Promise<CliResult> }[] = [];
 	let paneCounter = 1;
@@ -102,8 +104,9 @@ function createFakeCli(): {
 	];
 
 	const cli: HerdrCli = {
-		exec(args) {
+		exec(args, opts) {
 			execCalls.push(args);
+			execTimeouts.push(opts?.timeoutMs);
 			const key = args.join(" ");
 			for (const route of [...routes, ...defaults]) {
 				if (key.startsWith(route.prefix)) return Promise.resolve(route.handler(args));
@@ -135,6 +138,7 @@ function createFakeCli(): {
 	return {
 		cli,
 		execCalls,
+		execTimeouts,
 		waiters,
 		respond: (prefix, handler) => routes.push({ prefix, handler }),
 	};
@@ -678,16 +682,14 @@ test("an agent run stays supervised through transient compaction", async () => {
 	assert.deepEqual(closedPanes(fake.execCalls), ["w1:p7"]);
 });
 
-test("agent start retries Herdr's transient unavailable-shell refusal", async () => {
+test("agent start retries Herdr's transient busy code and legacy prose", async () => {
 	const fake = createFakeCli();
 	let starts = 0;
 	fake.respond("agent start", () => {
 		starts += 1;
-		if (starts < 3) {
-			return failed(
-				"invalid_state",
-				"agent target pane w1:p2 is not an available shell",
-			);
+		if (starts === 1) return failed("agent_pane_busy", "pane still initializing");
+		if (starts === 2) {
+			return failed("invalid_state", "agent target pane w1:p2 is not an available shell");
 		}
 		return ok({ result: { agent: { pane_id: "w1:p2" }, type: "agent_started" } });
 	});
@@ -788,6 +790,25 @@ test("a multiline Pi prompt is submitted atomically via agent prompt", async () 
 	const prompted = fake.execCalls.find((args) => args[0] === "agent" && args[1] === "prompt");
 	assert.equal(prompted?.[2], record.agentName, "prompt targets the agent by name");
 	assert.equal(prompted?.[3], prompt, "full multiline prompt in one atomic submit");
+	assert.deepEqual(
+		prompted?.slice(4),
+		[
+			"--wait",
+			"--until",
+			"working",
+			"--until",
+			"done",
+			"--until",
+			"idle",
+			"--until",
+			"blocked",
+			"--timeout",
+			"20000",
+		],
+		"submission waits for every meaningful post-prompt lifecycle state",
+	);
+	const promptCallIndex = fake.execCalls.indexOf(prompted ?? []);
+	assert.equal(fake.execTimeouts[promptCallIndex], 25_000, "process timeout exceeds Herdr's wait budget");
 	assert.ok(
 		!fake.execCalls.some((args) => args[0] === "pane" && args[1] === "send-keys"),
 		"no Enter retry is needed",
@@ -797,6 +818,84 @@ test("a multiline Pi prompt is submitted atomically via agent prompt", async () 
 	fake.waiters.find((waiter) => waiter.args.includes("idle"))?.resolveWith(ok({}));
 	const finished = await completion;
 	assert.equal(finished.agentState, "idle");
+});
+
+test("prompt wait accepts an immediate terminal state without a working waiter", async () => {
+	const fake = createFakeCli();
+	fake.respond("agent start", () =>
+		ok({ result: { agent: { pane_id: "w1:p7" }, type: "agent_started" } }),
+	);
+	fake.respond("agent prompt", () => ok({ result: { agent: { agent_status: "done" } } }));
+	fake.respond("pane read", () => ok(undefined, "fast task finished"));
+	const registry = herdrRegistry(fake);
+	const { completion } = await registry.start({
+		kind: "agent",
+		command: "codex",
+		cwd,
+		prompt: "Finish quickly.",
+	});
+
+	const finished = await completion;
+	assert.equal(finished.agentState, "done");
+	assert.equal(fake.waiters.length, 0, "a lifecycle-bound prompt cannot miss fast settlement");
+});
+
+test("a stalled prompt gets one guarded Enter and recognizes a fast terminal turn", async () => {
+	const fake = createFakeCli();
+	let expectedName = "";
+	fake.respond("agent start", (args) => {
+		expectedName = args[2] ?? "";
+		return ok({ result: { agent: { pane_id: "w1:p7" }, type: "agent_started" } });
+	});
+	let gets = 0;
+	fake.respond("agent get", () => {
+		gets += 1;
+		return agentGet("w1:p7", expectedName, gets < 3 ? "idle" : "done", gets < 3 ? 7 : 8);
+	});
+	fake.respond("agent prompt", () => failed("agent_prompt_stalled", "no state change"));
+	fake.respond("pane read", () => ok(undefined, "recovered task finished"));
+	const registry = herdrRegistry(fake);
+	const { record, completion } = await registry.start({
+		kind: "agent",
+		command: "codex",
+		cwd,
+		label: "checker",
+		prompt: "Check the result.",
+	});
+	assert.equal(record.agentName, expectedName);
+	const enters = fake.execCalls.filter(
+		(args) => args[0] === "pane" && args[1] === "send-keys" && args[3] === "enter",
+	);
+	assert.equal(enters.length, 1, "recovery presses Enter exactly once");
+	fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(failed("timeout"));
+
+	const finished = await completion;
+	assert.equal(finished.agentState, "done", "generation change recovers a missed working state");
+});
+
+test("a stalled prompt never presses Enter for a different occupant", async () => {
+	const fake = createFakeCli();
+	fake.respond("agent start", () =>
+		ok({ result: { agent: { pane_id: "w1:p7" }, type: "agent_started" } }),
+	);
+	fake.respond("agent get", () => agentGet("w1:p7", "replacement", "idle", 9));
+	fake.respond("agent prompt", () => failed("agent_prompt_stalled", "no state change"));
+	fake.respond("pane read", () => ok(undefined, "replacement occupant"));
+	const registry = herdrRegistry(fake);
+	const { completion } = await registry.start({
+		kind: "agent",
+		command: "codex",
+		cwd,
+		prompt: "Do not send this twice.",
+	});
+
+	const finished = await completion;
+	assert.equal(finished.agentState, "stalled");
+	assert.match(registry.tail(finished.id, 10), /without a safe same-agent recovery/);
+	assert.ok(
+		!fake.execCalls.some((args) => args[0] === "pane" && args[1] === "send-keys"),
+		"mismatched occupant receives no input",
+	);
 });
 
 test("a blocked agent is reported as blocked", async () => {
