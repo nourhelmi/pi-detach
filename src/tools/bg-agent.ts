@@ -92,7 +92,15 @@ const BgAgentParameters = Type.Object({
 	),
 	anchor: Type.Optional(
 		Type.String({
-			description: "Concrete command, evidence condition, or artifact that proves the task is done.",
+			description:
+				"Single-criterion shorthand: one concrete command, evidence condition, or artifact that proves the task is done. Prefer `acceptance` for anything nontrivial.",
+		}),
+	),
+	acceptance: Type.Optional(
+		Type.Array(Type.String(), {
+			maxItems: 12,
+			description:
+				"Enumerated falsifiable acceptance criteria. Each states a claim the work must survive and how it is proven (command, evidence condition, or artifact). The worker must verify every criterion itself and map its result Claims one-to-one to them.",
 		}),
 	),
 	resultPath: Type.Optional(
@@ -245,6 +253,7 @@ async function prepareLaunch(params: BgAgentParams, label: string): Promise<Reso
 		prompt: params.prompt,
 		label,
 		...(params.anchor ? { anchor: params.anchor } : {}),
+		...(params.acceptance ? { acceptance: params.acceptance } : {}),
 		...(params.resultPath ? { resultPath: params.resultPath } : {}),
 		...(params.requiredSkills ? { requiredSkills: params.requiredSkills } : {}),
 	});
@@ -399,7 +408,7 @@ export function registerBgAgentTool(pi: ExtensionAPI, registry: Registry): void 
 		promptGuidelines: [
 			"Use a configured `role` when delegated work needs a role skill, anchor policy, or turn cap.",
 			"Omit `model` and `thinking` to use Pi's default runtime identity; when supplied, they pass through to Pi.",
-			"Provide a concrete `anchor` when the selected role requires one; list only the task skills that agent must load.",
+			"Spell out `acceptance` criteria: enumerated falsifiable claims with their proof method. `anchor` remains a single-criterion shorthand; roles that require one accept either.",
 			"Prompts must be self-contained — the helper agent shares no context with this session.",
 			"Fan out several bg_agent calls in one message only for independent tasks.",
 			"Use `keepAlive: true` only when the same maker has a planned follow-up; successful tabs otherwise close automatically.",

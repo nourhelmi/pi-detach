@@ -88,6 +88,7 @@ export interface ResolveAgentLaunchOptions {
 	prompt: string;
 	label: string;
 	anchor?: string;
+	acceptance?: string[];
 	requiredSkills?: string[];
 	resultPath?: string;
 	configPath?: string;
@@ -275,8 +276,13 @@ function rolePrompt(
 	maxTurns: number | undefined,
 	resultPath: string | undefined,
 ): string {
-	if (profile.requireAnchor && !options.anchor?.trim()) {
-		throw new Error(`bg_agent role ${role} requires a concrete anchor`);
+	const criteria = [...(options.acceptance ?? []), ...(options.anchor ? [options.anchor] : [])]
+		.map((criterion) => criterion.trim())
+		.filter(Boolean);
+	if (profile.requireAnchor && criteria.length === 0) {
+		throw new Error(
+			`bg_agent role ${role} requires at least one acceptance criterion (acceptance or anchor)`,
+		);
 	}
 	const skills = options.requiredSkills ?? [];
 	for (const skill of skills) {
@@ -288,8 +294,11 @@ function rolePrompt(
 		"TASK:",
 		options.prompt.trim(),
 		"",
-		"ANCHOR:",
-		options.anchor?.trim() || "Return the requested bounded result with direct evidence.",
+		"ACCEPTANCE CRITERIA:",
+		"Falsifiable claims this work must survive. Verify each yourself before reporting done; map your result Claims one-to-one to these criteria with direct evidence.",
+		...(criteria.length
+			? criteria.map((criterion, index) => `${index + 1}. ${criterion}`)
+			: ["1. Return the requested bounded result with direct evidence."]),
 		"",
 		"REQUIRED SKILLS:",
 		"Load and follow each listed skill before starting.",

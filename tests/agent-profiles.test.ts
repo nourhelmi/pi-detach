@@ -77,7 +77,7 @@ test("role launch needs no model and preserves skill, tool, anchor, and turn gua
 	assert.equal(launch.thinking, undefined);
 	assert.equal(launch.maxTurns, 4);
 	assert.match(launch.prompt, /^Load and follow the role-reviewer skill before starting\.\n\nROLE: reviewer/);
-	assert.match(launch.prompt, /ANCHOR:\nReport evidence-backed findings\./);
+	assert.match(launch.prompt, /ACCEPTANCE CRITERIA:\n[^\n]+\n1\. Report evidence-backed findings\./);
 	assert.match(launch.prompt, /REQUIRED SKILLS:\nLoad and follow each listed skill before starting\.[\s\S]+- review-pr/);
 	assert.match(launch.prompt, /TURN CAP: 4$/);
 });
@@ -91,7 +91,23 @@ test("requires an anchor when the selected role profile requires one", async () 
 			label: "reviewer",
 			configPath: path,
 		}),
-		/requires a concrete anchor/,
+		/requires at least one acceptance criterion/,
+	);
+});
+
+test("acceptance criteria render numbered and satisfy a role's anchor requirement", async () => {
+	const path = await configFile(GUARDED_PROFILE);
+	const launch = await resolveAgentLaunch({
+		role: "reviewer",
+		prompt: "Review the change.",
+		acceptance: ["Focused suites pass in the worktree.", "No new public API is introduced."],
+		anchor: "Diff stays under 400 lines.",
+		label: "reviewer",
+		configPath: path,
+	});
+	assert.match(
+		launch.prompt,
+		/ACCEPTANCE CRITERIA:\n[^\n]+\n1\. Focused suites pass in the worktree\.\n2\. No new public API is introduced\.\n3\. Diff stays under 400 lines\./,
 	);
 });
 
