@@ -558,6 +558,72 @@ test("a valid required result artifact preserves successful close-on-settle", as
 	}
 });
 
+test("a working-wait timeout stays supervised while compaction is running", async () => {
+	const fake = createFakeCli();
+	fake.respond("agent get", () =>
+		ok({ result: { agent: { pane_id: "w1:p7", name: "reviewer-abc" }, type: "agent_info" } }),
+	);
+	let reads = 0;
+	fake.respond("pane read", () => {
+		reads += 1;
+		return ok(
+			undefined,
+			reads === 1
+				? "prior output\n◐ OpenAI compaction running…\nCompacting context..."
+				: "✓ OpenAI compaction complete\ncontinued task\nfinal answer",
+		);
+	});
+	const registry = herdrRegistry(fake);
+	const { completion } = await registry.start({
+		kind: "agent",
+		command: "pi",
+		cwd,
+		prompt: "Continue after compaction.",
+		reuseName: "reviewer-abc",
+	});
+
+	fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(failed("timeout"));
+	await flushAsync();
+
+	let completed = false;
+	void completion.then(() => {
+		completed = true;
+	});
+	await flushAsync();
+	assert.equal(completed, false, "compaction does not settle the run as stalled");
+	const workingWaiters = fake.waiters.filter((waiter) => waiter.args.includes("working"));
+	assert.equal(workingWaiters.length, 2, "driver rearms the working wait through compaction");
+	workingWaiters.at(-1)?.resolveWith(ok({}));
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+	fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+
+	const finished = await completion;
+	assert.equal(finished.agentState, "done");
+});
+
+test("a non-compacting working-wait timeout settles stalled with the existing note", async () => {
+	const fake = createFakeCli();
+	fake.respond("agent start", () =>
+		ok({ result: { agent: { pane_id: "w1:p7" }, type: "agent_started" } }),
+	);
+	fake.respond("pane read", () => ok(undefined, "agent remained idle"));
+	const registry = herdrRegistry(fake);
+	const { completion } = await registry.start({
+		kind: "agent",
+		command: "pi",
+		cwd,
+		prompt: "Start work.",
+	});
+
+	fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(failed("timeout"));
+	const finished = await completion;
+	assert.equal(finished.agentState, "stalled");
+	assert.match(
+		registry.tail(finished.id, 10),
+		/the prompt did not visibly start a turn within 20s — check the pane/,
+	);
+});
+
 test("an agent run stays supervised through transient compaction", async () => {
 	const fake = createFakeCli();
 	fake.respond("agent start", () =>

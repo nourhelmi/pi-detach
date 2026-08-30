@@ -608,11 +608,17 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 				if (finished) return;
 				if (!workingResult.ok) {
 					if (workingResult.errorCode === "cancelled") return;
+					const output = await readPane(paneId).catch(() => undefined);
+					if (output !== undefined && isCompactionRunning(output)) {
+						workingTimeoutMs = WAIT_FOREVER_MS;
+						continue;
+					}
 					await settle(
 						"stalled",
 						workingTimeoutMs === AGENT_WORKING_TIMEOUT_MS
 							? "the prompt did not visibly start a turn within 20s — check the pane"
 							: "the agent did not resume after compaction — check the pane",
+						output,
 					);
 					return;
 				}
