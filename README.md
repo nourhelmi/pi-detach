@@ -155,10 +155,10 @@ command is still supported with `agent`, but role and agent cannot be combined:
 ```
 
 Every configured semantic role can instead use its selected provider's native
-harness. Set `harness: "native"` per launch, or set
-`PI_DETACH_WORKER_HARNESS=native` once for the parent session. When the parent
-variable is set, it is authoritative and a conflicting per-launch override is
-rejected:
+harness unless its profile declares a transport requirement. Set `harness: "native"`
+per launch, or set `PI_DETACH_WORKER_HARNESS=native` once for the parent session.
+The parent variable is authoritative over per-launch requests;
+an explicit profile `harness` constraint takes precedence over both defaults:
 
 ```jsonc
 {
@@ -196,6 +196,7 @@ Profile file shape:
   "profiles": {
     "reviewer": {
       "agent": "pi",
+      "harness": "pi",
       "skill": "role-reviewer",
       "skillPath": "skills/roles/reviewer/SKILL.md",
       "maxTurns": 5,
@@ -212,8 +213,11 @@ Profile file shape:
 }
 ```
 
-`skillPath` is resolved relative to the profile file and gives any harness a
-plain filesystem location for the role skill. Task packets also identify the
+`harness` is an optional generic transport constraint (`"pi"` or `"native"`).
+Use it when a role contract depends on capabilities available only in one
+runtime; it does not encode role semantics. `skillPath` is resolved relative to
+the profile file and gives any harness a plain filesystem location for the role
+skill. Task packets also identify the
 profile-adjacent `skills/` root so native workers can resolve named required
 skills without Pi slash syntax or harness-specific symlinks. In Pi mode, legacy `cliArgs`,
 `turnCapFlag`, `tools`, and `excludeTools` fields are still supported when

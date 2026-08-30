@@ -58,7 +58,7 @@ const BgAgentParameters = Type.Object({
 	harness: Type.Optional(
 		Type.Union([Type.Literal("pi"), Type.Literal("native")], {
 			description:
-				"Worker harness for a configured role. Defaults to the advisor session preference, then Pi.",
+				"Worker harness for a configured role. Defaults to the advisor session preference, then Pi; an explicit profile transport constraint takes precedence.",
 		}),
 	),
 	model: Type.Optional(

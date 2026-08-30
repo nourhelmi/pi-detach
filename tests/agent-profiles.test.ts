@@ -82,6 +82,34 @@ test("role launch needs no model and preserves skill, tool, anchor, and turn gua
 	assert.match(launch.prompt, /TURN CAP: 4$/);
 });
 
+test("a profile harness constraint overrides the parent transport default", async () => {
+	const path = await configFile({
+		defaultAgent: "pi",
+		profiles: {
+			coordinator: {
+				agent: "pi",
+				harness: "pi",
+				skill: "role-coordinator",
+				cliArgs: ["--coordinator"],
+				requireAnchor: true,
+			},
+		},
+	});
+	const launch = await resolveAgentLaunch({
+		role: "coordinator",
+		harness: "native",
+		model: "openai-codex/gpt-5.6-sol",
+		thinking: "high",
+		prompt: "Coordinate one bounded task.",
+		anchor: "Return direct evidence.",
+		label: "coordinator",
+		configPath: path,
+	});
+	assert.equal(launch.runtime, "pi");
+	assert.match(launch.command, /^pi --provider openai-codex --model gpt-5\.6-sol --thinking high /);
+	assert.match(launch.command, /--coordinator$/);
+});
+
 test("requires an anchor when the selected role profile requires one", async () => {
 	const path = await configFile(GUARDED_PROFILE);
 	await assert.rejects(

@@ -17,10 +17,12 @@ const ThinkingLevelSchema = Type.Union([
 	Type.Literal("xhigh"),
 	Type.Literal("max"),
 ]);
+const WorkerHarnessSchema = Type.Union([Type.Literal("pi"), Type.Literal("native")]);
 const AgentProfileSchema = Type.Object(
 	{
 		description: Type.Optional(NonEmptyString),
 		agent: Type.Optional(NonEmptyString),
+		harness: Type.Optional(WorkerHarnessSchema),
 		skill: Type.Optional(Type.String({ pattern: SAFE_SKILL.source })),
 		skillPath: Type.Optional(NonEmptyString),
 		tools: Type.Optional(Type.Array(NonEmptyString)),
@@ -47,7 +49,7 @@ const AgentProfilesConfigSchema = Type.Object(
 );
 
 export type ThinkingLevel = Static<typeof ThinkingLevelSchema>;
-export type WorkerHarness = "pi" | "native";
+export type WorkerHarness = Static<typeof WorkerHarnessSchema>;
 
 export interface ModelEntry {
 	character?: string;
@@ -58,6 +60,7 @@ export interface ModelEntry {
 export interface AgentProfile {
 	description?: string;
 	agent?: string;
+	harness?: WorkerHarness;
 	skill?: string;
 	skillPath?: string;
 	tools?: string[];
@@ -350,10 +353,11 @@ function resolveProfileLaunch(
 		throw new Error(`Unknown bg_agent role ${role}. Available roles: ${availableRoles(config)}`);
 	}
 	const identity = selectIdentity(options, profile);
-	if (options.harness === "native" && (profile.tools?.length || profile.excludeTools?.length)) {
+	const harness = profile.harness ?? options.harness;
+	if (harness === "native" && (profile.tools?.length || profile.excludeTools?.length)) {
 		throw new Error(`bg_agent role ${role} uses Pi-only tool filtering that cannot be applied to a native harness`);
 	}
-	const native = options.harness === "native" ? buildNativeCommand(identity) : undefined;
+	const native = harness === "native" ? buildNativeCommand(identity) : undefined;
 	const resultPath = native ? nativeResultPath(options.resultPath) : undefined;
 	return {
 		command: native?.command ?? buildAgentCommand(profile, identity, config.defaultAgent, options.label),
