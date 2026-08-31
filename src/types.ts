@@ -22,6 +22,8 @@ export interface RunRecord {
 	agentName?: string | undefined;
 	/** How an agent run settled, when kind is "agent". */
 	agentState?: AgentSettledState | undefined;
+	/** Agent runs: successful done/idle settlement triggers automatic pane closure. */
+	closeOnSettle?: boolean | undefined;
 	exitCode?: number | undefined;
 	termSignal?: string | undefined;
 	startedAt: number;

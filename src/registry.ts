@@ -224,6 +224,7 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 			...(options.errorPattern ? { errorPattern: options.errorPattern } : {}),
 			...(options.donePattern ? { donePattern: options.donePattern } : {}),
 			...(options.requiredArtifactPath ? { resultPath: options.requiredArtifactPath } : {}),
+			...(options.kind === "agent" ? { closeOnSettle: Boolean(options.closeOnSettle) } : {}),
 			...(options.quiet ? { quiet: true } : {}),
 		};
 

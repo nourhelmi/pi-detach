@@ -29,6 +29,27 @@ function harness(idle: boolean) {
 	return { sent, registry, notifier };
 }
 
+function settledAgent(closeOnSettle: boolean): RunRecord {
+	return {
+		id: closeOnSettle ? "auto-close" : "kept-alive",
+		kind: "agent",
+		command: "pi",
+		cwd,
+		label: "scout",
+		status: "exited",
+		backend: "herdr",
+		paneId: "w1:p2",
+		agentName: "scout-worker",
+		agentState: "idle",
+		closeOnSettle,
+		exitCode: 0,
+		startedAt: Date.now() - 100,
+		endedAt: Date.now(),
+		promoted: true,
+		logPath: "",
+	};
+}
+
 test("an idle session is woken with a new turn", async () => {
 	const { sent, registry } = harness(true);
 	const { record, completion } = await registry.start({ kind: "run", command: "echo done", cwd });
@@ -120,4 +141,23 @@ test("the completion message tells the agent to keep going", async () => {
 	await completion;
 	assert.match(sent[0]?.content ?? "", /continue what you were doing/i);
 	assert.match(sent[0]?.content ?? "", /bg_output/);
+});
+
+test("an auto-closing agent notice tells the model to launch fresh", () => {
+	const { sent, notifier } = harness(true);
+	notifier.runFinished(settledAgent(true));
+	const content = sent[0]?.content ?? "";
+	assert.match(content, /tab is being closed automatically/i);
+	assert.match(content, /launch a fresh agent/i);
+	assert.doesNotMatch(content, /agent is still alive/i);
+	assert.doesNotMatch(content, /bg_agent\(\{ name:/);
+});
+
+test("a kept-alive agent notice permits a name-based follow-up", () => {
+	const { sent, notifier } = harness(true);
+	notifier.runFinished(settledAgent(false));
+	const content = sent[0]?.content ?? "";
+	assert.match(content, /bg_agent\(\{ name: "scout-worker"/);
+	assert.match(content, /tab was kept available/i);
+	assert.doesNotMatch(content, /launch a fresh agent/i);
 });

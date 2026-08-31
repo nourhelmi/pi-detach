@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 import { createRegistry } from "../src/registry.ts";
+import type { DriverStart } from "../src/types.ts";
 
 const cwd = tmpdir();
 
@@ -154,4 +155,27 @@ test("a done line notifies once and outranks the error pattern", async () => {
 	assert.deepEqual(errors, []);
 	assert.equal(done.length, 1);
 	assert.match(done[0] ?? "", /terminal state/);
+});
+
+test("carries an agent's auto-close policy into its run record", async () => {
+	let settle!: () => void;
+	const herdrDriver: DriverStart = async (_options, controller) => {
+		settle = () => controller.finish({ agentState: "idle", exitCode: 0 });
+		return {
+			paneId: "w1:p2",
+			agentName: "scout-worker",
+			stop() {},
+		};
+	};
+	const registry = createRegistry({ herdrDriver });
+	const { record, completion } = await registry.start({
+		kind: "agent",
+		command: "pi",
+		cwd,
+		prompt: "Inspect the code.",
+		closeOnSettle: true,
+	});
+	assert.equal(record.closeOnSettle, true);
+	settle();
+	await completion;
 });

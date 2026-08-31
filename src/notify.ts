@@ -71,10 +71,22 @@ export function createNotifier(
 				`It needs an answer. Reply with bg_agent({ name: "${record.agentName}", prompt: "…" }), ` +
 					`or use the herdr CLI (\`herdr pane run ${record.paneId} "…"\` / \`herdr pane send-keys ${record.paneId} <key>\`) for menu-style prompts.`,
 			);
+		} else if (state === "done" || state === "idle") {
+			if (record.closeOnSettle) {
+				lines.push(
+					`Full transcript: bg_output({ runId: "${record.id}" }). ` +
+						"Its successful tab is being closed automatically. Launch a fresh agent for any follow-up (omit `name`).",
+				);
+			} else {
+				lines.push(
+					`Full transcript: bg_output({ runId: "${record.id}" }). ` +
+						`Follow up with bg_agent({ name: "${record.agentName}", prompt: "…", keepAlive: true }) — its tab was kept available.`,
+				);
+			}
 		} else {
 			lines.push(
 				`Full transcript: bg_output({ runId: "${record.id}" }). ` +
-					`Follow up with bg_agent({ name: "${record.agentName}", prompt: "…" }) — the agent is still alive in its pane.`,
+					`Its tab remains visible for inspection; if the agent is still responsive, follow up with bg_agent({ name: "${record.agentName}", prompt: "…" }).`,
 			);
 		}
 		lines.push(CONTINUE_HINT);
