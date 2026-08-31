@@ -182,6 +182,14 @@ function flushAsync(): Promise<void> {
 	return new Promise((resolve) => setImmediate(resolve));
 }
 
+async function waitUntil(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate()) {
+		if (Date.now() >= deadline) throw new Error("condition did not become true before timeout");
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+}
+
 function waitOutcome(id: string, exitCode: number, body: string): CliResult {
 	const text = [
 		startMarker(id),
@@ -320,6 +328,103 @@ test("a watch is pane-hosted and completes through the sentinel wait", async () 
 	assert.equal(finished.status, "exited");
 	assert.equal(finished.exitCode, 1);
 	assert.match(registry.tail(record.id, 10), /EADDRINUSE/);
+});
+
+test("a watch re-arms supervision after a transient waiter failure", async () => {
+	const fake = createFakeCli();
+	const registry = herdrRegistry(fake);
+	const { record, completion } = await registry.start({
+		kind: "watch",
+		command: "bun dev",
+		cwd,
+		label: "web dev",
+	});
+
+	fake.waiters[0]?.resolveWith(failed("server_unavailable", "herdr restarted"));
+	await flushAsync();
+	assert.equal(record.status, "running", "transport failure is not command settlement");
+
+	await waitUntil(() => fake.waiters.length === 2);
+	fake.waiters[1]?.resolveWith(waitOutcome(record.id, 0, "ready after reconnect"));
+
+	const finished = await completion;
+	assert.equal(finished.status, "exited");
+	assert.equal(finished.exitCode, 0);
+	assert.match(registry.tail(record.id, 10), /ready after reconnect/);
+	assert.doesNotMatch(registry.tail(record.id, 10), /herdr wait failed/);
+});
+
+test("waiter recovery preserves a completed watch's exit code from the pane", async () => {
+	const fake = createFakeCli();
+	let snapshot = "";
+	fake.respond("pane read", () => ok(undefined, snapshot));
+	const registry = herdrRegistry(fake);
+	const { record, completion } = await registry.start({ kind: "watch", command: "echo done", cwd });
+	snapshot = [startMarker(record.id), "done", `<<pi-detach:${record.id}:7>>`, "➜  repo"].join("\n");
+
+	fake.waiters[0]?.resolveWith(failed("server_unavailable"));
+	const finished = await completion;
+
+	assert.equal(finished.status, "exited");
+	assert.equal(finished.exitCode, 7);
+	assert.match(registry.tail(record.id, 10), /done/);
+	assert.equal(fake.waiters.length, 1, "snapshot reconciliation cancels the pending retry");
+});
+
+test("a malformed successful wait response is retried instead of accepted", async () => {
+	const fake = createFakeCli();
+	const registry = herdrRegistry(fake);
+	const { record, completion } = await registry.start({ kind: "watch", command: "bun dev", cwd });
+
+	fake.waiters[0]?.resolveWith(ok({ result: { type: "output_matched" } }));
+	await flushAsync();
+	assert.equal(record.status, "running");
+
+	await waitUntil(() => fake.waiters.length === 2);
+	fake.waiters[1]?.resolveWith(waitOutcome(record.id, 0, "valid sentinel"));
+	const finished = await completion;
+	assert.equal(finished.status, "exited");
+	assert.equal(finished.exitCode, 0);
+});
+
+test("shutdown detach cancels waiter recovery without interrupting the watch", async () => {
+	const fake = createFakeCli();
+	const registry = herdrRegistry(fake);
+	const { record, completion } = await registry.start({ kind: "watch", command: "bun dev", cwd });
+	let settled = false;
+	void completion.then(() => {
+		settled = true;
+	});
+
+	fake.waiters[0]?.resolveWith(failed("server_unavailable"));
+	await flushAsync();
+	registry.stopAll("shutdown");
+	await new Promise((resolve) => setTimeout(resolve, 300));
+
+	assert.equal(record.status, "running", "shutdown leaves the pane-owned command alive");
+	assert.equal(settled, false);
+	assert.equal(fake.waiters.length, 1, "shutdown prevents a replacement waiter");
+	assert.equal(
+		fake.execCalls.filter((args) => args[0] === "pane" && args[1] === "send-keys").length,
+		0,
+		"shutdown does not interrupt the pane",
+	);
+});
+
+test("stopping a watch cancels a pending waiter retry", async () => {
+	const fake = createFakeCli();
+	const registry = herdrRegistry(fake);
+	const { record, completion } = await registry.start({ kind: "watch", command: "bun dev", cwd });
+
+	fake.waiters[0]?.resolveWith(failed("server_unavailable"));
+	await waitUntil(() => fake.waiters.length === 2);
+	fake.waiters[1]?.resolveWith(failed("server_unavailable"));
+	await flushAsync();
+	registry.stop(record.id);
+
+	const finished = await completion;
+	assert.equal(finished.status, "killed");
+	assert.equal(fake.waiters.length, 2, "stop prevents another waiter from being spawned");
 });
 
 test("a second watch reuses the dead watch's pane and prepends cd", async () => {

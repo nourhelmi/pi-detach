@@ -35,6 +35,8 @@ const SUPERVISE_AGENT_MS = 60_000;
 const WATCH_POLL_MS = 10_000;
 const INTERRUPT_GRACE_MS = 3_000;
 const STOP_SETTLE_MS = 1_500;
+const COMMAND_WAITER_RETRY_BASE_MS = 250;
+const COMMAND_WAITER_RETRY_MAX_MS = 15_000;
 const AGENT_START_TIMEOUT_MS = 45_000;
 const AGENT_WORKING_TIMEOUT_MS = 20_000;
 const AGENT_PROMPT_WAIT_TIMEOUT_MS = 20_000;
@@ -299,8 +301,12 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		let finished = false;
 		let stopping = false;
 		let emittedLines = 0;
-
-		const waiter: Waiter = cli.spawnWaiter([
+		let waiter: Waiter | undefined;
+		let waiterRetryTimer: NodeJS.Timeout | undefined;
+		let waiterFailureCount = 0;
+		let reconcilingWaiterFailure = false;
+		const timers: NodeJS.Timeout[] = [];
+		const waiterArgs = [
 			"pane",
 			"wait-output",
 			paneId,
@@ -308,13 +314,108 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			exitMatchPattern(record.id),
 			"--timeout",
 			String(WAIT_FOREVER_MS),
-		]);
+		];
 
-		const timers: NodeJS.Timeout[] = [];
+		async function readSnapshot(lines?: number): Promise<string> {
+			return readPane(paneId, lines);
+		}
 
 		async function readOutput(lines?: number): Promise<string> {
-			const snapshot = await readPane(paneId, lines);
-			return extractRunOutput(record.id, snapshot);
+			return extractRunOutput(record.id, await readSnapshot(lines));
+		}
+
+		function completedSnapshot(
+			snapshot: string,
+		): { exitCode: number; output: string } | undefined {
+			const matched = snapshot.match(new RegExp(exitMatchPattern(record.id)))?.[0];
+			if (!matched) return undefined;
+			const exitCode = parseExitCode(record.id, matched);
+			if (exitCode === undefined) return undefined;
+			return { exitCode, output: extractRunOutput(record.id, snapshot) };
+		}
+
+		function cancelWaiterSupervision(): void {
+			if (waiterRetryTimer) {
+				clearTimeout(waiterRetryTimer);
+				waiterRetryTimer = undefined;
+			}
+			const current = waiter;
+			waiter = undefined;
+			current?.kill();
+		}
+
+		function scheduleWaiterRetry(): void {
+			if (finished || stopping || waiter || waiterRetryTimer) return;
+			const delay = Math.min(
+				COMMAND_WAITER_RETRY_BASE_MS * 2 ** Math.min(waiterFailureCount, 6),
+				COMMAND_WAITER_RETRY_MAX_MS,
+			);
+			waiterFailureCount += 1;
+			waiterRetryTimer = setTimeout(() => {
+				waiterRetryTimer = undefined;
+				startWaiter();
+			}, delay);
+		}
+
+		function recoverWaiterFailure(): void {
+			scheduleWaiterRetry();
+			if (reconcilingWaiterFailure) return;
+			reconcilingWaiterFailure = true;
+			void (async () => {
+				try {
+					const snapshot = await readSnapshot().catch(() => undefined);
+					if (finished || stopping || snapshot === undefined) return;
+					const completed = completedSnapshot(snapshot);
+					if (completed) finalize({ exitCode: completed.exitCode }, completed.output, false);
+				} finally {
+					reconcilingWaiterFailure = false;
+				}
+			})();
+		}
+
+		function startWaiter(): void {
+			if (finished || stopping || waiter) return;
+			let current: Waiter;
+			try {
+				current = cli.spawnWaiter(waiterArgs);
+			} catch {
+				scheduleWaiterRetry();
+				return;
+			}
+			waiter = current;
+			void current.promise.then(
+				async (result: CliResult) => {
+					if (waiter !== current) return;
+					waiter = undefined;
+					if (finished || stopping) return;
+					if (result.ok) {
+						const matched = findString(result.json, "matched_line") ?? "";
+						const embedded = findString(result.json, "text");
+						const snapshot = embedded ?? (await readSnapshot().catch(() => ""));
+						if (finished || stopping) return;
+						const completed = completedSnapshot(snapshot);
+						const exitCode = parseExitCode(record.id, matched) ?? completed?.exitCode;
+						if (exitCode === undefined) {
+							scheduleWaiterRetry();
+							return;
+						}
+						finalize(
+							{ exitCode },
+							completed?.output ?? extractRunOutput(record.id, snapshot),
+							false,
+						);
+						return;
+					}
+					// The waiter is only an observer. A Herdr restart or protocol error
+					// does not mean the pane command died, so keep the run supervised.
+					recoverWaiterFailure();
+				},
+				() => {
+					if (waiter !== current) return;
+					waiter = undefined;
+					recoverWaiterFailure();
+				},
+			);
 		}
 
 		function finalize(
@@ -325,7 +426,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			if (finished) return;
 			finished = true;
 			for (const timer of timers) clearInterval(timer);
-			waiter.kill();
+			cancelWaiterSupervision();
 			if (finalText !== undefined) {
 				const lines = finalText.split("\n");
 				const fresh = lines.slice(emittedLines).join("\n");
@@ -349,28 +450,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			controller.finish(outcome);
 		}
 
-		void waiter.promise.then(async (result: CliResult) => {
-			if (finished || stopping) return;
-			if (result.ok) {
-				const matched = findString(result.json, "matched_line") ?? "";
-				const exitCode = parseExitCode(record.id, matched);
-				const embedded = findString(result.json, "text");
-				const output = embedded
-					? extractRunOutput(record.id, embedded)
-					: await readOutput();
-				finalize({ exitCode }, output, false);
-				return;
-			}
-			if (result.errorCode === "cancelled") return;
-			// The wait died while the run may still be going (herdr restart,
-			// protocol error). Capture what we can and settle as unsupervised.
-			const output = await readOutput().catch(() => undefined);
-			finalize(
-				{ killed: true, note: `herdr wait failed: ${result.errorMessage ?? "unknown error"}` },
-				output,
-				false,
-			);
-		});
+		startWaiter();
 
 		timers.push(
 			setInterval(() => {
@@ -391,10 +471,15 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 						setTimeout(() => {
 							void (async () => {
 								if (finished || stopping) return;
-								const output = await readOutput().catch(() => undefined);
+								const snapshot = await readSnapshot().catch(() => undefined);
+								const completed = snapshot === undefined ? undefined : completedSnapshot(snapshot);
+								if (completed) {
+									finalize({ exitCode: completed.exitCode }, completed.output, false);
+									return;
+								}
 								finalize(
 									{ killed: true, note: "command was interrupted in its pane" },
-									output,
+									snapshot === undefined ? undefined : extractRunOutput(record.id, snapshot),
 									false,
 								);
 							})();
@@ -430,7 +515,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			stop() {
 				if (finished || stopping) return;
 				stopping = true;
-				waiter.kill();
+				cancelWaiterSupervision();
 				void cli.exec(["pane", "send-keys", paneId, "ctrl+c"]);
 				setTimeout(() => {
 					void (async () => {
@@ -443,7 +528,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			detach() {
 				finished = true;
 				for (const timer of timers) clearInterval(timer);
-				waiter.kill();
+				cancelWaiterSupervision();
 			},
 			readLive: (lines) => readOutput(lines),
 		};
