@@ -538,6 +538,97 @@ test("an agent run settles when its status wait fires", async () => {
 	assert.equal(blocked?.killedByDriver, true, "loser waits are cancelled");
 });
 
+test("agent settlement reconciles live state after every status waiter fails", async () => {
+	const fake = createFakeCli();
+	fake.respond("agent start", () =>
+		ok({ result: { agent: { pane_id: "w1:p7" }, type: "agent_started" } }),
+	);
+	const registry = herdrRegistry(fake);
+	const { record, completion } = await registry.start({
+		kind: "agent",
+		command: "codex",
+		cwd,
+		label: "reconciled",
+		prompt: "Finish despite a Herdr waiter restart.",
+	});
+	fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+	await waitUntil(() => fake.waiters.filter((waiter) => ["done", "idle", "blocked"].some((state) => waiter.args.includes(state))).length === 3);
+	fake.respond("agent get", () => agentGet("w1:p7", record.agentName ?? "", "done"));
+	for (const waiter of fake.waiters.filter((value) => ["done", "idle", "blocked"].some((state) => value.args.includes(state)))) {
+		waiter.resolveWith(failed("server_unavailable", "herdr restarted"));
+	}
+
+	const finished = await completion;
+	assert.equal(finished.agentState, "done");
+	assert.equal(finished.status, "exited");
+	assert.doesNotMatch(registry.tail(record.id, 10), /unknown|status waits failed/);
+});
+
+test("agent settlement re-arms waits when reconciliation still finds working", async () => {
+	const fake = createFakeCli();
+	fake.respond("agent start", () =>
+		ok({ result: { agent: { pane_id: "w1:p7" }, type: "agent_started" } }),
+	);
+	let liveState = "working";
+	const registry = herdrRegistry(fake);
+	const { record, completion } = await registry.start({
+		kind: "agent",
+		command: "codex",
+		cwd,
+		label: "rearmed",
+		prompt: "Keep working through waiter transport failure.",
+	});
+	fake.respond("agent get", () => agentGet("w1:p7", record.agentName ?? "", liveState));
+	fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+	await waitUntil(() => fake.waiters.filter((waiter) => ["done", "idle", "blocked"].some((state) => waiter.args.includes(state))).length === 3);
+	for (const waiter of fake.waiters.filter((value) => ["done", "idle", "blocked"].some((state) => value.args.includes(state)))) {
+		waiter.resolveWith(failed("server_unavailable", "herdr restarted"));
+	}
+	await waitUntil(() => fake.waiters.filter((waiter) => waiter.args.includes("done")).length === 2);
+	liveState = "done";
+	fake.waiters.filter((waiter) => waiter.args.includes("done")).at(-1)?.resolveWith(ok({}));
+
+	const finished = await completion;
+	assert.equal(finished.agentState, "done");
+	assert.equal(fake.waiters.filter((waiter) => waiter.args.includes("done")).length, 2);
+});
+
+test("a vanished agent with a valid required artifact settles successfully", async () => {
+	const artifactDir = mkdtempSync(join(tmpdir(), "pi-detach-artifact-reconcile-"));
+	const artifactPath = join(artifactDir, "result.md");
+	await writeFile(
+		artifactPath,
+		"# Status\nDone\n# Claims\nBuilt\n# Evidence\nTests pass\n# Files\n- src/x.ts\n# Decisions\nNone\n# Remaining Risk\nNone\n",
+	);
+	try {
+		const fake = createFakeCli();
+		fake.respond("agent start", () =>
+			ok({ result: { agent: { pane_id: "w1:p7" }, type: "agent_started" } }),
+		);
+		const registry = herdrRegistry(fake);
+		const { record, completion } = await registry.start({
+			kind: "agent",
+			command: "codex",
+			cwd,
+			label: "artifact-reconciled",
+			prompt: "Write the required final result.",
+			requiredArtifactPath: artifactPath,
+		});
+		fake.respond("agent get", () => failed("not_found", "agent vanished after completion"));
+		fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+		await waitUntil(() => fake.waiters.filter((waiter) => ["done", "idle", "blocked"].some((state) => waiter.args.includes(state))).length === 3);
+		for (const waiter of fake.waiters.filter((value) => ["done", "idle", "blocked"].some((state) => value.args.includes(state)))) {
+			waiter.resolveWith(failed("server_unavailable", "herdr restarted"));
+		}
+
+		const finished = await completion;
+		assert.equal(finished.agentState, "done");
+		assert.match(registry.tail(record.id, 10), /valid required result artifact/);
+	} finally {
+		await rm(artifactDir, { force: true, recursive: true });
+	}
+});
+
 test("result artifact validation rejects empty files and missing headings", async () => {
 	const artifactDir = mkdtempSync(join(tmpdir(), "pi-detach-artifact-validation-"));
 	const artifactPath = join(artifactDir, "result.md");

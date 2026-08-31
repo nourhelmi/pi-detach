@@ -666,6 +666,8 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			return waiter.promise;
 		}
 
+		let settlementWaitFailureCount = 0;
+
 		function waitForSettledState(): Promise<{
 			state: AgentSettledState;
 			note?: string;
@@ -691,6 +693,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 						if (resolved || finished) return;
 						if (result.ok) {
 							resolved = true;
+							settlementWaitFailureCount = 0;
 							for (const sibling of cycleWaiters) {
 								if (sibling !== waiter) sibling.kill();
 							}
@@ -699,13 +702,51 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 						}
 						if (result.errorCode === "cancelled") return;
 						failures += 1;
-						if (failures >= states.length) {
-							resolved = true;
+						if (failures < states.length) return;
+						resolved = true;
+						void (async () => {
+							const currentResult = await cli.exec(["agent", "get", paneId]);
+							if (finished) return;
+							const current = currentResult.ok ? occupantFrom(currentResult.json) : undefined;
+							if (current && isSameOccupant(current, paneId, name)) {
+								if (current.status === "done" || current.status === "idle" || current.status === "blocked") {
+									settlementWaitFailureCount = 0;
+									resolvePromise({ state: current.status });
+									return;
+								}
+								if (current.status === "working" || current.status === "unknown") {
+									const delay = Math.min(
+										COMMAND_WAITER_RETRY_BASE_MS * 2 ** Math.min(settlementWaitFailureCount, 6),
+										COMMAND_WAITER_RETRY_MAX_MS,
+									);
+									settlementWaitFailureCount += 1;
+									await new Promise((resolveDelay) => setTimeout(resolveDelay, delay));
+									if (!finished) resolvePromise(await waitForSettledState());
+									return;
+								}
+							}
+							if (currentResult.errorCode === "not_found" && options.requiredArtifactPath) {
+								const issue = await settlementArtifactIssue(options.requiredArtifactPath);
+								resolvePromise(issue
+									? { state: "stalled", note: `agent disappeared and required result artifact is invalid: ${issue}` }
+									: { state: "done", note: "agent became unavailable after writing a valid required result artifact" });
+								return;
+							}
+							if (!currentResult.ok && currentResult.errorCode !== "not_found") {
+								const delay = Math.min(
+									COMMAND_WAITER_RETRY_BASE_MS * 2 ** Math.min(settlementWaitFailureCount, 6),
+									COMMAND_WAITER_RETRY_MAX_MS,
+								);
+								settlementWaitFailureCount += 1;
+								await new Promise((resolveDelay) => setTimeout(resolveDelay, delay));
+								if (!finished) resolvePromise(await waitForSettledState());
+								return;
+							}
 							resolvePromise({
 								state: "unknown",
-								note: "all status waits failed — herdr may have restarted",
+								note: "status waits failed and the live agent could not be reconciled",
 							});
-						}
+						})();
 					});
 				}
 			});
