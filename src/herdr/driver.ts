@@ -725,11 +725,13 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 									return;
 								}
 							}
-							if (currentResult.errorCode === "not_found" && options.requiredArtifactPath) {
+							const originalAgentUnavailable = currentResult.errorCode === "not_found"
+								|| (currentResult.ok && (!current || !isSameOccupant(current, paneId, name)));
+							if (originalAgentUnavailable && options.requiredArtifactPath) {
 								const issue = await settlementArtifactIssue(options.requiredArtifactPath);
 								resolvePromise(issue
 									? { state: "stalled", note: `agent disappeared and required result artifact is invalid: ${issue}` }
-									: { state: "done", note: "agent became unavailable after writing a valid required result artifact" });
+									: { state: "done", note: "agent became unavailable or unclassifiable after writing a valid required result artifact" });
 								return;
 							}
 							if (!currentResult.ok && currentResult.errorCode !== "not_found") {

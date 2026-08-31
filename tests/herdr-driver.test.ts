@@ -629,6 +629,42 @@ test("a vanished agent with a valid required artifact settles successfully", asy
 	}
 });
 
+test("an unclassifiable agent with a valid required artifact settles successfully", async () => {
+	const artifactDir = mkdtempSync(join(tmpdir(), "pi-detach-artifact-unclassifiable-"));
+	const artifactPath = join(artifactDir, "result.md");
+	await writeFile(
+		artifactPath,
+		"# Status\nDone\n# Claims\nBuilt\n# Evidence\nTests pass\n# Files\n- src/x.ts\n# Decisions\nNone\n# Remaining Risk\nNone\n",
+	);
+	try {
+		const fake = createFakeCli();
+		fake.respond("agent start", () =>
+			ok({ result: { agent: { pane_id: "w1:p7" }, type: "agent_started" } }),
+		);
+		fake.respond("agent get", () => ok({ result: { type: "agent_info" } }));
+		const registry = herdrRegistry(fake);
+		const { record, completion } = await registry.start({
+			kind: "agent",
+			command: "codex",
+			cwd,
+			label: "artifact-unclassifiable",
+			prompt: "Write the required final result.",
+			requiredArtifactPath: artifactPath,
+		});
+		fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+		await waitUntil(() => fake.waiters.filter((waiter) => ["done", "idle", "blocked"].some((state) => waiter.args.includes(state))).length === 3);
+		for (const waiter of fake.waiters.filter((value) => ["done", "idle", "blocked"].some((state) => value.args.includes(state)))) {
+			waiter.resolveWith(failed("server_unavailable", "herdr restarted"));
+		}
+
+		const finished = await completion;
+		assert.equal(finished.agentState, "done");
+		assert.match(registry.tail(record.id, 10), /valid required result artifact/);
+	} finally {
+		await rm(artifactDir, { force: true, recursive: true });
+	}
+});
+
 test("result artifact validation rejects empty files and missing headings", async () => {
 	const artifactDir = mkdtempSync(join(tmpdir(), "pi-detach-artifact-validation-"));
 	const artifactPath = join(artifactDir, "result.md");
