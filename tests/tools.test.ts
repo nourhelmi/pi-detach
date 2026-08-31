@@ -21,6 +21,7 @@ import type { Registry } from "../src/registry.ts";
 import {
 	agentLabel,
 	agentTombstoneNote,
+	bgAgentResultLabel,
 	withReservedResultArtifact,
 	workerHarness,
 } from "../src/tools/bg-agent.ts";
@@ -79,6 +80,23 @@ function host(options: { idle?: boolean; cwd?: string } = {}) {
 
 const text = (result: AgentToolResult<any>): string =>
 	result.content.map((part) => ("text" in part ? part.text : "")).join("");
+
+test("bg_agent renders guard-blocked results without undefined timing", () => {
+	const label = bgAgentResultLabel({
+		content: [
+			{
+				type: "text",
+				text: "Advisor native sessions use a configured role and Claude model, not agent: claude.",
+			},
+		],
+		details: {},
+	});
+	assert.equal(
+		label,
+		"Advisor native sessions use a configured role and Claude model, not agent: claude.",
+	);
+	assert.doesNotMatch(label, /undefined|NaN/);
+});
 
 test("registers the full toolset", () => {
 	const { tools, shutdown } = host();
@@ -332,3 +350,4 @@ test("successfully started native runs retain their result reservation", async (
 		await rm(dir, { force: true, recursive: true });
 	}
 });
+

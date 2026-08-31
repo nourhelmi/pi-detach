@@ -410,6 +410,25 @@ async function executeAgent(options: ExecuteAgentOptions): Promise<AgentToolResu
 	return settledResult(registry, outcome, launch, Boolean(params.keepAlive));
 }
 
+export function bgAgentResultLabel(result: AgentToolResult<any>): string {
+	const details = result.details as Partial<Details> | undefined;
+	if (details?.promoted && details.runId) {
+		return `working in ${details.paneId ?? "pane"} → ${details.runId}`;
+	}
+	if (details?.status === "failed") return "failed to start";
+	const status = details?.agentState ?? details?.status;
+	if (typeof status === "string" && Number.isFinite(details?.durationMs)) {
+		return `${status} · ${formatDuration(details?.durationMs as number)}`;
+	}
+	if (typeof status === "string") return status;
+	const fallback = result.content
+		.map((part) => ("text" in part ? part.text : ""))
+		.filter(Boolean)
+		.join("\n")
+		.trim();
+	return fallback || "blocked";
+}
+
 export function registerBgAgentTool(pi: ExtensionAPI, registry: Registry): void {
 	pi.registerTool({
 		name: "bg_agent",
@@ -445,17 +464,7 @@ export function registerBgAgentTool(pi: ExtensionAPI, registry: Registry): void 
 		},
 
 		renderResult(result) {
-			const details = result.details as Details | undefined;
-			if (!details) return new Text("", 0, 0);
-			if (details.promoted) {
-				return new Text(`working in ${details.paneId ?? "pane"} → ${details.runId}`, 0, 0);
-			}
-			if (details.status === "failed") return new Text("failed to start", 0, 0);
-			return new Text(
-				`${details.agentState ?? details.status} · ${formatDuration(details.durationMs)}`,
-				0,
-				0,
-			);
+			return new Text(bgAgentResultLabel(result), 0, 0);
 		},
 	});
 }
