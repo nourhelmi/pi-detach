@@ -46,6 +46,14 @@ const WAIT_FOREVER_MS = 7 * 24 * 60 * 60 * 1000;
 const SHELL_READY_ATTEMPTS = 120;
 const SHELL_READY_POLL_MS = 250;
 const READ_LINES = 400;
+const AGENT_PANE_ENV_KEYS = [
+	"ADVISOR_STATE_DIR",
+	"ADVISOR_STATE_ROOT",
+	"CODEX_HOME",
+	"PATH",
+	"PI_CODING_AGENT_DIR",
+	"PI_DETACH_AGENT_PROFILES",
+] as const;
 
 export interface HerdrDriverDeps {
 	cli: HerdrCli;
@@ -167,7 +175,11 @@ export async function settlementArtifactIssue(path: string): Promise<string | un
 
 export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 	const { cli, panes, ledger, reapOrphans } = deps;
-	const toasts = toastsEnabled(deps.env ?? process.env);
+	const runtimeEnv = deps.env ?? process.env;
+	const toasts = toastsEnabled(runtimeEnv);
+	const agentPaneEnvironment = Object.fromEntries(
+		AGENT_PANE_ENV_KEYS.flatMap((key) => (runtimeEnv[key] ? [[key, runtimeEnv[key]]] : [])),
+	) as Record<string, string>;
 
 	// Layout policy lives on the pane manager's caller-split coordinator.
 	// This stack is agent-only (not the idle pool); the shared coordinator
@@ -225,7 +237,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		const kind = (argv[0] ?? "").split("/").pop() ?? "";
 		if (!kind) throw new Error("agent command is empty");
 		const agentArgs = argv.slice(1);
-		const workerPane = await panes.splitOff(cwd, agentPaneStack);
+		const workerPane = await panes.splitOff(cwd, agentPaneStack, agentPaneEnvironment);
 		// Shell startup can briefly report one foreground zsh before later init
 		// jobs run. process-info is therefore only a cheap gate; Herdr's own
 		// `agent start` precondition is authoritative. Retry only its exact

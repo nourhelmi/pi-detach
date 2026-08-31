@@ -162,6 +162,7 @@ function herdrRegistry(
 	extras: {
 		ledger?: ReturnType<typeof createSessionLedger>;
 		reapOrphans?: () => Promise<void>;
+		env?: Record<string, string>;
 	} = {},
 ) {
 	const ctx = { paneId: "w1:p1", tabId: "w1:t7", workspaceId: "w1" };
@@ -170,7 +171,7 @@ function herdrRegistry(
 		cli: fake.cli,
 		ctx,
 		panes,
-		env: { PI_DETACH_HERDR_TOAST: "0" },
+		env: { PI_DETACH_HERDR_TOAST: "0", ...extras.env },
 		...(extras.ledger ? { ledger: extras.ledger } : {}),
 		...(extras.reapOrphans ? { reapOrphans: extras.reapOrphans } : {}),
 	});
@@ -478,7 +479,15 @@ test("an agent run settles when its status wait fires", async () => {
 		ok({ result: { agent: { pane_id: "w1:p7" }, type: "agent_started" } }),
 	);
 	fake.respond("pane read", () => ok(undefined, "I finished the review.\nAll good."));
-	const registry = herdrRegistry(fake);
+	const registry = herdrRegistry(fake, {
+		env: {
+			CODEX_HOME: "/tmp/isolated-codex",
+			PI_CODING_AGENT_DIR: "/tmp/isolated-pi",
+			ADVISOR_STATE_DIR: "/tmp/isolated-advisor",
+			PATH: "/tmp/isolated-pi/bin:/usr/bin",
+			OPENAI_API_KEY: "must-not-enter-pane-args",
+		},
+	});
 	const { record, completion } = await registry.start({
 		kind: "agent",
 		command: "codex",
@@ -506,6 +515,16 @@ test("an agent run settles when its status wait fires", async () => {
 		"first caller split is always right",
 	);
 	assert.ok(callerSplit?.includes("--no-focus"), "caller retains focus");
+	const inheritedEnv = callerSplit
+		?.flatMap((value, index, args) => (value === "--env" ? [args[index + 1]] : []))
+		.filter((value): value is string => Boolean(value));
+	assert.deepEqual(inheritedEnv, [
+		"ADVISOR_STATE_DIR=/tmp/isolated-advisor",
+		"CODEX_HOME=/tmp/isolated-codex",
+		"PATH=/tmp/isolated-pi/bin:/usr/bin",
+		"PI_CODING_AGENT_DIR=/tmp/isolated-pi",
+	]);
+	assert.ok(!callerSplit?.some((value) => value.includes("must-not-enter-pane-args")), "secrets are not inherited");
 
 	const prompted = fake.execCalls.find((args) => args[0] === "agent" && args[1] === "prompt");
 	assert.equal(prompted?.[3], "Review the diff.");
