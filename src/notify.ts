@@ -123,6 +123,7 @@ export function createNotifier(
 		agentPaused(record, _note) {
 			const lines = [
 				`[detach] agent ${record.id} · ${record.label} (${record.agentName ?? "?"}) paused after a turn — result Status: "${record.resultStatus ?? "IN PROGRESS"}". It is waiting on its own background work; supervision continues and you will be woken when its result becomes terminal or it blocks.`,
+				`If its pane is idle with no background work of its own, the Status line is stale: follow up with bg_agent({ name: "${record.agentName}", prompt: "…" }) to have it finalize the result, or bg_stop({ runId: "${record.id}" }).`,
 				...paneHint(record),
 				...(record.resultPath ? [`Result artifact: ${record.resultPath}`] : []),
 				CONTINUE_HINT,
