@@ -36,6 +36,8 @@ export interface RunRecord {
 	donePattern?: string;
 	/** Agent runs: durable result artifact path, kept for post-settlement lookups. */
 	resultPath?: string | undefined;
+	/** Agent runs: parsed first line beneath the result artifact's Status heading. */
+	resultStatus?: string | undefined;
 	/** Set when a herdr start failed and the run fell back to a local process. */
 	fallbackReason?: string | undefined;
 	/** Quiet runs never get a viewer pane when promoted (silent waiters). */
@@ -58,6 +60,8 @@ export interface StartOptions {
 	closeOnSettle?: boolean;
 	/** Agent runs: require this durable result artifact before treating done/idle as success. */
 	requiredArtifactPath?: string;
+	/** Agent runs: discover a durable result artifact from the Pi session JSONL entry of this type. */
+	resultDiscovery?: string;
 	/** Skip the promoted-run viewer pane; the run stays visible in bg_list only. */
 	quiet?: boolean;
 }
@@ -82,6 +86,7 @@ export interface RunSummary {
 	agentName?: string;
 	agentState?: AgentSettledState;
 	resultPath?: string;
+	resultStatus?: string;
 	exitCode?: number;
 	startedAt: number;
 	endedAt?: number;
@@ -94,6 +99,7 @@ export interface DriverOutcome {
 	termSignal?: string | undefined;
 	killed?: boolean;
 	agentState?: AgentSettledState;
+	resultStatus?: string;
 	/** Appended to the log before handlers fire, e.g. "pane was closed". */
 	note?: string;
 }
@@ -103,6 +109,8 @@ export interface RunController {
 	record: RunRecord;
 	/** Append output: feeds the log file, the in-memory tail, and errorPattern matching. */
 	emitOutput(chunk: string): void;
+	/** Report non-terminal progress while the run remains supervised. */
+	progress?(note: string): void;
 	/** Report the run finished. Idempotent; the first call wins. */
 	finish(outcome: DriverOutcome): void;
 }

@@ -53,6 +53,7 @@ export interface Registry {
 	onExit(handler: (record: RunRecord) => void): void;
 	onErrorLine(handler: (record: RunRecord, line: string) => void): void;
 	onDoneLine(handler: (record: RunRecord, line: string) => void): void;
+	onProgress(handler: (record: RunRecord, note: string) => void): void;
 }
 
 function dedupeKey(cwd: string, command: string): string {
@@ -76,6 +77,7 @@ function summarize(record: RunRecord): RunSummary {
 		...(record.agentName !== undefined ? { agentName: record.agentName } : {}),
 		...(record.agentState !== undefined ? { agentState: record.agentState } : {}),
 		...(record.resultPath !== undefined ? { resultPath: record.resultPath } : {}),
+		...(record.resultStatus !== undefined ? { resultStatus: record.resultStatus } : {}),
 		...(record.exitCode !== undefined ? { exitCode: record.exitCode } : {}),
 		startedAt: record.startedAt,
 		...(record.endedAt !== undefined ? { endedAt: record.endedAt } : {}),
@@ -165,6 +167,7 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 	const exitHandlers: ((record: RunRecord) => void)[] = [];
 	const errorLineHandlers: ((record: RunRecord, line: string) => void)[] = [];
 	const doneLineHandlers: ((record: RunRecord, line: string) => void)[] = [];
+	const progressHandlers: ((record: RunRecord, note: string) => void)[] = [];
 
 	function absorb(live: LiveRun, chunk: string): void {
 		live.stream.write(chunk);
@@ -189,6 +192,13 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 	}
 
 	async function start(options: StartOptions): Promise<StartResult> {
+		if (options.kind === "agent" && options.reuseName && !options.requiredArtifactPath) {
+			const prior = [...runs.values()]
+				.map((live) => live.record)
+				.filter((candidate) => candidate.agentName === options.reuseName)
+				.sort((a, b) => b.startedAt - a.startedAt)[0];
+			if (prior?.resultPath) options = { ...options, requiredArtifactPath: prior.resultPath };
+		}
 		const key = dedupeKey(options.cwd, options.command);
 		if (options.kind !== "agent") {
 			const existingId = active.get(key);
@@ -246,6 +256,11 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 		const controller: RunController = {
 			record,
 			emitOutput: (chunk) => absorb(live, chunk),
+			progress: (note) => {
+				if (record.status !== "running") return;
+				absorb(live, `[detach] ${note}\n`);
+				for (const handler of progressHandlers) handler(record, note);
+			},
 			finish: (outcome: DriverOutcome) => {
 				if (record.status !== "running") return;
 				if (live.pending) absorb(live, "\n");
@@ -254,6 +269,7 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 				record.exitCode = outcome.exitCode;
 				record.termSignal = outcome.termSignal;
 				if (outcome.agentState) record.agentState = outcome.agentState;
+				if (outcome.resultStatus) record.resultStatus = outcome.resultStatus;
 				record.endedAt = Date.now();
 				active.delete(key);
 				// Announce only once the log file is flushed, so a notified reader
@@ -370,6 +386,9 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 		},
 		onDoneLine(handler) {
 			doneLineHandlers.push(handler);
+		},
+		onProgress(handler) {
+			progressHandlers.push(handler);
 		},
 	};
 }

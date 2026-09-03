@@ -95,6 +95,7 @@ export default function registerDetachExtension(pi: ExtensionAPI): void {
 
 	registry.onExit((record) => notifier.runFinished(record));
 	registry.onErrorLine((record, line) => notifier.watchErrorLine(record, line));
+	registry.onProgress((record, note) => notifier.agentPaused(record, note));
 	registry.onDoneLine((record, line) => {
 		notifier.watchDoneLine(record, line);
 		registry.stop(record.id);

@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { CliResult, HerdrCli, Waiter } from "../src/herdr/cli.ts";
-import { createHerdrDriver, settlementArtifactIssue } from "../src/herdr/driver.ts";
+import { createHerdrDriver, parseResultArtifactStatus, settlementArtifactIssue } from "../src/herdr/driver.ts";
 import { createSessionLedger } from "../src/herdr/ledger.ts";
 import { createPaneManager } from "../src/herdr/panes.ts";
 import { startMarker } from "../src/herdr/sentinel.ts";
@@ -151,6 +151,10 @@ function agentGet(paneId: string, name: string, agent_status: string, state_chan
 			type: "agent_info",
 		},
 	});
+}
+
+function resultArtifact(status: string): string {
+	return `# Status\n${status}\n# Claims\nBuilt\n# Evidence\nTests pass\n# Files\n- src/x.ts\n# Decisions\nNone\n# Remaining Risk\nNone\n`;
 }
 
 function closedPanes(execCalls: string[][]): string[] {
@@ -1902,4 +1906,213 @@ test("tall worker panes stack down via splitDirectionFor", async () => {
 	assert.equal(splitDirection(splits[0]), "right");
 	assert.equal(splits[1]?.[2], first.paneId, "second helper stacks off the worker");
 	assert.equal(splitDirection(splits[1]), "down", "tall worker uses the down heuristic");
+});
+
+test("result artifact Status parsing strips markdown and classifies lifecycle signals", () => {
+	assert.deepEqual(parseResultArtifactStatus("## Status\n**BLOCKED: needs approval.**\n# Claims\nx"), {
+		line: "BLOCKED: needs approval",
+		classification: "blocked",
+	});
+	assert.equal(parseResultArtifactStatus("# Status\n`IN_PROGRESS`\n")?.classification, "in-progress");
+	assert.equal(parseResultArtifactStatus("# Status\nPASS\n")?.classification, "terminal");
+});
+
+test("a prompt to a working occupant queues without --wait and stays supervised", async () => {
+	const fake = createFakeCli();
+	fake.respond("agent get", () => agentGet("w1:p7", "reviewer-abc", "working", 7));
+	const registry = herdrRegistry(fake);
+	const { completion } = await registry.start({
+		kind: "agent",
+		command: "pi",
+		cwd,
+		prompt: "Queue this follow-up.",
+		reuseName: "reviewer-abc",
+	});
+	assert.deepEqual(
+		fake.execCalls.find((args) => args[0] === "agent" && args[1] === "prompt"),
+		["agent", "prompt", "reviewer-abc", "Queue this follow-up."],
+	);
+	await waitUntil(() => fake.waiters.some((waiter) => waiter.args.includes("done")));
+	fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+	assert.equal((await completion).agentState, "done");
+});
+
+test("a prompt wait timeout remains supervised when the same occupant is working", async () => {
+	const fake = createFakeCli();
+	let gets = 0;
+	fake.respond("agent get", () => {
+		gets += 1;
+		return agentGet("w1:p7", "reviewer-abc", gets < 3 ? "idle" : "working", gets);
+	});
+	fake.respond("agent prompt", () => failed("timeout", "timed out waiting for agent status"));
+	const registry = herdrRegistry(fake);
+	const { completion } = await registry.start({
+		kind: "agent",
+		command: "pi",
+		cwd,
+		prompt: "Submit once.",
+		reuseName: "reviewer-abc",
+	});
+	assert.deepEqual(
+		fake.execCalls.find((args) => args[0] === "agent" && args[1] === "prompt"),
+		[
+			"agent", "prompt", "reviewer-abc", "Submit once.", "--wait", "--until", "working",
+			"--until", "done", "--until", "idle", "--until", "blocked", "--timeout", "20000",
+		],
+	);
+	await waitUntil(() => fake.waiters.some((waiter) => waiter.args.includes("idle")));
+	fake.waiters.find((waiter) => waiter.args.includes("idle"))?.resolveWith(ok({}));
+	assert.equal((await completion).agentState, "idle");
+});
+
+test("a BLOCKED result artifact overrides Herdr done and keeps the pane open", async () => {
+	const artifactDir = mkdtempSync(join(tmpdir(), "pi-detach-blocked-result-"));
+	const artifactPath = join(artifactDir, "result.md");
+	await writeFile(artifactPath, resultArtifact("**BLOCKED: needs approval.**"));
+	try {
+		const fake = createFakeCli();
+		fake.respond("agent start", () => ok({ result: { agent: { pane_id: "w1:p7" } } }));
+		const registry = herdrRegistry(fake);
+		const { completion } = await registry.start({
+			kind: "agent", command: "pi", cwd, prompt: "Work.", closeOnSettle: true,
+			requiredArtifactPath: artifactPath,
+		});
+		fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+		await waitUntil(() => fake.waiters.some((waiter) => waiter.args.includes("done")));
+		fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+		const finished = await completion;
+		assert.equal(finished.agentState, "blocked");
+		assert.equal(finished.exitCode, 0);
+		assert.equal(finished.resultStatus, "BLOCKED: needs approval");
+		assert.equal(registry.list().find((run) => run.id === finished.id)?.resultStatus, "BLOCKED: needs approval");
+		assert.match(registry.tail(finished.id, 10), /result artifact reports BLOCKED/);
+		assert.deepEqual(closedPanes(fake.execCalls), []);
+	} finally {
+		await rm(artifactDir, { force: true, recursive: true });
+	}
+});
+
+test("an IN PROGRESS artifact pauses once, rearms indefinitely, then settles terminal", async () => {
+	for (const closeOnSettle of [true, false]) {
+		const artifactDir = mkdtempSync(join(tmpdir(), "pi-detach-paused-result-"));
+		const artifactPath = join(artifactDir, "result.md");
+		await writeFile(artifactPath, resultArtifact("IN PROGRESS — waiting for tests"));
+		try {
+			const fake = createFakeCli();
+			let agent = "";
+			fake.respond("agent start", (args) => {
+				agent = args[2] ?? "";
+				return ok({ result: { agent: { pane_id: "w1:p7" } } });
+			});
+			fake.respond("agent get", () => agentGet("w1:p7", agent, "done", 2));
+			const registry = herdrRegistry(fake);
+			const progress: string[] = [];
+			registry.onProgress((_record, note) => progress.push(note));
+			const { record, completion } = await registry.start({
+				kind: "agent", command: "pi", cwd, prompt: "Work.", closeOnSettle,
+				requiredArtifactPath: artifactPath,
+			});
+			fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+			await waitUntil(() => fake.waiters.some((waiter) => waiter.args.includes("done")));
+			fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+			await waitUntil(() => progress.length === 1);
+			assert.equal(record.status, "running");
+			assert.match(progress[0] ?? "", /IN PROGRESS/);
+			const workingWait = fake.waiters.filter((waiter) => waiter.args.includes("working")).at(-1);
+			assert.equal(workingWait?.args.at(-1), "604800000", "pause rearms an indefinite working wait");
+			assert.deepEqual(closedPanes(fake.execCalls), []);
+			await writeFile(artifactPath, resultArtifact("PASS"));
+			workingWait?.resolveWith(ok({}));
+			await waitUntil(() => fake.waiters.filter((waiter) => waiter.args.includes("done")).length === 2);
+			fake.waiters.filter((waiter) => waiter.args.includes("done")).at(-1)?.resolveWith(ok({}));
+			const finished = await completion;
+			assert.equal(finished.agentState, "done");
+			assert.equal(finished.resultStatus, "PASS");
+			assert.equal(progress.length, 1);
+			await flushAsync();
+			assert.equal(closedPanes(fake.execCalls).length, closeOnSettle ? 1 : 0);
+		} finally {
+			await rm(artifactDir, { force: true, recursive: true });
+		}
+	}
+});
+
+test("Pi role result discovery reads the agent session and supervises its artifact", async () => {
+	const runDir = mkdtempSync(join(tmpdir(), "pi-detach-discovered-result-"));
+	const sessionPath = join(runDir, "session.jsonl");
+	const artifactPath = join(runDir, "result.md");
+	await writeFile(sessionPath, [
+		JSON.stringify({ type: "message", data: {} }),
+		JSON.stringify({ type: "custom", customType: "advisor-worker", data: { runDir } }),
+	].join("\n"));
+	await writeFile(artifactPath, resultArtifact("PASS"));
+	try {
+		const fake = createFakeCli();
+		let name = "";
+		fake.respond("agent start", (args) => {
+			name = args[2] ?? "";
+			return ok({ result: { agent: { pane_id: "w1:p7" } } });
+		});
+		fake.respond("agent get", () => ok({ result: { agent: {
+			pane_id: "w1:p7", name, agent_status: "idle", state_change_seq: 1,
+			agent_session: { kind: "path", value: sessionPath },
+		} } }));
+		const registry = herdrRegistry(fake);
+		const { record, completion } = await registry.start({
+			kind: "agent", command: "pi", cwd, prompt: "Work.", resultDiscovery: "advisor-worker",
+		});
+		assert.equal(record.resultPath, artifactPath);
+		assert.equal(registry.list()[0]?.resultPath, artifactPath);
+		fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+		await waitUntil(() => fake.waiters.some((waiter) => waiter.args.includes("done")));
+		fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+		assert.equal((await completion).resultStatus, "PASS");
+	} finally {
+		await rm(runDir, { force: true, recursive: true });
+	}
+});
+
+test("failed Pi result discovery preserves ordinary settlement and logs one note", async () => {
+	const fake = createFakeCli();
+	fake.respond("agent start", () => ok({ result: { agent: { pane_id: "w1:p7" } } }));
+	const registry = herdrRegistry(fake);
+	const { record, completion } = await registry.start({
+		kind: "agent", command: "pi", cwd, prompt: "Work.", resultDiscovery: "advisor-worker",
+	});
+	assert.equal(record.resultPath, undefined);
+	fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+	await waitUntil(() => fake.waiters.some((waiter) => waiter.args.includes("done")));
+	fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+	assert.equal((await completion).agentState, "done");
+	assert.equal(registry.tail(record.id, 20).match(/could not discover/g)?.length, 1);
+});
+
+test("name reuse inherits the latest run result path", async () => {
+	const artifactDir = mkdtempSync(join(tmpdir(), "pi-detach-reused-result-"));
+	const artifactPath = join(artifactDir, "result.md");
+	await writeFile(artifactPath, resultArtifact("PASS"));
+	try {
+		const fake = createFakeCli();
+		fake.respond("agent get", () => agentGet("w1:p7", "reviewer-abc", "idle", 1));
+		const registry = herdrRegistry(fake);
+		const first = await registry.start({
+			kind: "agent", command: "pi", cwd, prompt: "First.", reuseName: "reviewer-abc",
+			requiredArtifactPath: artifactPath,
+		});
+		fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+		await waitUntil(() => fake.waiters.some((waiter) => waiter.args.includes("done")));
+		fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+		await first.completion;
+
+		const second = await registry.start({
+			kind: "agent", command: "pi", cwd, prompt: "Second.", reuseName: "reviewer-abc",
+		});
+		assert.equal(second.record.resultPath, artifactPath);
+		fake.waiters.filter((waiter) => waiter.args.includes("working")).at(-1)?.resolveWith(ok({}));
+		await waitUntil(() => fake.waiters.filter((waiter) => waiter.args.includes("done")).length === 2);
+		fake.waiters.filter((waiter) => waiter.args.includes("done")).at(-1)?.resolveWith(ok({}));
+		assert.equal((await second.completion).resultStatus, "PASS");
+	} finally {
+		await rm(artifactDir, { force: true, recursive: true });
+	}
 });

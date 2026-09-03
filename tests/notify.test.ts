@@ -161,3 +161,31 @@ test("a kept-alive agent notice permits a name-based follow-up", () => {
 	assert.match(content, /tab was kept available/i);
 	assert.doesNotMatch(content, /launch a fresh agent/i);
 });
+
+test("agent settlement headline carries result Status and artifact path", () => {
+	const { sent, notifier } = harness(true);
+	const record = settledAgent(false);
+	record.resultStatus = "BLOCKED: needs approval";
+	record.resultPath = "/tmp/result.md";
+	record.agentState = "blocked";
+	notifier.runFinished(record);
+	assert.match(sent[0]?.content ?? "", /result Status: BLOCKED: needs approval/);
+	assert.match(sent[0]?.content ?? "", /Result artifact: \/tmp\/result\.md/);
+});
+
+test("paused agent notice is delivered once with supervision guidance", () => {
+	const { sent, notifier } = harness(false);
+	const record = settledAgent(false);
+	record.status = "running";
+	record.resultStatus = "IN PROGRESS — waiting for checks";
+	record.resultPath = "/tmp/result.md";
+	notifier.agentPaused(record, "paused");
+	assert.equal(sent.length, 1);
+	assert.equal(sent[0]?.customType, "detach_agent_paused");
+	assert.equal(sent[0]?.options?.deliverAs, "steer");
+	assert.match(sent[0]?.content ?? "", /paused after a turn/);
+	assert.match(sent[0]?.content ?? "", /supervision continues/);
+	assert.match(sent[0]?.content ?? "", /result Status: "IN PROGRESS — waiting for checks"/);
+	assert.match(sent[0]?.content ?? "", /Result artifact: \/tmp\/result\.md/);
+	assert.match(sent[0]?.content ?? "", /continue what you were doing/i);
+});

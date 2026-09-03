@@ -155,6 +155,7 @@ interface Details {
 	thinking?: string;
 	maxTurns?: number;
 	resultPath?: string;
+	resultStatus?: string;
 	reusable?: boolean;
 	durationMs: number;
 }
@@ -304,6 +305,7 @@ function promotedResult(
 	const lifecycle = keepAlive
 		? "Its tab will remain available for follow-up."
 		: "A successful tab closes automatically; blocked or failed tabs stay visible.";
+	const resultPath = record.resultPath ?? launch.resultPath;
 	return {
 		content: [
 			{
@@ -311,7 +313,7 @@ function promotedResult(
 				text:
 					`Agent ${record.agentName} is working in pane ${record.paneId} — detached after ${waited} as ${record.id}.\n` +
 					`You will be woken when it settles. ${lifecycle}` +
-					(launch.resultPath ? `\nResult artifact: ${launch.resultPath}` : ""),
+					(resultPath ? `\nResult artifact: ${resultPath}` : ""),
 			},
 		],
 		details: {
@@ -319,6 +321,7 @@ function promotedResult(
 			promoted: true,
 			status: "running",
 			...launchDetails(launch),
+			...(resultPath ? { resultPath } : {}),
 			reusable: keepAlive,
 			...(record.agentName ? { agentName: record.agentName } : {}),
 			...(record.paneId ? { paneId: record.paneId } : {}),
@@ -337,7 +340,7 @@ function settledFollowUp(finished: RunRecord, keepAlive: boolean): string {
 	return "Its tab remains visible for inspection or input.";
 }
 
-function settledResult(
+export function settledResult(
 	registry: Registry,
 	finished: RunRecord,
 	launch: ResolvedAgentLaunch,
@@ -346,10 +349,12 @@ function settledResult(
 	const tail = registry.tail(finished.id, INLINE_TAIL_LINES);
 	const duration = (finished.endedAt ?? Date.now()) - finished.startedAt;
 	const state = finished.agentState ?? "unknown";
+	const resultPath = finished.resultPath ?? launch.resultPath;
 	const header =
-		`Agent ${finished.agentName} settled: ${state} in ${formatDuration(duration)} ` +
-		`(pane ${finished.paneId}). ${settledFollowUp(finished, keepAlive)}` +
-		(launch.resultPath ? `\nResult artifact: ${launch.resultPath}` : "");
+		`Agent ${finished.agentName} settled: ${state}` +
+		(finished.resultStatus ? ` · result Status: ${finished.resultStatus}` : "") +
+		` in ${formatDuration(duration)} (pane ${finished.paneId}). ${settledFollowUp(finished, keepAlive)}` +
+		(resultPath ? `\nResult artifact: ${resultPath}` : "");
 	return {
 		content: [{ type: "text", text: tail.trim() ? `${header}\n\n${tail.trimEnd()}` : header }],
 		details: {
@@ -358,6 +363,8 @@ function settledResult(
 			status: finished.status,
 			agentState: state,
 			...launchDetails(launch),
+			...(resultPath ? { resultPath } : {}),
+			...(finished.resultStatus ? { resultStatus: finished.resultStatus } : {}),
 			reusable: keepAlive,
 			...(finished.agentName ? { agentName: finished.agentName } : {}),
 			...(finished.paneId ? { paneId: finished.paneId } : {}),
@@ -383,6 +390,7 @@ async function executeAgent(options: ExecuteAgentOptions): Promise<AgentToolResu
 			...(params.name ? { reuseName: params.name } : {}),
 			closeOnSettle: !params.keepAlive,
 			...(launch.resultPath ? { requiredArtifactPath: launch.resultPath } : {}),
+			...(launch.resultDiscovery ? { resultDiscovery: launch.resultDiscovery } : {}),
 		});
 		started = launch.resultPath
 			? await withReservedResultArtifact(launch.resultPath, start)

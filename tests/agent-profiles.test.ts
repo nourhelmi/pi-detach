@@ -471,3 +471,19 @@ test("does not combine an explicit agent command with Pi launch options", async 
 		/not explicit agent commands/,
 	);
 });
+
+test("Pi role profiles round-trip resultDiscovery into the resolved launch", async () => {
+	const path = await configFile({
+		defaultAgent: "pi",
+		profiles: {
+			builder: { agent: "pi", resultDiscovery: "advisor-worker" },
+		},
+	});
+	const launch = await resolveAgentLaunch({
+		role: "builder",
+		prompt: "Build.",
+		label: "builder",
+		configPath: path,
+	});
+	assert.equal(launch.resultDiscovery, "advisor-worker");
+});

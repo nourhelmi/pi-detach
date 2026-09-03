@@ -35,6 +35,7 @@ const AgentProfileSchema = Type.Object(
 		turnCapFlag: Type.Optional(Type.String({ pattern: "^--[a-z0-9][a-z0-9-]*$" })),
 		maxTurns: Type.Optional(Type.Integer({ minimum: 1 })),
 		requireAnchor: Type.Optional(Type.Boolean()),
+		resultDiscovery: Type.Optional(NonEmptyString),
 	},
 	{ additionalProperties: false },
 );
@@ -73,6 +74,7 @@ export interface AgentProfile {
 	turnCapFlag?: string;
 	maxTurns?: number;
 	requireAnchor?: boolean;
+	resultDiscovery?: string;
 }
 
 interface AgentProfilesConfig {
@@ -107,6 +109,7 @@ export interface ResolvedAgentLaunch {
 	thinking?: string;
 	maxTurns?: number;
 	resultPath?: string;
+	resultDiscovery?: string;
 }
 
 interface LaunchIdentity {
@@ -365,6 +368,7 @@ function resolveProfileLaunch(
 		role,
 		runtime: native?.runtime ?? (profile.agent ?? config.defaultAgent).split(/\s+/)[0] ?? "pi",
 		...(resultPath ? { resultPath } : {}),
+		...(!native && profile.resultDiscovery ? { resultDiscovery: profile.resultDiscovery } : {}),
 		...identityDetails(identity),
 	};
 }

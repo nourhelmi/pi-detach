@@ -22,6 +22,7 @@ import {
 	agentLabel,
 	agentTombstoneNote,
 	bgAgentResultLabel,
+	settledResult,
 	withReservedResultArtifact,
 	workerHarness,
 } from "../src/tools/bg-agent.ts";
@@ -349,5 +350,38 @@ test("successfully started native runs retain their result reservation", async (
 	} finally {
 		await rm(dir, { force: true, recursive: true });
 	}
+});
+
+test("settled bg_agent result header surfaces result Status and discovered artifact", () => {
+	const finished = {
+		id: "agent1",
+		kind: "agent",
+		command: "pi",
+		cwd: "/tmp",
+		label: "builder",
+		status: "exited",
+		backend: "herdr",
+		paneId: "w1:p7",
+		agentName: "builder-abc",
+		agentState: "blocked",
+		resultPath: "/tmp/discovered/result.md",
+		resultStatus: "BLOCKED: needs input",
+		exitCode: 0,
+		startedAt: 0,
+		endedAt: 1000,
+		promoted: false,
+		logPath: "/tmp/output.log",
+	} as const;
+	const registry = { tail: () => "" } as unknown as Registry;
+	const result = settledResult(
+		registry,
+		finished,
+		{ command: "pi", prompt: "Build.", runtime: "pi" },
+		false,
+	);
+	assert.match(text(result), /settled: blocked · result Status: BLOCKED: needs input/);
+	assert.match(text(result), /Result artifact: \/tmp\/discovered\/result\.md/);
+	assert.equal(result.details.resultStatus, "BLOCKED: needs input");
+	assert.equal(result.details.resultPath, "/tmp/discovered/result.md");
 });
 

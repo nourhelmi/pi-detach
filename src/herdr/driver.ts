@@ -15,7 +15,8 @@
  */
 
 import { type CliResult, findString, type HerdrCli, type Waiter } from "./cli.ts";
-import { readFile } from "node:fs/promises";
+import { open, readFile } from "node:fs/promises";
+import { join } from "node:path";
 
 import { type HerdrContext, toastsEnabled } from "./context.ts";
 import type { AgentPaneLedger } from "./ledger.ts";
@@ -171,6 +172,81 @@ export async function settlementArtifactIssue(path: string): Promise<string | un
 	}
 	if (missing.length) return `${path} is missing headings: ${missing.join(", ")}`;
 	return empty.length ? `${path} has empty sections: ${empty.join(", ")}` : undefined;
+}
+
+export type ResultStatusClassification = "blocked" | "in-progress" | "terminal";
+
+export interface ResultArtifactStatus {
+	line: string;
+	classification: ResultStatusClassification;
+}
+
+/** Parse the first non-empty line beneath a markdown Status heading. */
+export function parseResultArtifactStatus(content: string): ResultArtifactStatus | undefined {
+	const heading = /^#{1,6}\s+Status\s*$/im.exec(content);
+	if (!heading) return undefined;
+	const remainder = content.slice(heading.index + heading[0].length);
+	const nextHeading = remainder.search(/^#{1,6}\s+\S.*$/m);
+	const body = nextHeading >= 0 ? remainder.slice(0, nextHeading) : remainder;
+	const rawLine = body.split("\n").find((line) => line.trim());
+	if (!rawLine) return undefined;
+	const line = rawLine
+		.trim()
+		.replace(/^[*_`]+/, "")
+		.replace(/[.!?,;:]+$/, "")
+		.replace(/[*_`]+$/, "")
+		.replace(/[.!?,;:]+$/, "")
+		.trim()
+		.slice(0, 200);
+	const classification = /^BLOCKED\b/i.test(line)
+		? "blocked"
+		: /^(?:IN[ _-]PROGRESS|WORKING|WAITING|PAUSED|RUNNING)\b/i.test(line)
+			? "in-progress"
+			: "terminal";
+	return { line, classification };
+}
+
+async function readFilePrefix(path: string, maxBytes: number): Promise<string> {
+	const handle = await open(path, "r");
+	try {
+		const buffer = Buffer.alloc(maxBytes);
+		const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0);
+		return buffer.subarray(0, bytesRead).toString("utf8");
+	} finally {
+		await handle.close();
+	}
+}
+
+function agentSessionPath(value: unknown): string | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const record = value as Record<string, unknown>;
+	const session = record.agent_session;
+	if (session && typeof session === "object") {
+		const candidate = session as Record<string, unknown>;
+		if (candidate.kind === "path" && typeof candidate.value === "string") return candidate.value;
+	}
+	for (const child of Object.values(record)) {
+		const found = agentSessionPath(child);
+		if (found) return found;
+	}
+	return undefined;
+}
+
+function discoveredRunDir(content: string, customType: string): string | undefined {
+	for (const line of content.split("\n")) {
+		try {
+			const entry = JSON.parse(line) as Record<string, unknown>;
+			const data = entry.data as Record<string, unknown> | undefined;
+			if (
+				entry.type === "custom"
+				&& entry.customType === customType
+				&& typeof data?.runDir === "string"
+			) return data.runDir;
+		} catch {
+			// Session files are JSONL; skip partial or non-JSON lines.
+		}
+	}
+	return undefined;
 }
 
 export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
@@ -575,6 +651,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		if (!paneId) throw new Error("herdr did not report a pane id for the agent");
 		record.paneId = paneId;
 		record.agentName = name;
+		let artifactPath = options.requiredArtifactPath;
 		// Track before the prompt so a later session death can still reap this pane.
 		ledger?.track({
 			paneId,
@@ -584,10 +661,11 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			// Required-artifact runs are closed by this live driver only after
 			// validation. A same-process reload must not let the generic reaper
 			// close a settled pane without that validation context.
-			closeOnSettle: Boolean(options.closeOnSettle && !options.requiredArtifactPath),
+			closeOnSettle: Boolean(options.closeOnSettle && !artifactPath),
 		});
 
 		let finished = false;
+		let pauseNotified = false;
 		const waiters: Waiter[] = [];
 		const timers: NodeJS.Timeout[] = [];
 
@@ -638,18 +716,35 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			state: AgentSettledState,
 			note?: string,
 			capturedOutput?: string,
-		): Promise<void> {
+		): Promise<boolean> {
 			const output = capturedOutput ?? await readPane(paneId).catch(() => undefined);
 			let finalState = state;
 			let finalNote = note;
-			if (
-				(state === "done" || state === "idle")
-				&& options.requiredArtifactPath
-			) {
-				const issue = await settlementArtifactIssue(options.requiredArtifactPath);
-				if (issue) {
-					finalState = "stalled";
-					finalNote = `required result artifact is invalid: ${issue}`;
+			let resultStatus: ResultArtifactStatus | undefined;
+			if (artifactPath) {
+				const issue = await settlementArtifactIssue(artifactPath);
+				if (!issue) {
+					const content = await readFile(artifactPath, "utf8");
+					resultStatus = parseResultArtifactStatus(content);
+					if (resultStatus) record.resultStatus = resultStatus.line;
+				}
+				if (state === "done" || state === "idle") {
+					if (issue) {
+						finalState = "stalled";
+						finalNote = `required result artifact is invalid: ${issue}`;
+					} else if (resultStatus?.classification === "blocked") {
+						finalState = "blocked";
+						finalNote = "result artifact reports BLOCKED";
+					} else if (resultStatus?.classification === "in-progress") {
+						const pauseNote = `agent paused after a turn — result Status: "${resultStatus.line}"; supervision continues`;
+						if (!pauseNotified) {
+							pauseNotified = true;
+							controller.progress?.(pauseNote);
+						} else {
+							controller.emitOutput(`[detach] ${pauseNote}\n`);
+						}
+						return false;
+					}
 				}
 			}
 			finalize(
@@ -658,10 +753,12 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 					...(finalState === "blocked" || finalState === "done" || finalState === "idle"
 						? { exitCode: 0 }
 						: {}),
+					...(resultStatus ? { resultStatus: resultStatus.line } : {}),
 					...(finalNote ? { note: finalNote } : {}),
 				},
 				output,
 			);
+			return true;
 		}
 
 		function waitForWorking(timeoutMs: number): Promise<CliResult> {
@@ -739,8 +836,8 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 							}
 							const originalAgentUnavailable = currentResult.errorCode === "not_found"
 								|| (currentResult.ok && (!current || !isSameOccupant(current, paneId, name)));
-							if (originalAgentUnavailable && options.requiredArtifactPath) {
-								const issue = await settlementArtifactIssue(options.requiredArtifactPath);
+							if (originalAgentUnavailable && artifactPath) {
+								const issue = await settlementArtifactIssue(artifactPath);
 								resolvePromise(issue
 									? { state: "stalled", note: `agent disappeared and required result artifact is invalid: ${issue}` }
 									: { state: "done", note: "agent became unavailable or unclassifiable after writing a valid required result artifact" });
@@ -771,31 +868,32 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		let promptState: ObservedAgentState | undefined;
 		let promptFailureNote: string | undefined;
 
-		// Bind submission to an observed post-prompt lifecycle transition. Herdr
-		// can otherwise accept text into a composer while a separate working-only
-		// waiter misses both an unsubmitted prompt and a fast working → idle turn.
-		const prompted = await cli.exec(
-			[
-				"agent",
-				"prompt",
-				name,
-				options.prompt,
-				"--wait",
-				"--until",
-				"working",
-				"--until",
-				"done",
-				"--until",
-				"idle",
-				"--until",
-				"blocked",
-				"--timeout",
-				String(AGENT_PROMPT_WAIT_TIMEOUT_MS),
-			],
-			{ timeoutMs: AGENT_PROMPT_PROCESS_TIMEOUT_MS },
-		);
+		// A working same occupant accepts queued steer/follow-up text without a lifecycle wait.
+		const busyOccupant = isSameOccupant(beforePrompt, paneId, name) && beforePrompt?.status === "working";
+		const prompted = busyOccupant
+			? await cli.exec(["agent", "prompt", name, options.prompt])
+			: await cli.exec(
+				[
+					"agent",
+					"prompt",
+					name,
+					options.prompt,
+					"--wait",
+					"--until",
+					"working",
+					"--until",
+					"done",
+					"--until",
+					"idle",
+					"--until",
+					"blocked",
+					"--timeout",
+					String(AGENT_PROMPT_WAIT_TIMEOUT_MS),
+				],
+				{ timeoutMs: AGENT_PROMPT_PROCESS_TIMEOUT_MS },
+			);
 		if (prompted.ok) {
-			promptState = observedAgentState(prompted.json);
+			promptState = busyOccupant ? "working" : observedAgentState(prompted.json);
 		} else if (prompted.errorCode === "agent_prompt_stalled") {
 			const currentResult = await cli.exec(["agent", "get", paneId]);
 			const current = currentResult.ok ? occupantFrom(currentResult.json) : undefined;
@@ -824,8 +922,44 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			} else {
 				promptFailureNote = "prompt submission stalled without a safe same-agent recovery";
 			}
+		} else if (prompted.errorCode === "timeout") {
+			const currentResult = await cli.exec(["agent", "get", paneId]);
+			const current = currentResult.ok ? occupantFrom(currentResult.json) : undefined;
+			if (isSameOccupant(current, paneId, name) && current?.status === "working") {
+				promptState = "working";
+			} else {
+				throw new Error(`failed to submit prompt: ${prompted.errorMessage ?? prompted.stderr.trim()}`);
+			}
 		} else {
 			throw new Error(`failed to submit prompt: ${prompted.errorMessage ?? prompted.stderr.trim()}`);
+		}
+
+		if (options.resultDiscovery && !artifactPath) {
+			for (let attempt = 0; attempt < 4 && !artifactPath; attempt++) {
+				try {
+					const current = await cli.exec(["agent", "get", paneId]);
+					const sessionPath = current.ok ? agentSessionPath(current.json) : undefined;
+					if (sessionPath) {
+						const runDir = discoveredRunDir(await readFilePrefix(sessionPath, 256 * 1024), options.resultDiscovery);
+						if (runDir) artifactPath = join(runDir, "result.md");
+					}
+				} catch {
+					// Retry briefly while the worker extension writes its session-start entry.
+				}
+				if (!artifactPath && attempt < 3) await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
+			}
+			if (artifactPath) {
+				record.resultPath = artifactPath;
+				ledger?.track({
+					paneId,
+					agentName: name,
+					runId: record.id,
+					label: record.label,
+					closeOnSettle: false,
+				});
+			} else {
+				controller.emitOutput(`[detach] could not discover ${options.resultDiscovery} result artifact; continuing without artifact supervision\n`);
+			}
 		}
 
 		void (async () => {
@@ -834,10 +968,11 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 				return;
 			}
 			if (promptState === "done" || promptState === "idle" || promptState === "blocked") {
-				await settle(promptState);
-				return;
+				if (await settle(promptState)) return;
 			}
-			let workingTimeoutMs = AGENT_WORKING_TIMEOUT_MS;
+			let workingTimeoutMs = promptState === "done" || promptState === "idle"
+				? WAIT_FOREVER_MS
+				: AGENT_WORKING_TIMEOUT_MS;
 			let workingObserved = promptState === "working";
 			while (!finished) {
 				if (!workingObserved) {
@@ -852,8 +987,10 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 							&& generationChanged(beforePrompt, current)
 							&& (current?.status === "done" || current?.status === "idle" || current?.status === "blocked")
 						) {
-							await settle(current.status);
-							return;
+							if (await settle(current.status)) return;
+							workingTimeoutMs = WAIT_FOREVER_MS;
+							workingObserved = false;
+							continue;
 						}
 						if (isSameOccupant(current, paneId, name) && current?.status === "working") {
 							workingObserved = true;
@@ -891,7 +1028,11 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 					workingTimeoutMs = WAIT_FOREVER_MS;
 					continue;
 				}
-				await settle(settled.state, settled.note, output);
+				if (!(await settle(settled.state, settled.note, output))) {
+					workingTimeoutMs = WAIT_FOREVER_MS;
+					workingObserved = false;
+					continue;
+				}
 				return;
 			}
 		})();

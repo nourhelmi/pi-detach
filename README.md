@@ -115,14 +115,21 @@ Pi is the default runtime:
 
 A role resolves through `~/.pi/agent/bg-agent-profiles.json`. The profile supplies
 the semantic role contract: role skill, optional portable skill path, anchor
-requirement, and instructional prompt-cycle cap. Model selection is not role
-policy. With no `model` or `thinking`, a Pi worker uses Pi's default runtime
-identity. If supplied, `model` ("provider/model-id") and `thinking` are forwarded
-to Pi. `thinking` requires `model`.
+requirement, instructional prompt-cycle cap, and optional `resultDiscovery`.
+For Pi-hosted advisor workers, `resultDiscovery: "advisor-worker"` finds the
+worker's session-start JSONL entry and uses `<runDir>/result.md` as its durable
+artifact. Model selection is not role policy. With no `model` or `thinking`, a
+Pi worker uses Pi's default runtime identity. If supplied, `model`
+("provider/model-id") and `thinking` are forwarded to Pi. `thinking` requires
+`model`.
 
 `bg_agent` submits a structured task packet and follows the promote-after-30s
 contract. The caller is woken when the helper settles as `done`, `idle`,
-`blocked`, or `stalled`.
+`blocked`, or `stalled`. When a valid result artifact is available, its first
+line under `Status` is authoritative: a line beginning `BLOCKED` settles as
+blocked even if Herdr reports done, while `IN PROGRESS`, `WAITING`, and the other
+working-status aliases keep the run supervised. The parent receives one pause
+notice and is woken later when the artifact becomes terminal or blocked.
 
 Successful `done`/`idle` panes close after their transcript is captured. Blocked,
 stalled, and failed panes remain visible. Preserve a successful pane only for a
@@ -141,7 +148,10 @@ planned follow-up:
 }
 ```
 
-Then reuse it by name:
+Then reuse it by name. If the occupant is already working, Pi queues the prompt
+as a steer/follow-up without a lifecycle wait and pi-detach continues supervising
+that run; a wait timeout is also accepted when `agent get` confirms the same
+occupant is still working:
 
 ```jsonc
 { "name": "auth-builder-a3f9k", "prompt": "Address these bounded reviewer findings: …", "keepAlive": true }
@@ -199,6 +209,7 @@ Profile file shape:
       "harness": "pi",
       "skill": "role-reviewer",
       "skillPath": "skills/roles/reviewer/SKILL.md",
+      "resultDiscovery": "advisor-worker",
       "maxTurns": 5,
       "requireAnchor": true
     },

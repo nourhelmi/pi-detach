@@ -22,6 +22,7 @@ const CONTINUE_HINT =
 
 export interface Notifier {
 	runFinished(record: RunRecord): void;
+	agentPaused(record: RunRecord, note: string): void;
 	watchErrorLine(record: RunRecord, line: string): void;
 	watchDoneLine(record: RunRecord, line: string): void;
 }
@@ -59,8 +60,10 @@ export function createNotifier(
 			unknown: "settled in an unknown state",
 		};
 		const lines = [
-			`[detach] agent ${record.id} · ${record.label} (${record.agentName ?? "?"}) ${headlineByState[state] ?? state}`,
+			`[detach] agent ${record.id} · ${record.label} (${record.agentName ?? "?"}) ${headlineByState[state] ?? state}` +
+				(record.resultStatus ? ` · result Status: ${record.resultStatus}` : ""),
 			...paneHint(record),
+			...(record.resultPath ? [`Result artifact: ${record.resultPath}`] : []),
 		];
 		if (tail.trim()) {
 			lines.push("", tail.trimEnd());
@@ -115,6 +118,16 @@ export function createNotifier(
 			}
 			lines.push("", `Full log: bg_output({ runId: "${record.id}" })`, CONTINUE_HINT);
 			deliver("detach_finished", lines.join("\n"), record);
+		},
+
+		agentPaused(record, _note) {
+			const lines = [
+				`[detach] agent ${record.id} · ${record.label} (${record.agentName ?? "?"}) paused after a turn — result Status: "${record.resultStatus ?? "IN PROGRESS"}". It is waiting on its own background work; supervision continues and you will be woken when its result becomes terminal or it blocks.`,
+				...paneHint(record),
+				...(record.resultPath ? [`Result artifact: ${record.resultPath}`] : []),
+				CONTINUE_HINT,
+			];
+			deliver("detach_agent_paused", lines.join("\n"), record);
 		},
 
 		watchErrorLine(record, line) {
