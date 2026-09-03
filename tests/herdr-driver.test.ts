@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
-import { rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -155,6 +155,17 @@ function agentGet(paneId: string, name: string, agent_status: string, state_chan
 
 function resultArtifact(status: string): string {
 	return `# Status\n${status}\n# Claims\nBuilt\n# Evidence\nTests pass\n# Files\n- src/x.ts\n# Decisions\nNone\n# Remaining Risk\nNone\n`;
+}
+
+function advisorSession(runDir: string): string {
+	return [
+		JSON.stringify({ type: "message", data: {} }),
+		JSON.stringify({ type: "custom", customType: "advisor-worker", data: { runDir } }),
+	].join("\n");
+}
+
+function workerLedger(sessionId: string, records: unknown[]): string {
+	return `${JSON.stringify({ sessionId, ownerPid: 12345, records })}\n`;
 }
 
 function closedPanes(execCalls: string[][]): string[] {
@@ -2061,7 +2072,7 @@ test("Pi role result discovery reads the agent session and supervises its artifa
 		const { record, completion } = await registry.start({
 			kind: "agent", command: "pi", cwd, prompt: "Work.", resultDiscovery: "advisor-worker",
 		});
-		assert.equal(record.resultPath, artifactPath);
+		await waitUntil(() => record.resultPath === artifactPath);
 		assert.equal(registry.list()[0]?.resultPath, artifactPath);
 		fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
 		await waitUntil(() => fake.waiters.some((waiter) => waiter.args.includes("done")));
@@ -2069,6 +2080,511 @@ test("Pi role result discovery reads the agent session and supervises its artifa
 		assert.equal((await completion).resultStatus, "PASS");
 	} finally {
 		await rm(runDir, { force: true, recursive: true });
+	}
+});
+test("Pi result discovery succeeds on a later background retry", async () => {
+	const runDir = mkdtempSync(join(tmpdir(), "pi-detach-retry-discovery-"));
+	const sessionPath = join(runDir, "2026-03-18_worker-retry.jsonl");
+	const artifactPath = join(runDir, "result.md");
+	try {
+		const fake = createFakeCli();
+		let name = "";
+		fake.respond("agent start", (args) => {
+			name = args[2] ?? "";
+			return ok({ result: { agent: { pane_id: "w1:p7" } } });
+		});
+		fake.respond("agent get", () => ok({ result: { agent: {
+			pane_id: "w1:p7", name, agent_status: "idle", state_change_seq: 1,
+			agent_session: { kind: "path", value: sessionPath },
+		} } }));
+		const registry = herdrRegistry(fake);
+		const { record, completion } = await registry.start({
+			kind: "agent", command: "pi", cwd, prompt: "Work.", resultDiscovery: "advisor-worker",
+		});
+		await waitUntil(() => fake.execCalls.filter((args) => args[0] === "agent" && args[1] === "get").length >= 2);
+		assert.equal(record.resultPath, undefined, "the immediate discovery attempt ran before the session file existed");
+		await writeFile(sessionPath, advisorSession(runDir));
+		await writeFile(artifactPath, resultArtifact("PASS"));
+		await waitUntil(() => record.resultPath === artifactPath);
+		fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+		await waitUntil(() => fake.waiters.some((waiter) => waiter.args.includes("done")));
+		fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+		assert.equal((await completion).resultStatus, "PASS");
+	} finally {
+		await rm(runDir, { force: true, recursive: true });
+	}
+});
+
+test("Pi result discovery makes one final successful attempt at settlement", async () => {
+	const runDir = mkdtempSync(join(tmpdir(), "pi-detach-settlement-discovery-"));
+	const sessionPath = join(runDir, "2026-03-18_worker-settlement.jsonl");
+	const artifactPath = join(runDir, "result.md");
+	try {
+		const fake = createFakeCli();
+		let name = "";
+		let exposeSession = false;
+		fake.respond("agent start", (args) => {
+			name = args[2] ?? "";
+			return ok({ result: { agent: { pane_id: "w1:p7" } } });
+		});
+		fake.respond("agent get", () => ok({ result: { agent: {
+			pane_id: "w1:p7", name, agent_status: "idle", state_change_seq: 1,
+			...(exposeSession ? { agent_session: { kind: "path", value: sessionPath } } : {}),
+		} } }));
+		const registry = herdrRegistry(fake);
+		const { record, completion } = await registry.start({
+			kind: "agent", command: "pi", cwd, prompt: "Work.", resultDiscovery: "advisor-worker",
+		});
+		await waitUntil(() => fake.execCalls.filter((args) => args[0] === "agent" && args[1] === "get").length >= 2);
+		assert.equal(record.resultPath, undefined);
+		await writeFile(sessionPath, advisorSession(runDir));
+		await writeFile(artifactPath, resultArtifact("PASS"));
+		exposeSession = true;
+		fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+		await waitUntil(() => fake.waiters.some((waiter) => waiter.args.includes("done")));
+		fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+		const finished = await completion;
+		assert.equal(record.resultPath, artifactPath);
+		assert.equal(finished.resultStatus, "PASS");
+		assert.doesNotMatch(registry.tail(record.id, 20), /could not discover/);
+	} finally {
+		await rm(runDir, { force: true, recursive: true });
+	}
+});
+test("result discovery rejects a replacement pane occupant's session", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-detach-replacement-discovery-"));
+	const sessionPath = join(root, "2026-03-18_replacement-session.jsonl");
+	const artifactPath = join(root, "result.md");
+	try {
+		await writeFile(sessionPath, advisorSession(root));
+		await writeFile(artifactPath, resultArtifact("PASS"));
+		const ledger = createSessionLedger({ ledgerDir: join(root, "ledgers"), sessionId: "parent", ownerPid: process.pid });
+		const fake = createFakeCli();
+		let name = "";
+		let gets = 0;
+		fake.respond("agent start", (args) => {
+			name = args[2] ?? "";
+			return ok({ result: { agent: { pane_id: "w1:p7" } } });
+		});
+		fake.respond("agent get", () => {
+			gets += 1;
+			if (gets === 1) return agentGet("w1:p7", name, "idle", 1);
+			return ok({ result: { agent: {
+				pane_id: "w1:p7", name: "replacement", agent_status: "idle", state_change_seq: 2,
+				agent_session: { kind: "path", value: sessionPath },
+			} } });
+		});
+		const registry = herdrRegistry(fake, { ledger });
+		const { record } = await registry.start({
+			kind: "agent", command: "pi", cwd, prompt: "Work.", closeOnSettle: true,
+			resultDiscovery: "advisor-worker",
+		});
+		await waitUntil(() => gets >= 2);
+		await flushAsync();
+		assert.equal(record.resultPath, undefined);
+		assert.equal(ledger.read().records[0]?.closeOnSettle, true);
+		registry.stopAll("shutdown");
+	} finally {
+		await rm(root, { force: true, recursive: true });
+	}
+});
+
+test("in-flight result discovery cannot mutate a detached run", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-detach-detached-discovery-"));
+	const sessionPath = join(root, "2026-03-18_worker-detached.jsonl");
+	const artifactPath = join(root, "result.md");
+	try {
+		await writeFile(sessionPath, advisorSession(root));
+		await writeFile(artifactPath, resultArtifact("PASS"));
+		const ledger = createSessionLedger({ ledgerDir: join(root, "ledgers"), sessionId: "parent", ownerPid: process.pid });
+		const fake = createFakeCli();
+		let name = "";
+		let gets = 0;
+		let resolveDiscovery: ((result: CliResult) => void) | undefined;
+		fake.respond("agent start", (args) => {
+			name = args[2] ?? "";
+			return ok({ result: { agent: { pane_id: "w1:p7" } } });
+		});
+		fake.respond("agent get", () => {
+			gets += 1;
+			if (gets === 1) return agentGet("w1:p7", name, "idle", 1);
+			return new Promise<CliResult>((resolve) => {
+				resolveDiscovery = resolve;
+			});
+		});
+		const registry = herdrRegistry(fake, { ledger });
+		const { record } = await registry.start({
+			kind: "agent", command: "pi", cwd, prompt: "Work.", closeOnSettle: true,
+			resultDiscovery: "advisor-worker",
+		});
+		await waitUntil(() => resolveDiscovery !== undefined);
+		registry.stopAll("shutdown");
+		resolveDiscovery?.(ok({ result: { agent: {
+			pane_id: "w1:p7", name, agent_status: "idle", state_change_seq: 1,
+			agent_session: { kind: "path", value: sessionPath },
+		} } }));
+		await flushAsync();
+		await flushAsync();
+		assert.equal(record.resultPath, undefined);
+		assert.equal(ledger.read().records[0]?.closeOnSettle, true);
+	} finally {
+		await rm(root, { force: true, recursive: true });
+	}
+});
+
+test("a done worker with a live ledger sub-agent pauses, then settles after sub-work ends", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-detach-live-sub-agent-"));
+	const ledgerDir = join(root, "ledgers");
+	const runDir = join(root, "run");
+	const sessionId = "worker-live";
+	const sessionPath = join(root, `2026-03-18_${sessionId}.jsonl`);
+	const artifactPath = join(runDir, "result.md");
+	try {
+		await mkdir(runDir);
+		await writeFile(sessionPath, advisorSession(runDir));
+		const ledger = createSessionLedger({ ledgerDir, sessionId: "parent", ownerPid: process.pid });
+		await writeFile(join(ledgerDir, `${sessionId}.json`), workerLedger(sessionId, [{
+			paneId: "w1:p8", agentName: "child-scout", runId: "child", label: "child",
+			closeOnSettle: true, ownerPid: 12345, createdAt: Date.now(),
+		}]));
+		const fake = createFakeCli();
+		let name = "";
+		let childStatus = "working";
+		fake.respond("agent start", (args) => {
+			name = args[2] ?? "";
+			return ok({ result: { agent: { pane_id: "w1:p7" } } });
+		});
+		fake.respond("agent get", (args) => args[2] === "w1:p8"
+			? agentGet("w1:p8", "child-scout", childStatus, 1)
+			: ok({ result: { agent: {
+				pane_id: "w1:p7", name, agent_status: "done", state_change_seq: 2,
+				agent_session: { kind: "path", value: sessionPath },
+			} } }));
+		const registry = herdrRegistry(fake, { ledger });
+		const progress: string[] = [];
+		registry.onProgress((_record, note) => progress.push(note));
+		const { record, completion } = await registry.start({
+			kind: "agent", command: "pi", cwd, prompt: "Work.", closeOnSettle: true,
+			resultDiscovery: "advisor-worker",
+		});
+		await waitUntil(() => record.resultPath === artifactPath);
+		fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+		await waitUntil(() => fake.waiters.some((waiter) => waiter.args.includes("done")));
+		fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+		await waitUntil(() => progress.length === 1);
+		assert.match(progress[0] ?? "", /waiting on its own sub-agent\(s\): child-scout/);
+		assert.equal(record.status, "running");
+		assert.deepEqual(closedPanes(fake.execCalls), []);
+		const workingWait = fake.waiters.filter((waiter) => waiter.args.includes("working")).at(-1);
+		assert.equal(workingWait?.args.at(-1), "604800000");
+
+		childStatus = "done";
+		await writeFile(artifactPath, resultArtifact("PASS"));
+		workingWait?.resolveWith(ok({}));
+		await waitUntil(() => fake.waiters.filter((waiter) => waiter.args.includes("done")).length === 2);
+		fake.waiters.filter((waiter) => waiter.args.includes("done")).at(-1)?.resolveWith(ok({}));
+		const finished = await completion;
+		assert.equal(finished.agentState, "done");
+		assert.equal(finished.resultStatus, "PASS");
+		assert.equal(progress.length, 1);
+		await flushAsync();
+		assert.deepEqual(closedPanes(fake.execCalls), ["w1:p7"]);
+	} finally {
+		await rm(root, { force: true, recursive: true });
+	}
+});
+test("child lookup exceptions and transient failures fail closed before a later working lookup", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-detach-indeterminate-child-"));
+	const ledgerDir = join(root, "ledgers");
+	const runDir = join(root, "run");
+	const sessionId = "worker-indeterminate";
+	const sessionPath = join(root, `2026-03-18_${sessionId}.jsonl`);
+	const artifactPath = join(runDir, "result.md");
+	try {
+		await mkdir(runDir);
+		await writeFile(sessionPath, advisorSession(runDir));
+		await writeFile(artifactPath, resultArtifact("PASS"));
+		const ledger = createSessionLedger({ ledgerDir, sessionId: "parent", ownerPid: process.pid });
+		await writeFile(join(ledgerDir, `${sessionId}.json`), workerLedger(sessionId, [{
+			paneId: "w1:p8", agentName: "child-scout", runId: "child", label: "child",
+			closeOnSettle: true, ownerPid: 12345, createdAt: Date.now(),
+		}]));
+		const fake = createFakeCli();
+		let name = "";
+		let childLookups = 0;
+		fake.respond("agent start", (args) => {
+			name = args[2] ?? "";
+			return ok({ result: { agent: { pane_id: "w1:p7" } } });
+		});
+		fake.respond("agent get", (args) => {
+			if (args[2] === "w1:p8") {
+				childLookups += 1;
+				if (childLookups === 1) throw new Error("temporary agent-get exception");
+				if (childLookups === 2) return failed("server_unavailable", "temporary transport failure");
+				return agentGet("w1:p8", "child-scout", childLookups === 3 ? "working" : "done", childLookups);
+			}
+			return ok({ result: { agent: {
+				pane_id: "w1:p7", name, agent_status: "done", state_change_seq: 2,
+				agent_session: { kind: "path", value: sessionPath },
+			} } });
+		});
+		const registry = herdrRegistry(fake, { ledger });
+		const progress: string[] = [];
+		registry.onProgress((_record, note) => progress.push(note));
+		const { record, completion } = await registry.start({
+			kind: "agent", command: "pi", cwd, prompt: "Work.", closeOnSettle: true,
+			resultDiscovery: "advisor-worker",
+		});
+		await waitUntil(() => record.resultPath === artifactPath);
+		fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+		await waitUntil(() => fake.waiters.some((waiter) => waiter.args.includes("done")));
+		fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+		await waitUntil(() => progress.length === 1);
+		assert.match(progress[0] ?? "", /could not confirm.*child-scout/);
+		assert.equal(record.status, "running");
+		assert.deepEqual(closedPanes(fake.execCalls), []);
+
+		let workingWait = fake.waiters.filter((waiter) => waiter.args.includes("working")).at(-1);
+		workingWait?.resolveWith(ok({}));
+		await waitUntil(() => fake.waiters.filter((waiter) => waiter.args.includes("done")).length === 2);
+		fake.waiters.filter((waiter) => waiter.args.includes("done")).at(-1)?.resolveWith(ok({}));
+		await waitUntil(() => childLookups === 2);
+		assert.equal(record.status, "running", "a transient lookup failure keeps supervision paused");
+		assert.deepEqual(closedPanes(fake.execCalls), []);
+
+		workingWait = fake.waiters.filter((waiter) => waiter.args.includes("working")).at(-1);
+		workingWait?.resolveWith(ok({}));
+		await waitUntil(() => fake.waiters.filter((waiter) => waiter.args.includes("done")).length === 3);
+		fake.waiters.filter((waiter) => waiter.args.includes("done")).at(-1)?.resolveWith(ok({}));
+		await waitUntil(() => childLookups === 3);
+		assert.equal(record.status, "running", "a confirmed working child keeps supervision paused");
+		assert.deepEqual(closedPanes(fake.execCalls), []);
+
+		workingWait = fake.waiters.filter((waiter) => waiter.args.includes("working")).at(-1);
+		workingWait?.resolveWith(ok({}));
+		await waitUntil(() => fake.waiters.filter((waiter) => waiter.args.includes("done")).length === 4);
+		fake.waiters.filter((waiter) => waiter.args.includes("done")).at(-1)?.resolveWith(ok({}));
+		const finished = await completion;
+		assert.equal(finished.agentState, "done");
+		assert.equal(finished.resultStatus, "PASS");
+		assert.equal(progress.length, 1);
+		await flushAsync();
+		assert.deepEqual(closedPanes(fake.execCalls), ["w1:p7"]);
+	} finally {
+		await rm(root, { force: true, recursive: true });
+	}
+});
+
+test("discovery give-up is logged only when a live-child pause later terminalizes", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-detach-deferred-give-up-"));
+	const ledgerDir = join(root, "ledgers");
+	const sessionId = "worker-no-artifact";
+	const sessionPath = join(root, `2026-03-18_${sessionId}.jsonl`);
+	try {
+		await writeFile(sessionPath, JSON.stringify({ type: "message", data: {} }));
+		const ledger = createSessionLedger({ ledgerDir, sessionId: "parent", ownerPid: process.pid });
+		await writeFile(join(ledgerDir, `${sessionId}.json`), workerLedger(sessionId, [{
+			paneId: "w1:p8", agentName: "child-scout", runId: "child", label: "child",
+			closeOnSettle: true, ownerPid: 12345, createdAt: Date.now(),
+		}]));
+		const fake = createFakeCli();
+		let name = "";
+		let childStatus = "working";
+		fake.respond("agent start", (args) => {
+			name = args[2] ?? "";
+			return ok({ result: { agent: { pane_id: "w1:p7" } } });
+		});
+		fake.respond("agent get", (args) => args[2] === "w1:p8"
+			? agentGet("w1:p8", "child-scout", childStatus, 1)
+			: ok({ result: { agent: {
+				pane_id: "w1:p7", name, agent_status: "done", state_change_seq: 2,
+				agent_session: { kind: "path", value: sessionPath },
+			} } }));
+		const registry = herdrRegistry(fake, { ledger });
+		const progress: string[] = [];
+		registry.onProgress((_record, note) => progress.push(note));
+		const { record, completion } = await registry.start({
+			kind: "agent", command: "pi", cwd, prompt: "Work.", closeOnSettle: true,
+			resultDiscovery: "advisor-worker",
+		});
+		await waitUntil(() => fake.execCalls.filter((args) => args[0] === "agent" && args[1] === "get").length >= 2);
+		fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+		await waitUntil(() => fake.waiters.some((waiter) => waiter.args.includes("done")));
+		fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+		await waitUntil(() => progress.length === 1);
+		assert.equal(record.status, "running");
+		assert.doesNotMatch(registry.tail(record.id, 20), /could not discover/);
+
+		childStatus = "done";
+		fake.waiters.filter((waiter) => waiter.args.includes("working")).at(-1)?.resolveWith(ok({}));
+		await waitUntil(() => fake.waiters.filter((waiter) => waiter.args.includes("done")).length === 2);
+		fake.waiters.filter((waiter) => waiter.args.includes("done")).at(-1)?.resolveWith(ok({}));
+		assert.equal((await completion).agentState, "done");
+		assert.equal(registry.tail(record.id, 20).match(/could not discover/g)?.length, 1);
+	} finally {
+		await rm(root, { force: true, recursive: true });
+	}
+});
+test("detach during a child lookup produces no later settlement side effects", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-detach-child-lookup-detach-"));
+	const ledgerDir = join(root, "ledgers");
+	const runDir = join(root, "run");
+	const sessionId = "worker-child-detach";
+	const sessionPath = join(root, `2026-03-18_${sessionId}.jsonl`);
+	const artifactPath = join(runDir, "result.md");
+	try {
+		await mkdir(runDir);
+		await writeFile(sessionPath, advisorSession(runDir));
+		await writeFile(artifactPath, resultArtifact("PASS"));
+		const ledger = createSessionLedger({ ledgerDir, sessionId: "parent", ownerPid: process.pid });
+		await writeFile(join(ledgerDir, `${sessionId}.json`), workerLedger(sessionId, [{
+			paneId: "w1:p8", agentName: "child-scout", runId: "child", label: "child",
+			closeOnSettle: true, ownerPid: 12345, createdAt: Date.now(),
+		}]));
+		const fake = createFakeCli();
+		let name = "";
+		let resolveChild: ((result: CliResult) => void) | undefined;
+		fake.respond("agent start", (args) => {
+			name = args[2] ?? "";
+			return ok({ result: { agent: { pane_id: "w1:p7" } } });
+		});
+		fake.respond("agent get", (args) => {
+			if (args[2] === "w1:p8") {
+				return new Promise<CliResult>((resolve) => {
+					resolveChild = resolve;
+				});
+			}
+			return ok({ result: { agent: {
+				pane_id: "w1:p7", name, agent_status: "done", state_change_seq: 2,
+				agent_session: { kind: "path", value: sessionPath },
+			} } });
+		});
+		const registry = herdrRegistry(fake, { ledger });
+		const progress: string[] = [];
+		registry.onProgress((_record, note) => progress.push(note));
+		const { record } = await registry.start({
+			kind: "agent", command: "pi", cwd, prompt: "Work.", closeOnSettle: true,
+			resultDiscovery: "advisor-worker",
+		});
+		await waitUntil(() => record.resultPath === artifactPath);
+		fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+		await waitUntil(() => fake.waiters.some((waiter) => waiter.args.includes("done")));
+		fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+		await waitUntil(() => resolveChild !== undefined);
+
+		const logBefore = registry.tail(record.id, 20);
+		const ledgerBefore = ledger.read();
+		const workingWaitsBefore = fake.waiters.filter((waiter) => waiter.args.includes("working")).length;
+		registry.stopAll("shutdown");
+		const execCallsAfterDetach = fake.execCalls.length;
+		resolveChild?.(agentGet("w1:p8", "child-scout", "working", 1));
+		await flushAsync();
+		await flushAsync();
+
+		assert.deepEqual(progress, []);
+		assert.equal(registry.tail(record.id, 20), logBefore, "no output is emitted after detach");
+		assert.equal(record.status, "running", "detach does not synthesize a completion outcome");
+		assert.equal(record.agentState, undefined);
+		assert.equal(record.resultStatus, undefined);
+		assert.equal(record.exitCode, undefined);
+		assert.equal(record.endedAt, undefined);
+		assert.equal(
+			fake.waiters.filter((waiter) => waiter.args.includes("working")).length,
+			workingWaitsBefore,
+			"settlement does not rearm after detach",
+		);
+		assert.equal(fake.execCalls.length, execCallsAfterDetach, "no CLI mutation occurs after deferred resolution");
+		assert.deepEqual(ledger.read(), ledgerBefore);
+		assert.deepEqual(closedPanes(fake.execCalls), []);
+	} finally {
+		await rm(root, { force: true, recursive: true });
+	}
+});
+
+test("a stale in-progress artifact stalls when its readable ledger has no live sub-work", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-detach-stale-result-"));
+	const ledgerDir = join(root, "ledgers");
+	const runDir = join(root, "run");
+	const sessionId = "worker-stale";
+	const sessionPath = join(root, `2026-03-18_${sessionId}.jsonl`);
+	const artifactPath = join(runDir, "result.md");
+	try {
+		await mkdir(runDir);
+		await writeFile(sessionPath, advisorSession(runDir));
+		await writeFile(artifactPath, resultArtifact("IN PROGRESS — waiting forever"));
+		const ledger = createSessionLedger({ ledgerDir, sessionId: "parent", ownerPid: process.pid });
+		await writeFile(join(ledgerDir, `${sessionId}.json`), workerLedger(sessionId, []));
+		const fake = createFakeCli();
+		let name = "";
+		fake.respond("agent start", (args) => {
+			name = args[2] ?? "";
+			return ok({ result: { agent: { pane_id: "w1:p7" } } });
+		});
+		fake.respond("agent get", () => ok({ result: { agent: {
+			pane_id: "w1:p7", name, agent_status: "done", state_change_seq: 2,
+			agent_session: { kind: "path", value: sessionPath },
+		} } }));
+		const registry = herdrRegistry(fake, { ledger });
+		const { record, completion } = await registry.start({
+			kind: "agent", command: "pi", cwd, prompt: "Work.", closeOnSettle: true,
+			resultDiscovery: "advisor-worker",
+		});
+		await waitUntil(() => record.resultPath === artifactPath);
+		fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+		await waitUntil(() => fake.waiters.some((waiter) => waiter.args.includes("done")));
+		fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+		const finished = await completion;
+		assert.equal(finished.agentState, "stalled");
+		assert.ok(
+			registry.tail(finished.id, 20).includes(
+				'result Status is still "IN PROGRESS — waiting forever" but the agent has no background work of its own; follow up by name or read its pane',
+			),
+		);
+		assert.deepEqual(closedPanes(fake.execCalls), []);
+	} finally {
+		await rm(root, { force: true, recursive: true });
+	}
+});
+
+test("an in-progress artifact still pauses when the worker ledger is absent", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-detach-absent-ledger-"));
+	const ledgerDir = join(root, "ledgers");
+	const runDir = join(root, "run");
+	const sessionId = "worker-no-ledger";
+	const sessionPath = join(root, `2026-03-18_${sessionId}.jsonl`);
+	const artifactPath = join(runDir, "result.md");
+	try {
+		await mkdir(runDir);
+		await writeFile(sessionPath, advisorSession(runDir));
+		await writeFile(artifactPath, resultArtifact("IN PROGRESS — waiting for checks"));
+		const ledger = createSessionLedger({ ledgerDir, sessionId: "parent", ownerPid: process.pid });
+		const fake = createFakeCli();
+		let name = "";
+		fake.respond("agent start", (args) => {
+			name = args[2] ?? "";
+			return ok({ result: { agent: { pane_id: "w1:p7" } } });
+		});
+		fake.respond("agent get", () => ok({ result: { agent: {
+			pane_id: "w1:p7", name, agent_status: "done", state_change_seq: 2,
+			agent_session: { kind: "path", value: sessionPath },
+		} } }));
+		const registry = herdrRegistry(fake, { ledger });
+		const progress: string[] = [];
+		registry.onProgress((_record, note) => progress.push(note));
+		const { record, completion } = await registry.start({
+			kind: "agent", command: "pi", cwd, prompt: "Work.", resultDiscovery: "advisor-worker",
+		});
+		await waitUntil(() => record.resultPath === artifactPath);
+		fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+		await waitUntil(() => fake.waiters.some((waiter) => waiter.args.includes("done")));
+		fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+		await waitUntil(() => progress.length === 1);
+		assert.match(progress[0] ?? "", /IN PROGRESS/);
+		assert.equal(record.status, "running");
+		registry.stop(record.id);
+		await completion;
+	} finally {
+		await rm(root, { force: true, recursive: true });
 	}
 });
 

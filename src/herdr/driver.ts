@@ -16,10 +16,10 @@
 
 import { type CliResult, findString, type HerdrCli, type Waiter } from "./cli.ts";
 import { open, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import { type HerdrContext, toastsEnabled } from "./context.ts";
-import type { AgentPaneLedger } from "./ledger.ts";
+import { DEFAULT_LEDGER_DIR, type AgentPaneLedger, ledgerFilePath, readLedgerFile } from "./ledger.ts";
 import { isIdleShell, type PaneManager } from "./panes.ts";
 import { isSettledOccupantOf, occupantFrom } from "./reaper.ts";
 import { exitMatchPattern, extractRunOutput, parseExitCode, wrapRunCommand } from "./sentinel.ts";
@@ -46,6 +46,8 @@ const AGENT_PROMPT_PROCESS_TIMEOUT_MS = AGENT_PROMPT_WAIT_TIMEOUT_MS + 5_000;
 const WAIT_FOREVER_MS = 7 * 24 * 60 * 60 * 1000;
 const SHELL_READY_ATTEMPTS = 120;
 const SHELL_READY_POLL_MS = 250;
+const RESULT_DISCOVERY_WINDOW_MS = 60_000;
+const RESULT_DISCOVERY_BACKOFF_MS = [250, 500, 1_000, 2_000, 5_000] as const;
 const READ_LINES = 400;
 const AGENT_PANE_ENV_KEYS = [
 	"ADVISOR_STATE_DIR",
@@ -230,6 +232,13 @@ function agentSessionPath(value: unknown): string | undefined {
 		if (found) return found;
 	}
 	return undefined;
+}
+function agentSessionIdFromPath(path: string): string | undefined {
+	const filename = basename(path);
+	const stem = filename.endsWith(".jsonl") ? filename.slice(0, -".jsonl".length) : filename;
+	const separator = stem.indexOf("_");
+	const sessionId = separator >= 0 ? stem.slice(separator + 1).trim() : "";
+	return sessionId || undefined;
 }
 
 function discoveredRunDir(content: string, customType: string): string | undefined {
@@ -652,6 +661,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		record.paneId = paneId;
 		record.agentName = name;
 		let artifactPath = options.requiredArtifactPath;
+		const resultDiscovery = options.resultDiscovery;
 		// Track before the prompt so a later session death can still reap this pane.
 		ledger?.track({
 			paneId,
@@ -666,9 +676,126 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 
 		let finished = false;
 		let pauseNotified = false;
+		let discoveryGiveUpNoted = false;
+		let workerSessionPath: string | undefined;
+		let workerSessionId: string | undefined;
+		let discoveryDeadline = 0;
+		let discoveryRetryIndex = 0;
+		let discoveryAttempt: Promise<boolean> | undefined;
 		const waiters: Waiter[] = [];
 		const timers: NodeJS.Timeout[] = [];
 
+		function trackDiscoveredArtifact(path: string): void {
+			if (finished) return;
+			artifactPath = path;
+			record.resultPath = path;
+			ledger?.track({
+				paneId,
+				agentName: name,
+				runId: record.id,
+				label: record.label,
+				closeOnSettle: false,
+			});
+		}
+
+		async function attemptResultDiscovery(): Promise<boolean> {
+			if (!resultDiscovery || finished) return Boolean(artifactPath);
+			if (discoveryAttempt) return discoveryAttempt;
+			const attempt = (async () => {
+				try {
+					const current = await cli.exec(["agent", "get", paneId]);
+					if (finished) return false;
+					const occupant = current.ok ? occupantFrom(current.json) : undefined;
+					if (!isSameOccupant(occupant, paneId, name)) return false;
+					const discoveredSessionPath = agentSessionPath(current.json);
+					if (discoveredSessionPath) {
+						workerSessionPath = discoveredSessionPath;
+						workerSessionId = agentSessionIdFromPath(discoveredSessionPath);
+					}
+					if (artifactPath) return true;
+					if (!workerSessionPath) return false;
+					const content = await readFilePrefix(workerSessionPath, 256 * 1024);
+					if (finished) return false;
+					const runDir = discoveredRunDir(content, resultDiscovery);
+					if (!runDir || finished) return false;
+					trackDiscoveredArtifact(join(runDir, "result.md"));
+					return Boolean(artifactPath);
+				} catch {
+					return false;
+				}
+			})();
+			discoveryAttempt = attempt;
+			try {
+				return await attempt;
+			} finally {
+				if (discoveryAttempt === attempt) discoveryAttempt = undefined;
+			}
+		}
+
+		function scheduleResultDiscoveryRetry(): void {
+			if (finished || artifactPath || !resultDiscovery) return;
+			const remaining = discoveryDeadline - Date.now();
+			if (remaining <= 0) return;
+			const backoff = RESULT_DISCOVERY_BACKOFF_MS[
+				Math.min(discoveryRetryIndex, RESULT_DISCOVERY_BACKOFF_MS.length - 1)
+			] ?? RESULT_DISCOVERY_BACKOFF_MS.at(-1) ?? 5_000;
+			discoveryRetryIndex += 1;
+			const timer = setTimeout(() => {
+				void (async () => {
+					if (finished || artifactPath) return;
+					await attemptResultDiscovery();
+					if (!finished && !artifactPath) scheduleResultDiscoveryRetry();
+				})();
+			}, Math.min(backoff, remaining));
+			timers.push(timer);
+		}
+
+		async function workerSubAgentState(): Promise<{
+			ledgerReadable: boolean;
+			liveNames: string[];
+			indeterminateNames: string[];
+		}> {
+			if (!workerSessionId) return { ledgerReadable: false, liveNames: [], indeterminateNames: [] };
+			const path = ledgerFilePath(ledger?.dir ?? DEFAULT_LEDGER_DIR, workerSessionId);
+			const file = readLedgerFile(path);
+			if (!file || file.sessionId !== workerSessionId) {
+				return { ledgerReadable: false, liveNames: [], indeterminateNames: [] };
+			}
+			const liveNames = new Set<string>();
+			const indeterminateNames = new Set<string>();
+			for (const subAgent of file.records) {
+				try {
+					const got = await cli.exec(["agent", "get", subAgent.paneId]);
+					if (finished) return { ledgerReadable: false, liveNames: [], indeterminateNames: [] };
+					if (!got.ok) {
+						if (got.errorCode !== "not_found") indeterminateNames.add(subAgent.agentName);
+						continue;
+					}
+					const occupant = occupantFrom(got.json);
+					if (!isSameOccupant(occupant, subAgent.paneId, subAgent.agentName)) continue;
+					if (occupant?.status === "working" || occupant?.status === "blocked") {
+						liveNames.add(subAgent.agentName);
+					} else if (occupant?.status !== "done" && occupant?.status !== "idle") {
+						indeterminateNames.add(subAgent.agentName);
+					}
+				} catch {
+					if (finished) return { ledgerReadable: false, liveNames: [], indeterminateNames: [] };
+					indeterminateNames.add(subAgent.agentName);
+				}
+			}
+			return { ledgerReadable: true, liveNames: [...liveNames], indeterminateNames: [...indeterminateNames] };
+		}
+
+		function pause(note: string): boolean {
+			if (finished) return true;
+			if (!pauseNotified) {
+				pauseNotified = true;
+				controller.progress?.(note);
+			} else {
+				controller.emitOutput(`[detach] ${note}\n`);
+			}
+			return false;
+		}
 		function finalize(
 			outcome: Parameters<RunController["finish"]>[0],
 			finalText: string | undefined,
@@ -718,13 +845,32 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			capturedOutput?: string,
 		): Promise<boolean> {
 			const output = capturedOutput ?? await readPane(paneId).catch(() => undefined);
+			if (finished) return true;
+			if (resultDiscovery && !artifactPath) {
+				await attemptResultDiscovery();
+				if (finished) return true;
+			}
+
+			const subAgents = state === "done" || state === "idle"
+				? await workerSubAgentState()
+				: { ledgerReadable: false, liveNames: [], indeterminateNames: [] };
+			if (finished) return true;
+			if (subAgents.liveNames.length > 0) {
+				return pause(`waiting on its own sub-agent(s): ${subAgents.liveNames.join(", ")}`);
+			}
+			if (subAgents.indeterminateNames.length > 0) {
+				return pause(`could not confirm whether its own sub-agent(s) are still active: ${subAgents.indeterminateNames.join(", ")}`);
+			}
+
 			let finalState = state;
 			let finalNote = note;
 			let resultStatus: ResultArtifactStatus | undefined;
 			if (artifactPath) {
 				const issue = await settlementArtifactIssue(artifactPath);
+				if (finished) return true;
 				if (!issue) {
 					const content = await readFile(artifactPath, "utf8");
+					if (finished) return true;
 					resultStatus = parseResultArtifactStatus(content);
 					if (resultStatus) record.resultStatus = resultStatus.line;
 				}
@@ -736,16 +882,21 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 						finalState = "blocked";
 						finalNote = "result artifact reports BLOCKED";
 					} else if (resultStatus?.classification === "in-progress") {
-						const pauseNote = `agent paused after a turn — result Status: "${resultStatus.line}"; supervision continues`;
-						if (!pauseNotified) {
-							pauseNotified = true;
-							controller.progress?.(pauseNote);
+						if (workerSessionId && subAgents.ledgerReadable) {
+							finalState = "stalled";
+							finalNote = `result Status is still "${resultStatus.line}" but the agent has no background work of its own; follow up by name or read its pane`;
 						} else {
-							controller.emitOutput(`[detach] ${pauseNote}\n`);
+							return pause(`result Status is still "${resultStatus.line}"`);
 						}
-						return false;
 					}
 				}
+			}
+			if (finished) return true;
+			if (resultDiscovery && !artifactPath && !discoveryGiveUpNoted) {
+				discoveryGiveUpNoted = true;
+				controller.emitOutput(
+					`[detach] could not discover ${resultDiscovery} result artifact; continuing without artifact supervision\n`,
+				);
 			}
 			finalize(
 				{
@@ -934,32 +1085,12 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			throw new Error(`failed to submit prompt: ${prompted.errorMessage ?? prompted.stderr.trim()}`);
 		}
 
-		if (options.resultDiscovery && !artifactPath) {
-			for (let attempt = 0; attempt < 4 && !artifactPath; attempt++) {
-				try {
-					const current = await cli.exec(["agent", "get", paneId]);
-					const sessionPath = current.ok ? agentSessionPath(current.json) : undefined;
-					if (sessionPath) {
-						const runDir = discoveredRunDir(await readFilePrefix(sessionPath, 256 * 1024), options.resultDiscovery);
-						if (runDir) artifactPath = join(runDir, "result.md");
-					}
-				} catch {
-					// Retry briefly while the worker extension writes its session-start entry.
-				}
-				if (!artifactPath && attempt < 3) await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
-			}
-			if (artifactPath) {
-				record.resultPath = artifactPath;
-				ledger?.track({
-					paneId,
-					agentName: name,
-					runId: record.id,
-					label: record.label,
-					closeOnSettle: false,
-				});
-			} else {
-				controller.emitOutput(`[detach] could not discover ${options.resultDiscovery} result artifact; continuing without artifact supervision\n`);
-			}
+		if (resultDiscovery && !artifactPath) {
+			discoveryDeadline = Date.now() + RESULT_DISCOVERY_WINDOW_MS;
+			void (async () => {
+				await attemptResultDiscovery();
+				if (!finished && !artifactPath) scheduleResultDiscoveryRetry();
+			})();
 		}
 
 		void (async () => {

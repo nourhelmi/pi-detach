@@ -118,19 +118,30 @@ the semantic role contract: role skill, optional portable skill path, anchor
 requirement, instructional prompt-cycle cap, and optional `resultDiscovery`.
 For Pi-hosted advisor workers, `resultDiscovery: "advisor-worker"` finds the
 worker's session-start JSONL entry and uses `<runDir>/result.md` as its durable
-artifact. Model selection is not role policy. With no `model` or `thinking`, a
-Pi worker uses Pi's default runtime identity. If supplied, `model`
+artifact. Discovery starts immediately after prompt acceptance, retries with
+backoff in the background for up to about 60 seconds without delaying the tool
+return, and makes one final attempt when the worker settles. Model selection is
+not role policy. With no `model` or `thinking`, a Pi worker uses Pi's default
+runtime identity. If supplied, `model`
 ("provider/model-id") and `thinking` are forwarded to Pi. `thinking` requires
 `model`.
 
 `bg_agent` submits a structured task packet and follows the promote-after-30s
 contract. The caller is woken when the helper settles as `done`, `idle`,
-`blocked`, or `stalled`. When a valid result artifact is available, its first
-line under `Status` is authoritative: a line beginning `BLOCKED` settles as
-blocked even if Herdr reports done, while `IN PROGRESS`, `WAITING`, and the other
-working-status aliases keep the run supervised. The parent receives one pause
-notice and is woken later when the artifact becomes terminal or blocked.
-
+`blocked`, or `stalled`. A worker whose session ledger still has a matching
+`working` or `blocked` sub-agent remains supervised regardless of whether its
+result artifact is missing or looks terminal; the pause notice names that live
+sub-work. Transient child lookup failures are indeterminate and also keep the
+worker supervised rather than failing open. A final discovery give-up note is
+logged only when settlement actually becomes terminal. When a valid result
+artifact is available, its first line under
+`Status` is authoritative: a line beginning `BLOCKED` settles as blocked even
+if Herdr reports done, while `IN PROGRESS`, `WAITING`, and the other
+working-status aliases keep the run supervised when the worker ledger is absent
+or unreadable. If that ledger is readable and shows no live sub-work, an
+in-progress Status is treated as stale and settles as `stalled` so the parent is
+woken instead of waiting forever. The parent receives at most one pause notice
+and is woken later when the artifact becomes terminal or blocked.
 Successful `done`/`idle` panes close after their transcript is captured. Blocked,
 stalled, and failed panes remain visible. Preserve a successful pane only for a
 planned follow-up:
