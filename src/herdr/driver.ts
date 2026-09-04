@@ -30,6 +30,11 @@ import type {
 	RunController,
 	StartOptions,
 } from "../types.ts";
+import {
+	parseResultArtifactStatus,
+	settlementArtifactIssue,
+	type ResultArtifactStatus,
+} from "../agent-settlement.ts";
 
 const SUPERVISE_COMMAND_MS = 45_000;
 const SUPERVISE_AGENT_MS = 60_000;
@@ -141,72 +146,7 @@ function isCompactionRunning(output: string): boolean {
 	return startedAt > finishedAt;
 }
 
-const REQUIRED_ARTIFACT_HEADINGS = [
-	"Status",
-	"Claims",
-	"Evidence",
-	"Files",
-	"Decisions",
-	"Remaining Risk",
-];
-
-export async function settlementArtifactIssue(path: string): Promise<string | undefined> {
-	let content: string;
-	try {
-		content = await readFile(path, "utf8");
-	} catch (error) {
-		const code = (error as NodeJS.ErrnoException).code;
-		return code === "ENOENT" ? `missing ${path}` : `could not read ${path}: ${(error as Error).message}`;
-	}
-	if (!content.trim()) return `empty ${path}`;
-	const missing: string[] = [];
-	const empty: string[] = [];
-	for (const heading of REQUIRED_ARTIFACT_HEADINGS) {
-		const match = new RegExp(`^#{1,6}\\s+${heading}\\s*$`, "im").exec(content);
-		if (!match) {
-			missing.push(heading);
-			continue;
-		}
-		const remainder = content.slice(match.index + match[0].length);
-		const nextHeading = remainder.search(/^#{1,6}\s+\S.*$/m);
-		const body = (nextHeading >= 0 ? remainder.slice(0, nextHeading) : remainder).trim();
-		if (!body) empty.push(heading);
-	}
-	if (missing.length) return `${path} is missing headings: ${missing.join(", ")}`;
-	return empty.length ? `${path} has empty sections: ${empty.join(", ")}` : undefined;
-}
-
-export type ResultStatusClassification = "blocked" | "in-progress" | "terminal";
-
-export interface ResultArtifactStatus {
-	line: string;
-	classification: ResultStatusClassification;
-}
-
-/** Parse the first non-empty line beneath a markdown Status heading. */
-export function parseResultArtifactStatus(content: string): ResultArtifactStatus | undefined {
-	const heading = /^#{1,6}\s+Status\s*$/im.exec(content);
-	if (!heading) return undefined;
-	const remainder = content.slice(heading.index + heading[0].length);
-	const nextHeading = remainder.search(/^#{1,6}\s+\S.*$/m);
-	const body = nextHeading >= 0 ? remainder.slice(0, nextHeading) : remainder;
-	const rawLine = body.split("\n").find((line) => line.trim());
-	if (!rawLine) return undefined;
-	const line = rawLine
-		.trim()
-		.replace(/^[*_`]+/, "")
-		.replace(/[.!?,;:]+$/, "")
-		.replace(/[*_`]+$/, "")
-		.replace(/[.!?,;:]+$/, "")
-		.trim()
-		.slice(0, 200);
-	const classification = /^BLOCKED\b/i.test(line)
-		? "blocked"
-		: /^(?:IN[ _-]PROGRESS|WORKING|WAITING|PAUSED|RUNNING)\b/i.test(line)
-			? "in-progress"
-			: "terminal";
-	return { line, classification };
-}
+export { parseResultArtifactStatus, settlementArtifactIssue } from "../agent-settlement.ts";
 
 async function readFilePrefix(path: string, maxBytes: number): Promise<string> {
 	const handle = await open(path, "r");

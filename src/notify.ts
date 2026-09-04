@@ -27,6 +27,10 @@ export interface Notifier {
 	watchDoneLine(record: RunRecord, line: string): void;
 }
 
+export interface ParentWakeSink {
+	authorize(record: RunRecord, settlementGeneration: string): Promise<void>;
+}
+
 function paneHint(record: RunRecord): string[] {
 	if (!record.paneId) return [];
 	// A successful run's viewer pane closes itself right after this message.
@@ -38,6 +42,7 @@ export function createNotifier(
 	pi: ExtensionAPI,
 	registry: Registry,
 	getContext: () => ExtensionContext | undefined,
+	parentWakeSink?: ParentWakeSink,
 ): Notifier {
 	const lastErrorNotice = new Map<string, number>();
 
@@ -102,6 +107,12 @@ export function createNotifier(
 			// Killed: someone asked for this via bg_stop or shutdown, so it is not news.
 			if (!record.promoted || record.status === "killed") return;
 			if (record.kind === "agent") {
+				if (record.backend === "bb") {
+					if (record.agentState === "done" && record.settlementGeneration && parentWakeSink) {
+						void parentWakeSink.authorize(record, record.settlementGeneration).catch(() => undefined);
+					}
+					return;
+				}
 				agentFinished(record);
 				return;
 			}
@@ -121,6 +132,7 @@ export function createNotifier(
 		},
 
 		agentPaused(record, note) {
+			if (record.backend === "bb") return;
 			const resultStatus = record.resultStatus ? ` result Status: "${record.resultStatus}".` : "";
 			const lines = [
 				`[detach] agent ${record.id} · ${record.label} (${record.agentName ?? "?"}) paused after a turn — ${note}.${resultStatus} supervision continues and you will be woken when its result becomes terminal or it blocks.`,

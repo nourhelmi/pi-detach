@@ -110,6 +110,11 @@ export interface ResolvedAgentLaunch {
 	maxTurns?: number;
 	resultPath?: string;
 	resultDiscovery?: string;
+	profilePolicy?: {
+		cliArgs: string[];
+		tools: string[];
+		excludeTools: string[];
+	};
 }
 
 interface LaunchIdentity {
@@ -369,6 +374,11 @@ function resolveProfileLaunch(
 		runtime: native?.runtime ?? (profile.agent ?? config.defaultAgent).split(/\s+/)[0] ?? "pi",
 		...(resultPath ? { resultPath } : {}),
 		...(!native && profile.resultDiscovery ? { resultDiscovery: profile.resultDiscovery } : {}),
+		profilePolicy: {
+			cliArgs: [...(profile.cliArgs ?? [])],
+			tools: [...(profile.tools ?? [])],
+			excludeTools: [...(profile.excludeTools ?? [])],
+		},
 		...identityDetails(identity),
 	};
 }

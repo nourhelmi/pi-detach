@@ -14,6 +14,7 @@ import { createWriteStream, mkdirSync, type WriteStream } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { writeRunState } from "./run-state.ts";
 import type {
 	DriverHandle,
 	DriverOutcome,
@@ -27,7 +28,7 @@ import type {
 
 const TAIL_LINES = 500;
 
-const RUNS_DIR = join(homedir(), ".pi", "detach", "runs");
+const RUNS_DIR = join(process.env.PI_DETACH_STATE_ROOT ?? join(homedir(), ".pi", "detach"), "runs");
 
 interface LiveRun {
 	record: RunRecord;
@@ -47,6 +48,7 @@ export interface Registry {
 	tail(id: string, lines: number): string;
 	readLog(id: string, options: { lines: number; grep?: string }): Promise<string>;
 	stop(id: string): RunRecord | undefined;
+	continue(id: string, prompt: string): Promise<RunRecord>;
 	/** "shutdown" leaves herdr panes running — they are visible and user-owned. */
 	stopAll(mode?: "stop" | "shutdown"): void;
 	markPromoted(id: string): void;
@@ -78,6 +80,8 @@ function summarize(record: RunRecord): RunSummary {
 		...(record.agentState !== undefined ? { agentState: record.agentState } : {}),
 		...(record.resultPath !== undefined ? { resultPath: record.resultPath } : {}),
 		...(record.resultStatus !== undefined ? { resultStatus: record.resultStatus } : {}),
+		...(record.surface !== undefined ? { surface: record.surface } : {}),
+		...(record.settlementGeneration !== undefined ? { settlementGeneration: record.settlementGeneration } : {}),
 		...(record.exitCode !== undefined ? { exitCode: record.exitCode } : {}),
 		startedAt: record.startedAt,
 		...(record.endedAt !== undefined ? { endedAt: record.endedAt } : {}),
@@ -148,6 +152,8 @@ const localDriver: DriverStart = (options, controller) => {
 export interface RegistryOptions {
 	/** Hosts watch and agent runs in herdr panes. bg_run never uses it. */
 	herdrDriver?: DriverStart;
+	agentDriver?: { backend: "herdr" | "bb"; start: DriverStart };
+	runStatePath?: (runId: string) => string;
 	/** Called when a local run is promoted to the background — attaches a viewer pane. */
 	onPromoted?: (record: RunRecord, completion: Promise<RunRecord>) => void;
 }
@@ -161,13 +167,24 @@ function matchesPattern(pattern: string, line: string): boolean {
 }
 
 export function createRegistry(options: RegistryOptions = {}): Registry {
-	const { herdrDriver, onPromoted } = options;
+	const { herdrDriver, onPromoted, runStatePath } = options;
+	const agentDriver = options.agentDriver ?? (herdrDriver ? { backend: "herdr" as const, start: herdrDriver } : undefined);
 	const runs = new Map<string, LiveRun>();
 	const active = new Map<string, string>();
 	const exitHandlers: ((record: RunRecord) => void)[] = [];
 	const errorLineHandlers: ((record: RunRecord, line: string) => void)[] = [];
 	const doneLineHandlers: ((record: RunRecord, line: string) => void)[] = [];
 	const progressHandlers: ((record: RunRecord, note: string) => void)[] = [];
+	const stateWrites = new Map<string, Promise<void>>();
+	function persist(record: RunRecord, state: "running" | "paused" | "finished"): Promise<void> {
+		const snapshot = { ...record, ...(record.surface ? { surface: { ...record.surface } } : {}) };
+		const prior = stateWrites.get(record.id) ?? Promise.resolve();
+		const next = prior
+			.catch(() => undefined)
+			.then(() => writeRunState(snapshot, state, runStatePath?.(record.id)));
+		stateWrites.set(record.id, next);
+		return next;
+	}
 
 	function absorb(live: LiveRun, chunk: string): void {
 		live.stream.write(chunk);
@@ -225,7 +242,9 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 			// bg_run commands are foreground work: always local and invisible,
 			// like Claude Code's shell tool. Only watches and agents live in
 			// panes from birth.
-			backend: options.kind !== "run" && herdrDriver ? "herdr" : "local",
+			backend: options.kind === "agent" && agentDriver
+				? agentDriver.backend
+				: options.kind === "watch" && herdrDriver ? "herdr" : "local",
 			startedAt: Date.now(),
 			// Watches are announced from birth; runs and agents only after their
 			// tool call detaches.
@@ -261,6 +280,24 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 				absorb(live, `[detach] ${note}\n`);
 				for (const handler of progressHandlers) handler(record, note);
 			},
+			pause: (outcome) => {
+				if (record.status !== "running" || record.backend !== "bb") return;
+				record.agentState = "blocked";
+				if (outcome.resultStatus) record.resultStatus = outcome.resultStatus;
+				if (outcome.settlementGeneration) record.settlementGeneration = outcome.settlementGeneration;
+				if (outcome.note) absorb(live, `[detach] ${outcome.note}\n`);
+				void persist(record, "paused").catch(() => undefined);
+				for (const handler of progressHandlers) handler(record, outcome.note ?? "blocked");
+			},
+			resume: async () => {
+				if (record.status !== "running" || record.backend !== "bb" || record.agentState !== "blocked") {
+					throw new Error(`run ${record.id} is not paused BLOCKED`);
+				}
+				record.agentState = undefined;
+				record.resultStatus = undefined;
+				record.settlementGeneration = undefined;
+				await persist(record, "running");
+			},
 			finish: (outcome: DriverOutcome) => {
 				if (record.status !== "running") return;
 				if (live.pending) absorb(live, "\n");
@@ -270,11 +307,21 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 				record.termSignal = outcome.termSignal;
 				if (outcome.agentState) record.agentState = outcome.agentState;
 				if (outcome.resultStatus) record.resultStatus = outcome.resultStatus;
+				if (outcome.settlementGeneration) record.settlementGeneration = outcome.settlementGeneration;
 				record.endedAt = Date.now();
 				active.delete(key);
+				const statePersisted = persist(record, "finished");
 				// Announce only once the log file is flushed, so a notified reader
 				// calling bg_output immediately cannot see a truncated log.
-				live.stream.end(() => {
+				live.stream.end(async () => {
+					try {
+						await statePersisted;
+					} catch (error) {
+						if (record.backend === "bb") {
+							record.agentState = "stalled";
+							record.resultStatus = `could not persist canonical run projection: ${error instanceof Error ? error.message : String(error)}`;
+						}
+					}
 					resolve(record);
 					for (const handler of exitHandlers) handler(record);
 				});
@@ -288,13 +335,17 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 
 		let handle: DriverHandle;
 		try {
-			if (options.kind === "run" || !herdrDriver) {
+			if (options.kind === "run" || (options.kind === "watch" && !herdrDriver) || (options.kind === "agent" && !agentDriver)) {
 				if (options.kind === "agent") {
 					throw new Error("bg_agent requires pi to be running inside a herdr pane");
 				}
 				handle = await localDriver(options, controller);
-			} else {
+			} else if (options.kind === "agent" && agentDriver) {
+				handle = await agentDriver.start(options, controller);
+			} else if (herdrDriver) {
 				handle = await herdrDriver(options, controller);
+			} else {
+				throw new Error("no driver for run");
 			}
 		} catch (error) {
 			if (herdrDriver && options.kind === "watch" && record.status === "running") {
@@ -314,6 +365,8 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 		record.pid = handle.pid ?? record.pid;
 		record.paneId = handle.paneId ?? record.paneId;
 		record.agentName = handle.agentName ?? record.agentName;
+		record.surface = handle.surface ?? record.surface ?? (record.paneId ? { kind: "herdr", paneId: record.paneId } : { kind: "local" });
+		void persist(record, "running").catch(() => undefined);
 
 		return { record, completion, deduped: false };
 	}
@@ -355,6 +408,15 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 			const live = runs.get(id);
 			if (!live) return undefined;
 			if (live.record.status === "running") live.handle.stop();
+			return live.record;
+		},
+		async continue(id, prompt) {
+			const live = runs.get(id);
+			if (!live) throw new Error(`no run ${id}`);
+			if (live.record.status !== "running" || live.record.agentState !== "blocked") throw new Error(`run ${id} is not BLOCKED`);
+			if (!live.handle.continue) throw new Error(`run ${id} does not support continuation`);
+			await stateWrites.get(id);
+			await live.handle.continue(prompt);
 			return live.record;
 		},
 		stopAll(mode = "stop") {

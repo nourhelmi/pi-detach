@@ -76,6 +76,11 @@ test("role launch needs no model and preserves skill, tool, anchor, and turn gua
 	assert.equal(launch.model, undefined);
 	assert.equal(launch.thinking, undefined);
 	assert.equal(launch.maxTurns, 4);
+	assert.deepEqual(launch.profilePolicy, {
+		cliArgs: ["--worker-role", "reviewer"],
+		tools: ["read", "bash"],
+		excludeTools: ["edit", "bg_agent"],
+	});
 	assert.match(launch.prompt, /^Load and follow the role-reviewer skill before starting\.\n\nROLE: reviewer/);
 	assert.match(launch.prompt, /ACCEPTANCE CRITERIA:\n[^\n]+\n1\. Report evidence-backed findings\./);
 	assert.match(launch.prompt, /REQUIRED SKILLS:\nLoad and follow each listed skill before starting\.[\s\S]+- review-pr/);

@@ -28,6 +28,10 @@ import { createPaneManager } from "../src/herdr/panes.ts";
 import { createSafeReap, isProcessAlive, reapOrphanAgentPanes } from "../src/herdr/reaper.ts";
 import { createViewerManager } from "../src/herdr/viewer.ts";
 import { createNotifier } from "../src/notify.ts";
+import type { ParentWakeSink } from "../src/notify.ts";
+import { detectBbContext } from "../src/bb/context.ts";
+import { createBbClient } from "../src/bb/client.ts";
+import { createBbDriver } from "../src/bb/driver.ts";
 import { createRegistry } from "../src/registry.ts";
 import { registerBgAgentTool } from "../src/tools/bg-agent.ts";
 import { registerBgAwaitTool } from "../src/tools/bg-await.ts";
@@ -50,7 +54,8 @@ export default function registerDetachExtension(pi: ExtensionAPI): void {
 		}
 	}
 
-	const herdrCtx = detectHerdrContext();
+	const bbCtx = detectBbContext();
+	const herdrCtx = bbCtx ? undefined : detectHerdrContext();
 	const herdrCli = herdrCtx ? createHerdrCli() : undefined;
 	const ledger = herdrCtx
 		? createSessionLedger({
@@ -86,12 +91,23 @@ export default function registerDetachExtension(pi: ExtensionAPI): void {
 		viewer = createViewerManager(herdrCli, panes);
 	}
 
+	const bbClient = bbCtx ? createBbClient(bbCtx) : undefined;
+	const hostId = bbCtx ? process.env.PI_DETACH_BB_HOST_ID?.trim() : undefined;
+	if (bbCtx && !hostId) throw new Error("PI_DETACH_BB_HOST_ID is required in BB context");
+	const bbDriver = bbCtx && bbClient && hostId ? createBbDriver({ client: bbClient, context: bbCtx, hostId }) : undefined;
 	const registry = createRegistry({
 		...(herdrDriver ? { herdrDriver } : {}),
+		...(bbDriver ? { agentDriver: { backend: "bb" as const, start: bbDriver } } : {}),
 		...(viewer ? { onPromoted: viewer.attach } : {}),
 	});
 	let currentCtx: ExtensionContext | undefined;
-	const notifier = createNotifier(pi, registry, () => currentCtx);
+	const parentWakeSink: ParentWakeSink | undefined = bbCtx && bbClient ? {
+		async authorize(record, settlementGeneration) {
+			if (record.surface?.kind !== "bb") throw new Error("BB wake requires BB surface identity");
+			await bbClient.authorizeWake({ version: "1", runId: record.id, threadId: record.surface.threadId, logicalParentThreadId: record.surface.logicalParentThreadId, settlementGeneration });
+		},
+	} : undefined;
+	const notifier = createNotifier(pi, registry, () => currentCtx, parentWakeSink);
 
 	registry.onExit((record) => notifier.runFinished(record));
 	registry.onErrorLine((record, line) => notifier.watchErrorLine(record, line));

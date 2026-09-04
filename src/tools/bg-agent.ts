@@ -7,7 +7,9 @@
  */
 
 import { mkdir, unlink, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import { homedir } from "node:os";
 import type {
 	AgentToolResult,
 	ExtensionAPI,
@@ -148,6 +150,8 @@ interface Details {
 	agentState?: string;
 	agentName?: string;
 	paneId?: string;
+	threadId?: string;
+	hostId?: string;
 	role?: string;
 	runtime?: string;
 	provider?: string;
@@ -275,6 +279,22 @@ async function prepareLaunch(params: BgAgentParams, label: string): Promise<Reso
 	});
 }
 
+export function bbProfilePolicy(launch: ResolvedAgentLaunch, role: string): { allowSubagents: boolean } {
+	const policy = launch.profilePolicy;
+	if (!policy || policy.tools.length || policy.excludeTools.length) {
+		throw new Error("BB profiles cannot use Pi tool filters or omit curated profile metadata");
+	}
+	const base = ["--advisor-worker-role", role];
+	if (policy.cliArgs.length === base.length && policy.cliArgs.every((value, index) => value === base[index])) {
+		return { allowSubagents: false };
+	}
+	const delegated = [...base, "--advisor-worker-allow-subagents"];
+	if (policy.cliArgs.length === delegated.length && policy.cliArgs.every((value, index) => value === delegated[index])) {
+		return { allowSubagents: true };
+	}
+	throw new Error("BB profile contains unsupported CLI arguments");
+}
+
 async function waitForOutcome(
 	completion: Promise<RunRecord>,
 	signal: AbortSignal | undefined,
@@ -306,12 +326,15 @@ function promotedResult(
 		? "Its tab will remain available for follow-up."
 		: "A successful tab closes automatically; blocked or failed tabs stay visible.";
 	const resultPath = record.resultPath ?? launch.resultPath;
+	const surface = record.surface?.kind === "bb"
+		? `BB thread ${record.surface.threadId}`
+		: `pane ${record.paneId ?? "unknown"}`;
 	return {
 		content: [
 			{
 				type: "text",
 				text:
-					`Agent ${record.agentName} is working in pane ${record.paneId} — detached after ${waited} as ${record.id}.\n` +
+					`Agent ${record.agentName} is working in ${surface} — detached after ${waited} as ${record.id}.\n` +
 					`You will be woken when it settles. ${lifecycle}` +
 					(resultPath ? `\nResult artifact: ${resultPath}` : ""),
 			},
@@ -325,12 +348,14 @@ function promotedResult(
 			reusable: keepAlive,
 			...(record.agentName ? { agentName: record.agentName } : {}),
 			...(record.paneId ? { paneId: record.paneId } : {}),
+			...(record.surface?.kind === "bb" ? { threadId: record.surface.threadId, hostId: record.surface.hostId } : {}),
 			durationMs: Date.now() - record.startedAt,
 		},
 	};
 }
 
 function settledFollowUp(finished: RunRecord, keepAlive: boolean): string {
+	if (finished.surface?.kind === "bb") return "Its BB thread remains visible for inspection.";
 	if (keepAlive) {
 		return `Follow up with bg_agent({ name: "${finished.agentName}", prompt: "…", keepAlive: true }).`;
 	}
@@ -350,10 +375,13 @@ export function settledResult(
 	const duration = (finished.endedAt ?? Date.now()) - finished.startedAt;
 	const state = finished.agentState ?? "unknown";
 	const resultPath = finished.resultPath ?? launch.resultPath;
+	const surface = finished.surface?.kind === "bb"
+		? `BB thread ${finished.surface.threadId}`
+		: `pane ${finished.paneId ?? "unknown"}`;
 	const header =
 		`Agent ${finished.agentName} settled: ${state}` +
 		(finished.resultStatus ? ` · result Status: ${finished.resultStatus}` : "") +
-		` in ${formatDuration(duration)} (pane ${finished.paneId}). ${settledFollowUp(finished, keepAlive)}` +
+		` in ${formatDuration(duration)} (${surface}). ${settledFollowUp(finished, keepAlive)}` +
 		(resultPath ? `\nResult artifact: ${resultPath}` : "");
 	return {
 		content: [{ type: "text", text: tail.trim() ? `${header}\n\n${tail.trimEnd()}` : header }],
@@ -368,6 +396,7 @@ export function settledResult(
 			reusable: keepAlive,
 			...(finished.agentName ? { agentName: finished.agentName } : {}),
 			...(finished.paneId ? { paneId: finished.paneId } : {}),
+			...(finished.surface?.kind === "bb" ? { threadId: finished.surface.threadId, hostId: finished.surface.hostId } : {}),
 			durationMs: duration,
 		},
 	};
@@ -376,11 +405,57 @@ export function settledResult(
 async function executeAgent(options: ExecuteAgentOptions): Promise<AgentToolResult<Details>> {
 	const { registry, params, signal, ctx } = options;
 	const cwd = workingDirectory(params.cwd, ctx.cwd);
+	if (process.env.BB_THREAD_ID && params.name) {
+		if (
+			params.role || params.agent || params.harness || params.model || params.thinking ||
+			params.maxTurns !== undefined || params.anchor || params.acceptance || params.resultPath ||
+			params.requiredSkills || params.cwd || params.label || params.promoteAfterMs !== undefined
+		) {
+			return { content: [{ type: "text", text: "bg_agent failed to continue: BB continuation accepts only name, prompt, and keepAlive." }], details: { runId: "", promoted: false, status: "failed", durationMs: 0 } };
+		}
+		const match = registry.list().find((record) => record.agentName === params.name && record.surface?.kind === "bb");
+		if (!match) return { content: [{ type: "text", text: `bg_agent failed to continue: no BB agent named ${params.name}` }], details: { runId: "", promoted: false, status: "failed", durationMs: 0 } };
+		try {
+			const record = await registry.continue(match.id, params.prompt);
+			return {
+				content: [{ type: "text", text: `Continued run ${record.id} in the same BB thread ${record.surface?.kind === "bb" ? record.surface.threadId : "unknown"}.` }],
+				details: {
+					runId: record.id,
+					promoted: true,
+					status: record.status,
+					runtime: "existing",
+					reusable: Boolean(params.keepAlive),
+					...(record.agentName ? { agentName: record.agentName } : {}),
+					...(record.surface?.kind === "bb" ? { threadId: record.surface.threadId, hostId: record.surface.hostId } : {}),
+					durationMs: Date.now() - record.startedAt,
+				},
+			};
+		} catch (error) {
+			return { content: [{ type: "text", text: `bg_agent failed to continue: ${error instanceof Error ? error.message : String(error)}` }], details: { runId: match.id, promoted: false, status: "failed", durationMs: 0 } };
+		}
+	}
 	const label = agentLabel(params);
 	let launch: ResolvedAgentLaunch;
+	let bbAllowSubagents: boolean | undefined;
 	let started: Awaited<ReturnType<Registry["start"]>>;
 	try {
 		launch = await prepareLaunch(params, label);
+		if (process.env.BB_THREAD_ID) {
+			if (!params.role || params.agent || params.harness === "native" || launch.runtime !== "pi") {
+				throw new Error("BB v1 supports configured Pi roles only");
+			}
+			if (!launch.provider || !launch.model) throw new Error("BB bg_agent requires an exact provider/model");
+			if (params.thinking === "minimal") throw new Error("BB does not support reasoning level minimal");
+			const profilePolicy = bbProfilePolicy(launch, params.role);
+			bbAllowSubagents = profilePolicy.allowSubagents;
+			if (!launch.maxTurns) throw new Error("BB profile requires an exact positive turn cap");
+			const resultPath = launch.resultPath ?? params.resultPath ?? join(process.env.ADVISOR_STATE_ROOT ?? join(homedir(), ".advisor"), "runs", "native", randomUUID(), "result.md");
+			launch = {
+				...launch,
+				resultPath,
+				prompt: `${launch.prompt}\n\nRESULT ARTIFACT:\nCreate the parent directory and write the durable bounded result to ${resultPath}.\nInclude Status, Claims, Evidence, Files, Decisions, and Remaining Risk. Return this path in the final response.`,
+			};
+		}
 		const start = () => registry.start({
 			kind: "agent",
 			command: launch.command,
@@ -391,6 +466,18 @@ async function executeAgent(options: ExecuteAgentOptions): Promise<AgentToolResu
 			closeOnSettle: !params.keepAlive,
 			...(launch.resultPath ? { requiredArtifactPath: launch.resultPath } : {}),
 			...(launch.resultDiscovery ? { resultDiscovery: launch.resultDiscovery } : {}),
+			...(process.env.BB_THREAD_ID && launch.provider && launch.model ? {
+				piLaunchSpec: {
+					provider: launch.provider,
+					model: launch.model,
+					reasoning: (launch.thinking ?? "off") as "off" | "low" | "medium" | "high" | "xhigh" | "max",
+					prompt: launch.prompt,
+					role: launch.role!,
+					maxTurns: launch.maxTurns!,
+					allowSubagents: bbAllowSubagents!,
+					...(launch.resultPath ? { resultPath: launch.resultPath } : {}),
+				},
+			} : {}),
 		});
 		started = launch.resultPath
 			? await withReservedResultArtifact(launch.resultPath, start)
@@ -421,7 +508,7 @@ async function executeAgent(options: ExecuteAgentOptions): Promise<AgentToolResu
 export function bgAgentResultLabel(result: AgentToolResult<any>): string {
 	const details = result.details as Partial<Details> | undefined;
 	if (details?.promoted && details.runId) {
-		return `working in ${details.paneId ?? "pane"} → ${details.runId}`;
+		return `working in ${details.threadId ?? details.paneId ?? "surface"} → ${details.runId}`;
 	}
 	if (details?.status === "failed") return "failed to start";
 	const status = details?.agentState ?? details?.status;

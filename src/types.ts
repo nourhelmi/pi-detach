@@ -1,6 +1,16 @@
 export type RunKind = "run" | "watch" | "agent";
 
-export type RunBackend = "local" | "herdr";
+export type RunBackend = "local" | "herdr" | "bb";
+
+export type AgentSurfaceRef =
+	| { kind: "local" }
+	| { kind: "herdr"; paneId: string }
+	| {
+			kind: "bb";
+			threadId: string;
+			logicalParentThreadId: string;
+			hostId: string;
+	  };
 
 export type RunStatus = "running" | "exited" | "killed";
 
@@ -15,6 +25,7 @@ export interface RunRecord {
 	label: string;
 	status: RunStatus;
 	backend: RunBackend;
+	surface?: AgentSurfaceRef | undefined;
 	pid?: number | undefined;
 	/** Herdr pane hosting this run, when backend is "herdr". */
 	paneId?: string | undefined;
@@ -38,10 +49,27 @@ export interface RunRecord {
 	resultPath?: string | undefined;
 	/** Agent runs: parsed first line beneath the result artifact's Status heading. */
 	resultStatus?: string | undefined;
+	/** Stable pi-detach settlement generation used for BB wake admission. */
+	settlementGeneration?: string | undefined;
 	/** Set when a herdr start failed and the run fell back to a local process. */
 	fallbackReason?: string | undefined;
 	/** Quiet runs never get a viewer pane when promoted (silent waiters). */
 	quiet?: boolean | undefined;
+}
+
+/** Structured Pi launch identity used by transports that do not execute the shell command. */
+export interface PiLaunchSpec {
+	provider: string;
+	model: string;
+	reasoning: Exclude<
+		"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max",
+		"minimal"
+	>;
+	prompt: string;
+	role: string;
+	maxTurns: number;
+	allowSubagents: boolean;
+	resultPath?: string;
 }
 
 export interface StartOptions {
@@ -64,6 +92,8 @@ export interface StartOptions {
 	resultDiscovery?: string;
 	/** Skip the promoted-run viewer pane; the run stays visible in bg_list only. */
 	quiet?: boolean;
+	/** Exact transport identity; required and fail-closed for BB agent launches. */
+	piLaunchSpec?: PiLaunchSpec;
 }
 
 export interface StartResult {
@@ -78,6 +108,7 @@ export interface RunSummary {
 	id: string;
 	kind: RunKind;
 	backend: RunBackend;
+	surface?: AgentSurfaceRef;
 	label: string;
 	command: string;
 	cwd: string;
@@ -87,6 +118,7 @@ export interface RunSummary {
 	agentState?: AgentSettledState;
 	resultPath?: string;
 	resultStatus?: string;
+	settlementGeneration?: string;
 	exitCode?: number;
 	startedAt: number;
 	endedAt?: number;
@@ -100,6 +132,7 @@ export interface DriverOutcome {
 	killed?: boolean;
 	agentState?: AgentSettledState;
 	resultStatus?: string;
+	settlementGeneration?: string;
 	/** Appended to the log before handlers fire, e.g. "pane was closed". */
 	note?: string;
 }
@@ -111,6 +144,15 @@ export interface RunController {
 	emitOutput(chunk: string): void;
 	/** Report non-terminal progress while the run remains supervised. */
 	progress?(note: string): void;
+	/** BB-only nonterminal pause. Does not close logs, resolve completion, or fire exit handlers. */
+	pause(outcome: {
+		agentState: "blocked";
+		resultStatus?: string;
+		settlementGeneration?: string;
+		note?: string;
+	}): void;
+	/** BB-only observed transition from a nonterminal pause back to active transport. */
+	resume(): Promise<void>;
 	/** Report the run finished. Idempotent; the first call wins. */
 	finish(outcome: DriverOutcome): void;
 }
@@ -120,12 +162,15 @@ export interface DriverHandle {
 	pid?: number | undefined;
 	paneId?: string | undefined;
 	agentName?: string | undefined;
+	surface?: AgentSurfaceRef | undefined;
 	/** Ask the run to stop (SIGTERM / ctrl+c / esc). Must eventually lead to finish(). */
 	stop(): void;
 	/** Abandon supervision without touching the process; used on session shutdown for herdr runs. */
 	detach?: () => void;
 	/** Live read for runs whose output is not streamed into the registry (herdr panes). */
 	readLive?: (lines: number) => Promise<string>;
+	/** Continue the same supervised run and surface after a typed pause. */
+	continue?: (prompt: string) => Promise<void>;
 }
 
 export type DriverStart = (

@@ -21,6 +21,7 @@ import type { Registry } from "../src/registry.ts";
 import {
 	agentLabel,
 	agentTombstoneNote,
+	bbProfilePolicy,
 	bgAgentResultLabel,
 	settledResult,
 	withReservedResultArtifact,
@@ -323,6 +324,14 @@ test("bg_agent name-reuse misses are explained by a session tombstone", () => {
 	assert.equal(agentTombstoneNote(registry, "other"), undefined);
 });
 
+test("BB role profile policy permits only the exact role flag and bounded foreman delegation", () => {
+	const launch = { command: "pi", prompt: "work", runtime: "pi", role: "builder", profilePolicy: { cliArgs: ["--advisor-worker-role", "builder"], tools: [], excludeTools: [] } };
+	assert.deepEqual(bbProfilePolicy(launch, "builder"), { allowSubagents: false });
+	assert.deepEqual(bbProfilePolicy({ ...launch, role: "foreman", profilePolicy: { ...launch.profilePolicy, cliArgs: ["--advisor-worker-role", "foreman", "--advisor-worker-allow-subagents"] } }, "foreman"), { allowSubagents: true });
+	assert.throws(() => bbProfilePolicy({ ...launch, profilePolicy: { ...launch.profilePolicy, cliArgs: ["--unexpected"] } }, "builder"), /unsupported CLI/);
+	assert.throws(() => bbProfilePolicy({ ...launch, profilePolicy: { ...launch.profilePolicy, tools: ["read"] } }, "builder"), /tool filters/);
+});
+
 test("failed native starts remove only their reserved empty result", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "pi-detach-result-start-failure-"));
 	const resultPath = join(dir, "result.md");
@@ -384,4 +393,3 @@ test("settled bg_agent result header surfaces result Status and discovered artif
 	assert.equal(result.details.resultStatus, "BLOCKED: needs input");
 	assert.equal(result.details.resultPath, "/tmp/discovered/result.md");
 });
-
