@@ -3,6 +3,13 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { RunRecord } from "./types.ts";
 
+export type RunTransportState = "running" | "paused" | "finished";
+
+export interface RunLifecycleRevision {
+	revision: number;
+	transportState: RunTransportState;
+}
+
 export interface RunStateSnapshot {
 	version: 1;
 	runId: string;
@@ -16,7 +23,8 @@ export interface RunStateSnapshot {
 	resultPath?: string;
 	resultStatus?: string;
 	agentState?: RunRecord["agentState"];
-	transportState: "running" | "paused" | "finished";
+	transportState: RunTransportState;
+	lifecycleRevision: number;
 	settlementDecision: "wait" | "pause" | "finish";
 	settlementGeneration?: string;
 	startedAt: number;
@@ -31,9 +39,12 @@ export function defaultRunStatePath(runId: string): string {
 
 export async function writeRunState(
 	record: RunRecord,
-	transportState: RunStateSnapshot["transportState"],
+	lifecycle: RunLifecycleRevision,
 	path = defaultRunStatePath(record.id),
 ): Promise<void> {
+	if (!Number.isSafeInteger(lifecycle.revision) || lifecycle.revision < 0) {
+		throw new Error("run lifecycle revision must be a non-negative safe integer");
+	}
 	const snapshot: RunStateSnapshot = {
 		version: 1,
 		runId: record.id,
@@ -47,8 +58,9 @@ export async function writeRunState(
 		...(record.resultPath ? { resultPath: record.resultPath } : {}),
 		...(record.resultStatus ? { resultStatus: record.resultStatus } : {}),
 		...(record.agentState ? { agentState: record.agentState } : {}),
-		transportState,
-		settlementDecision: transportState === "paused" ? "pause" : transportState === "finished" ? "finish" : "wait",
+		transportState: lifecycle.transportState,
+		lifecycleRevision: lifecycle.revision,
+		settlementDecision: lifecycle.transportState === "paused" ? "pause" : lifecycle.transportState === "finished" ? "finish" : "wait",
 		...(record.settlementGeneration ? { settlementGeneration: record.settlementGeneration } : {}),
 		startedAt: record.startedAt,
 		updatedAt: Date.now(),
@@ -59,3 +71,5 @@ export async function writeRunState(
 	await writeFile(temporary, `${JSON.stringify(snapshot, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 	await rename(temporary, path);
 }
+
+export type RunStateWriter = typeof writeRunState;

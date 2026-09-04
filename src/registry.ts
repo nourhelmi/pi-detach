@@ -14,7 +14,12 @@ import { createWriteStream, mkdirSync, type WriteStream } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { writeRunState } from "./run-state.ts";
+import {
+	type RunLifecycleRevision,
+	type RunStateWriter,
+	type RunTransportState,
+	writeRunState,
+} from "./run-state.ts";
 import type {
 	DriverHandle,
 	DriverOutcome,
@@ -32,6 +37,7 @@ const RUNS_DIR = join(process.env.PI_DETACH_STATE_ROOT ?? join(homedir(), ".pi",
 
 interface LiveRun {
 	record: RunRecord;
+	lifecycle: RunLifecycleRevision;
 	handle: DriverHandle;
 	stream: WriteStream;
 	tail: string[];
@@ -154,6 +160,8 @@ export interface RegistryOptions {
 	herdrDriver?: DriverStart;
 	agentDriver?: { backend: "herdr" | "bb"; start: DriverStart };
 	runStatePath?: (runId: string) => string;
+	/** Injectable atomic writer for deterministic persistence-failure tests. */
+	runStateWriter?: RunStateWriter;
 	/** Called when a local run is promoted to the background — attaches a viewer pane. */
 	onPromoted?: (record: RunRecord, completion: Promise<RunRecord>) => void;
 }
@@ -167,7 +175,7 @@ function matchesPattern(pattern: string, line: string): boolean {
 }
 
 export function createRegistry(options: RegistryOptions = {}): Registry {
-	const { herdrDriver, onPromoted, runStatePath } = options;
+	const { herdrDriver, onPromoted, runStatePath, runStateWriter = writeRunState } = options;
 	const agentDriver = options.agentDriver ?? (herdrDriver ? { backend: "herdr" as const, start: herdrDriver } : undefined);
 	const runs = new Map<string, LiveRun>();
 	const active = new Map<string, string>();
@@ -176,12 +184,37 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 	const doneLineHandlers: ((record: RunRecord, line: string) => void)[] = [];
 	const progressHandlers: ((record: RunRecord, note: string) => void)[] = [];
 	const stateWrites = new Map<string, Promise<void>>();
-	function persist(record: RunRecord, state: "running" | "paused" | "finished"): Promise<void> {
+	function sameLifecycle(live: LiveRun, expected: RunLifecycleRevision): boolean {
+		return live.lifecycle.revision === expected.revision &&
+			live.lifecycle.transportState === expected.transportState;
+	}
+
+	function advanceLifecycle(live: LiveRun, transportState: RunTransportState): RunLifecycleRevision {
+		if (live.lifecycle.transportState === "finished") {
+			throw new Error(`run ${live.record.id} lifecycle is already finished`);
+		}
+		const next = {
+			revision: live.lifecycle.revision + 1,
+			transportState,
+		};
+		live.lifecycle = next;
+		return next;
+	}
+
+	function persist(live: LiveRun, lifecycle: RunLifecycleRevision): Promise<void> {
+		// A transition may occur while a driver start is still awaiting its handle.
+		// Do not enqueue a stale startup write, because even a guarded no-op would
+		// otherwise mask a rejected pause/finish write in stateWrites.
+		if (!sameLifecycle(live, lifecycle)) return Promise.resolve();
+		const { record } = live;
 		const snapshot = { ...record, ...(record.surface ? { surface: { ...record.surface } } : {}) };
 		const prior = stateWrites.get(record.id) ?? Promise.resolve();
 		const next = prior
 			.catch(() => undefined)
-			.then(() => writeRunState(snapshot, state, runStatePath?.(record.id)));
+			.then(async () => {
+				if (!sameLifecycle(live, lifecycle)) return;
+				await runStateWriter(snapshot, lifecycle, runStatePath?.(record.id));
+			});
 		stateWrites.set(record.id, next);
 		return next;
 	}
@@ -264,6 +297,7 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 
 		const live: LiveRun = {
 			record,
+			lifecycle: { revision: 0, transportState: "running" },
 			handle: { stop: () => {} },
 			stream: createWriteStream(logPath, { flags: "a" }),
 			tail: [],
@@ -271,6 +305,7 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 			completion,
 			resolve,
 		};
+		const startupLifecycle = { ...live.lifecycle };
 
 		const controller: RunController = {
 			record,
@@ -281,25 +316,27 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 				for (const handler of progressHandlers) handler(record, note);
 			},
 			pause: (outcome) => {
-				if (record.status !== "running" || record.backend !== "bb") return;
+				if (record.backend !== "bb" || live.lifecycle.transportState !== "running") return;
 				record.agentState = "blocked";
 				if (outcome.resultStatus) record.resultStatus = outcome.resultStatus;
 				if (outcome.settlementGeneration) record.settlementGeneration = outcome.settlementGeneration;
 				if (outcome.note) absorb(live, `[detach] ${outcome.note}\n`);
-				void persist(record, "paused").catch(() => undefined);
+				const lifecycle = advanceLifecycle(live, "paused");
+				void persist(live, lifecycle).catch(() => undefined);
 				for (const handler of progressHandlers) handler(record, outcome.note ?? "blocked");
 			},
 			resume: async () => {
-				if (record.status !== "running" || record.backend !== "bb" || record.agentState !== "blocked") {
+				if (record.backend !== "bb" || live.lifecycle.transportState !== "paused" || record.agentState !== "blocked") {
 					throw new Error(`run ${record.id} is not paused BLOCKED`);
 				}
 				record.agentState = undefined;
 				record.resultStatus = undefined;
 				record.settlementGeneration = undefined;
-				await persist(record, "running");
+				const lifecycle = advanceLifecycle(live, "running");
+				await persist(live, lifecycle);
 			},
 			finish: (outcome: DriverOutcome) => {
-				if (record.status !== "running") return;
+				if (live.lifecycle.transportState === "finished") return;
 				if (live.pending) absorb(live, "\n");
 				if (outcome.note) absorb(live, `[detach] ${outcome.note}\n`);
 				record.status = outcome.killed ? "killed" : "exited";
@@ -310,7 +347,8 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 				if (outcome.settlementGeneration) record.settlementGeneration = outcome.settlementGeneration;
 				record.endedAt = Date.now();
 				active.delete(key);
-				const statePersisted = persist(record, "finished");
+				const lifecycle = advanceLifecycle(live, "finished");
+				const statePersisted = persist(live, lifecycle);
 				// Announce only once the log file is flushed, so a notified reader
 				// calling bg_output immediately cannot see a truncated log.
 				live.stream.end(async () => {
@@ -366,7 +404,7 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 		record.paneId = handle.paneId ?? record.paneId;
 		record.agentName = handle.agentName ?? record.agentName;
 		record.surface = handle.surface ?? record.surface ?? (record.paneId ? { kind: "herdr", paneId: record.paneId } : { kind: "local" });
-		void persist(record, "running").catch(() => undefined);
+		void persist(live, startupLifecycle).catch(() => undefined);
 
 		return { record, completion, deduped: false };
 	}
