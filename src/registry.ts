@@ -345,6 +345,7 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 				if (outcome.agentState) record.agentState = outcome.agentState;
 				if (outcome.resultStatus) record.resultStatus = outcome.resultStatus;
 				if (outcome.settlementGeneration) record.settlementGeneration = outcome.settlementGeneration;
+				if (outcome.note && record.kind === "agent") record.settlementNote = outcome.note;
 				record.endedAt = Date.now();
 				active.delete(key);
 				const lifecycle = advanceLifecycle(live, "finished");

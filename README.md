@@ -203,7 +203,10 @@ native CLI unattended, injects the same role/task/anchor/skills packet, and adds
 a durable result-artifact instruction. It reserves the empty artifact before
 launch and validates a nonempty result with Status, Claims, Evidence, Files,
 Decisions, and Remaining Risk headings before accepting successful settlement.
-Missing or malformed results become `stalled` and retain their pane. The path defaults to
+A section may be organized into deeper subheadings (for example `## AC1` under
+`# Claims`); only a section with no prose under it or its subheadings is empty.
+Missing or malformed results become `stalled` and retain their pane, and the
+completion notice names the validation problem rather than a generic stall. The path defaults to
 `$ADVISOR_STATE_ROOT/runs/native/<uuid>/result.md` (or a temporary fallback) and
 is included in `bg_agent` details and completion output. Successful native panes
 close on settlement exactly like successful Pi panes; blocked or failed panes

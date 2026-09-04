@@ -11,20 +11,37 @@ export const REQUIRED_ARTIFACT_HEADINGS = [
 	"Remaining Risk",
 ] as const;
 
+/**
+ * Return one markdown section through the next heading at the same or a
+ * shallower level. Child subsections therefore count as part of their required
+ * parent section instead of accidentally making that parent look empty.
+ */
+function artifactSection(content: string, heading: string): string | undefined {
+	const match = new RegExp(`^(#{1,6})\\s+${heading}\\s*$`, "im").exec(content);
+	if (!match) return undefined;
+	const level = match[1]?.length ?? 1;
+	const remainder = content.slice(match.index + match[0].length);
+	const closer = new RegExp(`^#{1,${level}}\\s+\\S.*$`, "m");
+	const nextHeading = remainder.search(closer);
+	return nextHeading >= 0 ? remainder.slice(0, nextHeading) : remainder;
+}
+
 function artifactContentIssue(path: string, content: string): string | undefined {
 	if (!content.trim()) return `empty ${path}`;
 	const missing: string[] = [];
 	const empty: string[] = [];
 	for (const heading of REQUIRED_ARTIFACT_HEADINGS) {
-		const match = new RegExp(`^#{1,6}\\s+${heading}\\s*$`, "im").exec(content);
-		if (!match) {
+		const body = artifactSection(content, heading);
+		if (body === undefined) {
 			missing.push(heading);
 			continue;
 		}
-		const remainder = content.slice(match.index + match[0].length);
-		const nextHeading = remainder.search(/^#{1,6}\s+\S.*$/m);
-		const body = (nextHeading >= 0 ? remainder.slice(0, nextHeading) : remainder).trim();
-		if (!body) empty.push(heading);
+		const prose = body
+			.split("\n")
+			.filter((line) => !/^#{1,6}\s/.test(line.trim()))
+			.join("\n")
+			.trim();
+		if (!prose) empty.push(heading);
 	}
 	if (missing.length) return `${path} is missing headings: ${missing.join(", ")}`;
 	return empty.length ? `${path} has empty sections: ${empty.join(", ")}` : undefined;
@@ -62,12 +79,11 @@ export interface ResultArtifactStatus {
 }
 
 export function parseResultArtifactStatus(content: string): ResultArtifactStatus | undefined {
-	const heading = /^#{1,6}\s+Status\s*$/im.exec(content);
-	if (!heading) return undefined;
-	const remainder = content.slice(heading.index + heading[0].length);
-	const nextHeading = remainder.search(/^#{1,6}\s+\S.*$/m);
-	const body = nextHeading >= 0 ? remainder.slice(0, nextHeading) : remainder;
-	const rawLine = body.split("\n").find((line) => line.trim());
+	const body = artifactSection(content, "Status");
+	if (body === undefined) return undefined;
+	const rawLine = body
+		.split("\n")
+		.find((line) => line.trim() && !/^#{1,6}\s/.test(line.trim()));
 	if (!rawLine) return undefined;
 	const line = rawLine.trim().replace(/^[*_`]+/, "").replace(/^Status\s*:\s*/i, "").replace(/[.!?,;:]+$/, "")
 		.replace(/[*_`]+$/, "").replace(/[.!?,;:]+$/, "").trim().slice(0, 200);

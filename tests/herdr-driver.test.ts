@@ -715,6 +715,57 @@ test("result artifact validation rejects empty files and missing headings", asyn
 	}
 });
 
+test("Regression: subsection-organized result artifacts are valid, and empty parents with empty children are not", async () => {
+	// Failure mode: a worker that files its evidence as `# Claims` → `## AC1` … `## ACn`
+	// used to be reported as "has empty sections: Claims" because any heading closed
+	// the section. That stalled finished workers and forced a pointless relaunch
+	// whose only job was to add a sentence under the parent heading.
+	const artifactDir = mkdtempSync(join(tmpdir(), "pi-detach-artifact-subsections-"));
+	const artifactPath = join(artifactDir, "result.md");
+	try {
+		await writeFile(
+			artifactPath,
+			[
+				"# Status",
+				"DONE",
+				"# Claims",
+				"## AC1 — repaired",
+				"PASS. Evidence below.",
+				"## AC2 — verified",
+				"PASS.",
+				"# Evidence",
+				"### Commands",
+				"- npm test → exit 0",
+				"# Files",
+				"## Product",
+				"- src/x.ts",
+				"# Decisions",
+				"None",
+				"# Remaining Risk",
+				"None",
+				"",
+			].join("\n"),
+		);
+		assert.equal(await settlementArtifactIssue(artifactPath), undefined);
+
+		// A parent whose only children are empty subsections is still empty.
+		await writeFile(
+			artifactPath,
+			"# Status\nDONE\n# Claims\n## AC1\n## AC2\n# Evidence\nx\n# Files\nx\n# Decisions\nx\n# Remaining Risk\nx\n",
+		);
+		assert.match(await settlementArtifactIssue(artifactPath) ?? "", /has empty sections: Claims$/);
+
+		// A sibling heading at the same level still closes the section.
+		await writeFile(
+			artifactPath,
+			"# Status\nDONE\n# Claims\n# Evidence\nx\n# Files\nx\n# Decisions\nx\n# Remaining Risk\nx\n",
+		);
+		assert.match(await settlementArtifactIssue(artifactPath) ?? "", /has empty sections: Claims$/);
+	} finally {
+		await rm(artifactDir, { force: true, recursive: true });
+	}
+});
+
 test("a missing required result artifact stalls settlement and keeps the pane", async () => {
 	const artifactDir = mkdtempSync(join(tmpdir(), "pi-detach-artifact-missing-"));
 	const artifactPath = join(artifactDir, "result.md");
@@ -1926,6 +1977,12 @@ test("result artifact Status parsing strips markdown and classifies lifecycle si
 	});
 	assert.equal(parseResultArtifactStatus("# Status\n`IN_PROGRESS`\n")?.classification, "in-progress");
 	assert.equal(parseResultArtifactStatus("# Status\nPASS\n")?.classification, "terminal");
+	// A subsection inside Status is structure, not the status line.
+	assert.deepEqual(parseResultArtifactStatus("# Status\n## Summary\nDONE — all criteria met.\n# Claims\nx"), {
+		line: "DONE — all criteria met",
+		classification: "terminal",
+	});
+	assert.equal(parseResultArtifactStatus("# Status\n## Summary\n# Claims\nx"), undefined);
 });
 
 test("a prompt to a working occupant queues without --wait and stays supervised", async () => {

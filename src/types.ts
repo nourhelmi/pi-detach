@@ -51,6 +51,11 @@ export interface RunRecord {
 	resultStatus?: string | undefined;
 	/** Stable pi-detach settlement generation used for BB wake admission. */
 	settlementGeneration?: string | undefined;
+	/**
+	 * Agent runs: the driver's settlement reason (e.g. an invalid result artifact),
+	 * so the completion notice can say why a run stalled instead of a generic label.
+	 */
+	settlementNote?: string | undefined;
 	/** Set when a herdr start failed and the run fell back to a local process. */
 	fallbackReason?: string | undefined;
 	/** Quiet runs never get a viewer pane when promoted (silent waiters). */
