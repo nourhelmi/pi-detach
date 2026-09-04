@@ -150,6 +150,24 @@ const REQUIRED_ARTIFACT_HEADINGS = [
 	"Remaining Risk",
 ];
 
+/**
+ * Locate a required heading and return its section body. A section runs until
+ * the next heading at the same or a shallower level, so a worker that organizes
+ * `# Claims` into `## AC1` … `## ACn` subsections (the natural shape for
+ * criterion-by-criterion evidence) still has a non-empty Claims section.
+ * Before this rule, any heading at all closed the section, so a subsection as
+ * the first child reported the parent as empty and stalled a finished worker.
+ */
+function artifactSection(content: string, heading: string): string | undefined {
+	const match = new RegExp(`^(#{1,6})\\s+${heading}\\s*$`, "im").exec(content);
+	if (!match) return undefined;
+	const level = match[1]?.length ?? 1;
+	const remainder = content.slice(match.index + match[0].length);
+	const closer = new RegExp(`^#{1,${level}}\\s+\\S.*$`, "m");
+	const nextHeading = remainder.search(closer);
+	return nextHeading >= 0 ? remainder.slice(0, nextHeading) : remainder;
+}
+
 export async function settlementArtifactIssue(path: string): Promise<string | undefined> {
 	let content: string;
 	try {
@@ -162,15 +180,18 @@ export async function settlementArtifactIssue(path: string): Promise<string | un
 	const missing: string[] = [];
 	const empty: string[] = [];
 	for (const heading of REQUIRED_ARTIFACT_HEADINGS) {
-		const match = new RegExp(`^#{1,6}\\s+${heading}\\s*$`, "im").exec(content);
-		if (!match) {
+		const body = artifactSection(content, heading);
+		if (body === undefined) {
 			missing.push(heading);
 			continue;
 		}
-		const remainder = content.slice(match.index + match[0].length);
-		const nextHeading = remainder.search(/^#{1,6}\s+\S.*$/m);
-		const body = (nextHeading >= 0 ? remainder.slice(0, nextHeading) : remainder).trim();
-		if (!body) empty.push(heading);
+		// Heading-only bodies (e.g. `## AC1` with nothing under it) are still empty.
+		const prose = body
+			.split("\n")
+			.filter((line) => !/^#{1,6}\s/.test(line.trim()))
+			.join("\n")
+			.trim();
+		if (!prose) empty.push(heading);
 	}
 	if (missing.length) return `${path} is missing headings: ${missing.join(", ")}`;
 	return empty.length ? `${path} has empty sections: ${empty.join(", ")}` : undefined;
@@ -183,14 +204,15 @@ export interface ResultArtifactStatus {
 	classification: ResultStatusClassification;
 }
 
-/** Parse the first non-empty line beneath a markdown Status heading. */
+/**
+ * Parse the first non-empty, non-heading line beneath a markdown Status
+ * heading. Subsection headings inside Status are skipped rather than read as
+ * the status line.
+ */
 export function parseResultArtifactStatus(content: string): ResultArtifactStatus | undefined {
-	const heading = /^#{1,6}\s+Status\s*$/im.exec(content);
-	if (!heading) return undefined;
-	const remainder = content.slice(heading.index + heading[0].length);
-	const nextHeading = remainder.search(/^#{1,6}\s+\S.*$/m);
-	const body = nextHeading >= 0 ? remainder.slice(0, nextHeading) : remainder;
-	const rawLine = body.split("\n").find((line) => line.trim());
+	const body = artifactSection(content, "Status");
+	if (body === undefined) return undefined;
+	const rawLine = body.split("\n").find((line) => line.trim() && !/^#{1,6}\s/.test(line.trim()));
 	if (!rawLine) return undefined;
 	const line = rawLine
 		.trim()

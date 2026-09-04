@@ -173,6 +173,29 @@ test("agent settlement headline carries result Status and artifact path", () => 
 	assert.match(sent[0]?.content ?? "", /Result artifact: \/tmp\/result\.md/);
 });
 
+test("Regression: a stalled settlement names its cause instead of the generic prompt-not-registered label", () => {
+	// Failure mode: every stalled state printed "did not visibly start working", even
+	// when the agent had finished its work and only its result artifact failed
+	// validation. Parents then distrusted complete results and relaunched.
+	const { sent, notifier } = harness(true);
+	const record = settledAgent(false);
+	record.agentState = "stalled";
+	record.settlementNote = "required result artifact is invalid: /tmp/result.md has empty sections: Claims";
+	record.resultPath = "/tmp/result.md";
+	notifier.runFinished(record);
+	const content = sent[0]?.content ?? "";
+	assert.match(content, /settled as stalled — required result artifact is invalid: .*empty sections: Claims/);
+	assert.doesNotMatch(content, /did not visibly start working/);
+	assert.match(content, /underlying work may be complete/);
+	assert.match(content, /repair only the artifact/);
+
+	const generic = harness(true);
+	const plain = settledAgent(false);
+	plain.agentState = "stalled";
+	generic.notifier.runFinished(plain);
+	assert.match(generic.sent[0]?.content ?? "", /did not visibly start working/);
+});
+
 test("paused agent notice is delivered once with supervision guidance", () => {
 	const { sent, notifier } = harness(false);
 	const record = settledAgent(false);

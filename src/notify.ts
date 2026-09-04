@@ -52,11 +52,17 @@ export function createNotifier(
 	function agentFinished(record: RunRecord): void {
 		const tail = registry.tail(record.id, TAIL_ON_AGENT);
 		const state = record.agentState ?? "unknown";
+		// A stalled settlement has several distinct causes (prompt never started, the
+		// agent vanished, an invalid result artifact after real work). The driver's
+		// note names the actual cause; only fall back to the generic label without one.
+		const stalledHeadline = record.settlementNote
+			? `settled as stalled — ${record.settlementNote}`
+			: "did not visibly start working — the prompt may not have registered";
 		const headlineByState: Record<string, string> = {
 			done: "finished its task",
 			idle: "finished and is idle",
 			blocked: "is BLOCKED waiting for input",
-			stalled: "did not visibly start working — the prompt may not have registered",
+			stalled: stalledHeadline,
 			unknown: "settled in an unknown state",
 		};
 		const lines = [
@@ -86,6 +92,12 @@ export function createNotifier(
 						`Follow up with bg_agent({ name: "${record.agentName}", prompt: "…", keepAlive: true }) — its tab was kept available.`,
 				);
 			}
+		} else if (state === "stalled" && /result artifact is invalid/.test(record.settlementNote ?? "")) {
+			lines.push(
+				`The agent finished a turn but its result artifact failed validation, so the underlying work may be complete. ` +
+					`Read the artifact first; if the findings are sound, follow up by name with bg_agent({ name: "${record.agentName}", prompt: "…" }) asking it to repair only the artifact. ` +
+					`Full transcript: bg_output({ runId: "${record.id}" }).`,
+			);
 		} else {
 			lines.push(
 				`Full transcript: bg_output({ runId: "${record.id}" }). ` +
