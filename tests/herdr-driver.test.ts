@@ -1,12 +1,17 @@
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { CliResult, HerdrCli, Waiter } from "../src/herdr/cli.ts";
-import { createHerdrDriver, parseResultArtifactStatus, settlementArtifactIssue } from "../src/herdr/driver.ts";
+import {
+	createHerdrDriver,
+	parseResultArtifactStatus,
+	settlementArtifactIssue,
+	validateResultArtifact,
+} from "../src/herdr/driver.ts";
 import { createSessionLedger } from "../src/herdr/ledger.ts";
 import { createPaneManager } from "../src/herdr/panes.ts";
 import { startMarker } from "../src/herdr/sentinel.ts";
@@ -699,23 +704,79 @@ test("an unclassifiable agent with a valid required artifact settles successfull
 	}
 });
 
-test("result artifact validation rejects empty files and missing headings", async () => {
+test("result artifact validation v2 implements the shared fixture matrix", () => {
+	const markdown = (status: string, claims = "Built") =>
+		`${status}\n# Claims\n${claims}\n# Evidence\nTests pass\n# Files\n- src/x.ts\n# Decisions\nNone\n# Remaining Risk\nNone\n`;
+	const plain = [
+		"Status", "PASS", "Claims", "Built", "Evidence", "Tests pass", "Files", "src/x.ts",
+		"Decisions", "None", "Remaining Risk", "None", "",
+	].join("\n");
+	const cases: Array<{
+		name: string;
+		content: string;
+		valid: boolean;
+		status?: string;
+		classification: "blocked" | "in-progress" | "terminal";
+		notes: string[];
+	}> = [
+		{ name: "Markdown headings, Status PASS", content: markdown("# Status\nPASS"), valid: true, status: "PASS", classification: "terminal", notes: [] },
+		{ name: "Plain labels without #", content: plain, valid: true, status: "PASS", classification: "terminal", notes: [] },
+		{ name: "Bold Status label inline", content: markdown("**Status**: PASS"), valid: true, status: "PASS", classification: "terminal", notes: [] },
+		{ name: "Status with detail subsections", content: markdown("## Status\n### detail\nPASS").replaceAll("# Claims", "## Claims").replaceAll("# Evidence", "## Evidence").replaceAll("# Files", "## Files").replaceAll("# Decisions", "## Decisions").replaceAll("# Remaining Risk", "## Remaining Risk"), valid: true, status: "PASS", classification: "terminal", notes: [] },
+		{ name: "Missing Claims", content: markdown("# Status\nPASS").replace("# Claims\nBuilt\n", ""), valid: true, status: "PASS", classification: "terminal", notes: ["missing Claims"] },
+		{ name: "Claims with only an empty subsection", content: markdown("# Status\nPASS", "## AC1"), valid: true, status: "PASS", classification: "terminal", notes: ["empty Claims"] },
+		{ name: "No Status label with DONE on line two", content: `Worker report\nDONE\n${markdown("# Status\nPASS").replace("# Status\nPASS\n", "")}`, valid: true, status: "DONE", classification: "terminal", notes: ["missing Status"] },
+		{ name: "No status anywhere", content: `Worker report\n${markdown("# Status\nPASS").replace("# Status\nPASS\n", "")}`, valid: true, classification: "terminal", notes: ["missing Status", "no Status line found"] },
+		{ name: "Status BLOCKED", content: markdown("# Status\nBLOCKED: need a decision on X"), valid: true, status: "BLOCKED: need a decision on X", classification: "blocked", notes: [] },
+		{ name: "Status IN PROGRESS", content: markdown("# Status\nIN PROGRESS"), valid: true, status: "IN PROGRESS", classification: "in-progress", notes: [] },
+		{ name: "Blocked text outside Status", content: markdown("# Status\nPASS").replace("Tests pass", "blocked by CI"), valid: true, status: "PASS", classification: "terminal", notes: [] },
+		{ name: "Empty file", content: "", valid: false, classification: "terminal", notes: [] },
+		{ name: "Whitespace-only file", content: " \n\t\n", valid: false, classification: "terminal", notes: [] },
+	];
+
+	for (const fixture of cases) {
+		const validation = validateResultArtifact(fixture.content);
+		assert.deepEqual(
+			{
+				valid: validation.valid,
+				status: validation.status,
+				classification: validation.classification,
+				notes: validation.notes,
+			},
+			{
+				valid: fixture.valid,
+				status: fixture.status,
+				classification: fixture.classification,
+				notes: fixture.notes,
+			},
+			fixture.name,
+		);
+		assert.deepEqual(
+			parseResultArtifactStatus(fixture.content),
+			fixture.status ? { line: fixture.status, classification: fixture.classification } : undefined,
+			`${fixture.name}: exported status parser`,
+		);
+		assert.equal(validation.problems.length > 0, !fixture.valid, `${fixture.name}: problems`);
+	}
+});
+
+test("result artifact file validation rejects only empty files and notes missing headings", async () => {
 	const artifactDir = mkdtempSync(join(tmpdir(), "pi-detach-artifact-validation-"));
 	const artifactPath = join(artifactDir, "result.md");
 	try {
 		await writeFile(artifactPath, "");
 		assert.match(await settlementArtifactIssue(artifactPath) ?? "", /empty .*result\.md/);
 		await writeFile(artifactPath, "# Status\nDone\n");
-		assert.match(
-			await settlementArtifactIssue(artifactPath) ?? "",
-			/missing headings: Claims, Evidence, Files, Decisions, Remaining Risk/,
-		);
+		assert.equal(await settlementArtifactIssue(artifactPath), undefined);
+		assert.deepEqual(validateResultArtifact("# Status\nDone\n").notes, [
+			"missing Claims", "missing Evidence", "missing Files", "missing Decisions", "missing Remaining Risk",
+		]);
 	} finally {
 		await rm(artifactDir, { force: true, recursive: true });
 	}
 });
 
-test("Regression: subsection-organized result artifacts are valid, and empty parents with empty children are not", async () => {
+test("Regression: subsection-organized result artifacts are valid and empty sections become notes", async () => {
 	// Failure mode: a worker that files its evidence as `# Claims` → `## AC1` … `## ACn`
 	// used to be reported as "has empty sections: Claims" because any heading closed
 	// the section. That stalled finished workers and forced a pointless relaunch
@@ -748,19 +809,21 @@ test("Regression: subsection-organized result artifacts are valid, and empty par
 		);
 		assert.equal(await settlementArtifactIssue(artifactPath), undefined);
 
-		// A parent whose only children are empty subsections is still empty.
+		// A parent whose only children are empty subsections is noted but does not stall.
 		await writeFile(
 			artifactPath,
 			"# Status\nDONE\n# Claims\n## AC1\n## AC2\n# Evidence\nx\n# Files\nx\n# Decisions\nx\n# Remaining Risk\nx\n",
 		);
-		assert.match(await settlementArtifactIssue(artifactPath) ?? "", /has empty sections: Claims$/);
+		assert.equal(await settlementArtifactIssue(artifactPath), undefined);
+		assert.deepEqual(validateResultArtifact(await readFile(artifactPath, "utf8")).notes, ["empty Claims"]);
 
 		// A sibling heading at the same level still closes the section.
 		await writeFile(
 			artifactPath,
 			"# Status\nDONE\n# Claims\n# Evidence\nx\n# Files\nx\n# Decisions\nx\n# Remaining Risk\nx\n",
 		);
-		assert.match(await settlementArtifactIssue(artifactPath) ?? "", /has empty sections: Claims$/);
+		assert.equal(await settlementArtifactIssue(artifactPath), undefined);
+		assert.deepEqual(validateResultArtifact(await readFile(artifactPath, "utf8")).notes, ["empty Claims"]);
 	} finally {
 		await rm(artifactDir, { force: true, recursive: true });
 	}
@@ -781,7 +844,7 @@ test("a missing required result artifact stalls settlement and keeps the pane", 
 			ownerPid: 4242,
 		});
 		const registry = herdrRegistry(fake, { ledger });
-		const { completion } = await registry.start({
+		const { record, completion } = await registry.start({
 			kind: "agent",
 			command: "codex",
 			cwd,
@@ -792,6 +855,7 @@ test("a missing required result artifact stalls settlement and keeps the pane", 
 		});
 		fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
 		await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+		fake.respond("agent get", () => agentGet("w1:p7", record.agentName ?? "", "done"));
 		fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
 
 		const finished = await completion;
@@ -805,21 +869,18 @@ test("a missing required result artifact stalls settlement and keeps the pane", 
 	}
 });
 
-test("heading-only result artifacts stall settlement and keep the pane", async () => {
-	const artifactDir = mkdtempSync(join(tmpdir(), "pi-detach-artifact-empty-sections-"));
+test("a plain partial result settles done with notes and takes close-on-settle", async () => {
+	const artifactDir = mkdtempSync(join(tmpdir(), "pi-detach-artifact-notes-"));
 	const artifactPath = join(artifactDir, "result.md");
-	await writeFile(
-		artifactPath,
-		"# Status\n# Claims\n# Evidence\n# Files\n# Decisions\n# Remaining Risk\n",
-	);
+	await writeFile(artifactPath, "Status\nPASS\nClaims\n- fine");
 	try {
 		const fake = createFakeCli();
 		fake.respond("agent start", () =>
 			ok({ result: { agent: { pane_id: "w1:p7" }, type: "agent_started" } }),
 		);
-		fake.respond("pane read", () => ok(undefined, "Agent wrote headings without evidence."));
+		fake.respond("pane read", () => ok(undefined, "Agent wrote a lenient result."));
 		const registry = herdrRegistry(fake);
-		const { completion } = await registry.start({
+		const { record, completion } = await registry.start({
 			kind: "agent",
 			command: "codex",
 			cwd,
@@ -830,13 +891,43 @@ test("heading-only result artifacts stall settlement and keep the pane", async (
 		});
 		fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
 		await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+		fake.respond("agent get", () => agentGet("w1:p7", record.agentName ?? "", "done"));
+		fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
+
+		const finished = await completion;
+		assert.equal(finished.agentState, "done");
+		assert.equal(finished.resultStatus, "PASS");
+		assert.deepEqual(finished.resultNotes, [
+			"missing Evidence", "missing Files", "missing Decisions", "missing Remaining Risk",
+		]);
+		await flushAsync();
+		assert.deepEqual(closedPanes(fake.execCalls), ["w1:p7"]);
+	} finally {
+		await rm(artifactDir, { force: true, recursive: true });
+	}
+});
+
+test("a whitespace-only required result stalls settlement and keeps the pane", async () => {
+	const artifactDir = mkdtempSync(join(tmpdir(), "pi-detach-artifact-whitespace-"));
+	const artifactPath = join(artifactDir, "result.md");
+	await writeFile(artifactPath, " \n\t\n");
+	try {
+		const fake = createFakeCli();
+		fake.respond("agent start", () => ok({ result: { agent: { pane_id: "w1:p7" } } }));
+		const registry = herdrRegistry(fake);
+		const { completion } = await registry.start({
+			kind: "agent", command: "codex", cwd, label: "checker", prompt: "Check.",
+			closeOnSettle: true, requiredArtifactPath: artifactPath,
+		});
+		fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+		await waitUntil(() => fake.waiters.some((waiter) => waiter.args.includes("done")));
 		fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
 
 		const finished = await completion;
 		assert.equal(finished.agentState, "stalled");
-		assert.match(registry.tail(finished.id, 20), /has empty sections: Status, Claims, Evidence, Files, Decisions, Remaining Risk/);
+		assert.match(finished.settlementNote ?? "", /required result artifact is invalid: empty .*result\.md/);
 		await flushAsync();
-		assert.deepEqual(closedPanes(fake.execCalls), [], "heading-only artifact pane remains visible");
+		assert.deepEqual(closedPanes(fake.execCalls), []);
 	} finally {
 		await rm(artifactDir, { force: true, recursive: true });
 	}
@@ -1975,7 +2066,7 @@ test("result artifact Status parsing strips markdown and classifies lifecycle si
 		line: "BLOCKED: needs approval",
 		classification: "blocked",
 	});
-	assert.equal(parseResultArtifactStatus("# Status\n`IN_PROGRESS`\n")?.classification, "in-progress");
+	assert.equal(parseResultArtifactStatus("# Status\n`IN_PROGRESS`\n")?.classification, "terminal");
 	assert.equal(parseResultArtifactStatus("# Status\nPASS\n")?.classification, "terminal");
 	// A subsection inside Status is structure, not the status line.
 	assert.deepEqual(parseResultArtifactStatus("# Status\n## Summary\nDONE — all criteria met.\n# Claims\nx"), {
@@ -1983,6 +2074,7 @@ test("result artifact Status parsing strips markdown and classifies lifecycle si
 		classification: "terminal",
 	});
 	assert.equal(parseResultArtifactStatus("# Status\n## Summary\n# Claims\nx"), undefined);
+	assert.equal(parseResultArtifactStatus("# Status\n# Claims\nx\n# Evidence\nPASS\n"), undefined);
 });
 
 test("a prompt to a working occupant queues without --wait and stays supervised", async () => {

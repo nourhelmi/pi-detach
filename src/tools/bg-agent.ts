@@ -156,6 +156,8 @@ interface Details {
 	maxTurns?: number;
 	resultPath?: string;
 	resultStatus?: string;
+	settlementNote?: string;
+	resultNotes?: string[];
 	reusable?: boolean;
 	durationMs: number;
 }
@@ -296,7 +298,7 @@ async function waitForOutcome(
 	}
 }
 
-function promotedResult(
+export function promotedResult(
 	record: RunRecord,
 	launch: ResolvedAgentLaunch,
 	keepAlive: boolean,
@@ -322,6 +324,8 @@ function promotedResult(
 			status: "running",
 			...launchDetails(launch),
 			...(resultPath ? { resultPath } : {}),
+			...(record.settlementNote ? { settlementNote: record.settlementNote } : {}),
+			...(record.resultNotes?.length ? { resultNotes: record.resultNotes } : {}),
 			reusable: keepAlive,
 			...(record.agentName ? { agentName: record.agentName } : {}),
 			...(record.paneId ? { paneId: record.paneId } : {}),
@@ -352,7 +356,9 @@ export function settledResult(
 	const resultPath = finished.resultPath ?? launch.resultPath;
 	const header =
 		`Agent ${finished.agentName} settled: ${state}` +
+		(state === "stalled" && finished.settlementNote ? ` — ${finished.settlementNote}` : "") +
 		(finished.resultStatus ? ` · result Status: ${finished.resultStatus}` : "") +
+		(finished.resultNotes?.length ? ` · result notes: ${finished.resultNotes.join("; ")}` : "") +
 		` in ${formatDuration(duration)} (pane ${finished.paneId}). ${settledFollowUp(finished, keepAlive)}` +
 		(resultPath ? `\nResult artifact: ${resultPath}` : "");
 	return {
@@ -365,6 +371,8 @@ export function settledResult(
 			...launchDetails(launch),
 			...(resultPath ? { resultPath } : {}),
 			...(finished.resultStatus ? { resultStatus: finished.resultStatus } : {}),
+			...(finished.settlementNote ? { settlementNote: finished.settlementNote } : {}),
+			...(finished.resultNotes?.length ? { resultNotes: finished.resultNotes } : {}),
 			reusable: keepAlive,
 			...(finished.agentName ? { agentName: finished.agentName } : {}),
 			...(finished.paneId ? { paneId: finished.paneId } : {}),

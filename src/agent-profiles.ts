@@ -260,7 +260,8 @@ function buildNativeCommand(identity: LaunchIdentity): { command: string; runtim
 	const args = [runtime, "--model", commandArgument(identity.model, "model")];
 	if (runtime === "codex") {
 		if (identity.thinking) args.push("-c", `model_reasoning_effort=${identity.thinking}`);
-		args.push("-c", "approval_policy=never", "--sandbox", "danger-full-access");
+		// Hook review modals swallow bg_agent's typed prompt, so vetted automation bypasses trust UI.
+		args.push("-c", "approval_policy=never", "--sandbox", "danger-full-access", "--dangerously-bypass-hook-trust");
 	} else {
 		if (identity.thinking) args.push("--effort", identity.thinking);
 		args.push("--dangerously-skip-permissions");

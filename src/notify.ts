@@ -67,7 +67,10 @@ export function createNotifier(
 		};
 		const lines = [
 			`[detach] agent ${record.id} · ${record.label} (${record.agentName ?? "?"}) ${headlineByState[state] ?? state}` +
-				(record.resultStatus ? ` · result Status: ${record.resultStatus}` : ""),
+				(record.resultStatus ? ` · result Status: ${record.resultStatus}` : "") +
+				((state === "done" || state === "idle") && record.resultNotes?.length
+					? ` · result notes: ${record.resultNotes.join("; ")}`
+					: ""),
 			...paneHint(record),
 			...(record.resultPath ? [`Result artifact: ${record.resultPath}`] : []),
 		];

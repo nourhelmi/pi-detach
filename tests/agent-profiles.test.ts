@@ -340,7 +340,7 @@ test("builds every semantic role in native Codex or Claude from the selected mod
 	});
 	assert.equal(
 		codex.command,
-		"codex --model gpt-5.6-luna -c model_reasoning_effort=max -c approval_policy=never --sandbox danger-full-access",
+		"codex --model gpt-5.6-luna -c model_reasoning_effort=max -c approval_policy=never --sandbox danger-full-access --dangerously-bypass-hook-trust",
 	);
 	assert.doesNotMatch(codex.command, /--name|--provider/);
 	assert.match(codex.prompt, /advisor-worker\/roles\/scout\/SKILL\.md before starting/);

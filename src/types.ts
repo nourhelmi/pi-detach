@@ -36,8 +36,10 @@ export interface RunRecord {
 	donePattern?: string;
 	/** Agent runs: durable result artifact path, kept for post-settlement lookups. */
 	resultPath?: string | undefined;
-	/** Agent runs: parsed first line beneath the result artifact's Status heading. */
+	/** Agent runs: status parsed leniently from the result artifact. */
 	resultStatus?: string | undefined;
+	/** Agent runs: non-blocking result-template omissions found during settlement. */
+	resultNotes?: string[] | undefined;
 	/**
 	 * Agent runs: the driver's settlement reason (e.g. an invalid result artifact),
 	 * so the completion notice can say why a run stalled instead of a generic label.
@@ -105,6 +107,7 @@ export interface DriverOutcome {
 	killed?: boolean;
 	agentState?: AgentSettledState;
 	resultStatus?: string;
+	resultNotes?: string[];
 	/** Appended to the log before handlers fire, e.g. "pane was closed". */
 	note?: string;
 }

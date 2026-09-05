@@ -150,24 +150,62 @@ const REQUIRED_ARTIFACT_HEADINGS = [
 	"Remaining Risk",
 ];
 
-/**
- * Locate a required heading and return its section body. A section runs until
- * the next heading at the same or a shallower level, so a worker that organizes
- * `# Claims` into `## AC1` … `## ACn` subsections (the natural shape for
- * criterion-by-criterion evidence) still has a non-empty Claims section.
- * Before this rule, any heading at all closed the section, so a subsection as
- * the first child reported the parent as empty and stalled a finished worker.
- */
-function artifactSection(content: string, heading: string): string | undefined {
-	const match = new RegExp(`^(#{1,6})\\s+${heading}\\s*$`, "im").exec(content);
-	if (!match) return undefined;
-	const level = match[1]?.length ?? 1;
-	const remainder = content.slice(match.index + match[0].length);
-	const closer = new RegExp(`^#{1,${level}}\\s+\\S.*$`, "m");
-	const nextHeading = remainder.search(closer);
-	return nextHeading >= 0 ? remainder.slice(0, nextHeading) : remainder;
+interface ArtifactSection {
+	inline: string;
+	body: string;
 }
 
+function artifactLabel(line: string, heading: string): { inline: string; level?: number } | undefined {
+	const markdown = /^\s*(#{1,6})\s*(.*?)\s*$/.exec(line);
+	const text = (markdown?.[2] ?? line.trim()).replace(/^[*_`]+\s*/, "");
+	const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const match = new RegExp(`^${escaped}(?=$|[\\s:*_\`])(?:[*_\`]+)?\\s*:?[\\t ]*(.*)$`, "i").exec(text);
+	if (!match) return undefined;
+	return {
+		inline: (match[1] ?? "").replace(/[*_`]+$/, "").trim(),
+		...(markdown?.[1] ? { level: markdown[1].length } : {}),
+	};
+}
+
+function anyArtifactLabel(line: string): boolean {
+	return REQUIRED_ARTIFACT_HEADINGS.some((heading) => artifactLabel(line, heading) !== undefined);
+}
+
+function plainArtifactLabel(line: string): boolean {
+	return REQUIRED_ARTIFACT_HEADINGS.some((heading) => {
+		const label = artifactLabel(line, heading);
+		return label !== undefined && label.level === undefined;
+	});
+}
+
+/**
+ * Locate a markdown heading or plain/marked label. Deeper markdown headings stay
+ * inside the section; a same-or-shallower heading or another result label closes it.
+ */
+function artifactSection(content: string, heading: string): ArtifactSection | undefined {
+	const lines = content.split("\n");
+	for (let index = 0; index < lines.length; index++) {
+		const found = artifactLabel(lines[index] ?? "", heading);
+		if (!found) continue;
+		const body: string[] = [];
+		for (let cursor = index + 1; cursor < lines.length; cursor++) {
+			const line = lines[cursor] ?? "";
+			const markdown = /^\s*(#{1,6})(?:\s|$)/.exec(line);
+			const headingLevel = markdown?.[1]?.length;
+			const nextPlainLabel = found.level === undefined
+				? anyArtifactLabel(line)
+				: plainArtifactLabel(line);
+			if (nextPlainLabel || (found.level !== undefined && headingLevel !== undefined && headingLevel <= found.level)) {
+				break;
+			}
+			body.push(line);
+		}
+		return { inline: found.inline, body: body.join("\n") };
+	}
+	return undefined;
+}
+
+/** File validation v2 stalls only for a missing, unreadable, or blank artifact. */
 export async function settlementArtifactIssue(path: string): Promise<string | undefined> {
 	let content: string;
 	try {
@@ -177,24 +215,7 @@ export async function settlementArtifactIssue(path: string): Promise<string | un
 		return code === "ENOENT" ? `missing ${path}` : `could not read ${path}: ${(error as Error).message}`;
 	}
 	if (!content.trim()) return `empty ${path}`;
-	const missing: string[] = [];
-	const empty: string[] = [];
-	for (const heading of REQUIRED_ARTIFACT_HEADINGS) {
-		const body = artifactSection(content, heading);
-		if (body === undefined) {
-			missing.push(heading);
-			continue;
-		}
-		// Heading-only bodies (e.g. `## AC1` with nothing under it) are still empty.
-		const prose = body
-			.split("\n")
-			.filter((line) => !/^#{1,6}\s/.test(line.trim()))
-			.join("\n")
-			.trim();
-		if (!prose) empty.push(heading);
-	}
-	if (missing.length) return `${path} is missing headings: ${missing.join(", ")}`;
-	return empty.length ? `${path} has empty sections: ${empty.join(", ")}` : undefined;
+	return undefined;
 }
 
 export type ResultStatusClassification = "blocked" | "in-progress" | "terminal";
@@ -204,30 +225,90 @@ export interface ResultArtifactStatus {
 	classification: ResultStatusClassification;
 }
 
-/**
- * Parse the first non-empty, non-heading line beneath a markdown Status
- * heading. Subsection headings inside Status are skipped rather than read as
- * the status line.
- */
-export function parseResultArtifactStatus(content: string): ResultArtifactStatus | undefined {
-	const body = artifactSection(content, "Status");
-	if (body === undefined) return undefined;
-	const rawLine = body.split("\n").find((line) => line.trim() && !/^#{1,6}\s/.test(line.trim()));
-	if (!rawLine) return undefined;
-	const line = rawLine
+export interface ResultArtifactValidation {
+	valid: boolean;
+	status?: string;
+	classification: ResultStatusClassification;
+	problems: string[];
+	notes: string[];
+}
+
+function normalizeStatusLine(line: string, fallback = false): string {
+	return line
 		.trim()
-		.replace(/^[*_`]+/, "")
+		.replace(fallback ? /^[*_`-]+\s*/ : /^[*_`]+\s*/, "")
 		.replace(/[.!?,;:]+$/, "")
 		.replace(/[*_`]+$/, "")
 		.replace(/[.!?,;:]+$/, "")
 		.trim()
 		.slice(0, 200);
-	const classification = /^BLOCKED\b/i.test(line)
+}
+
+function classifyStatus(line: string): ResultStatusClassification {
+	return /^BLOCKED\b/i.test(line)
 		? "blocked"
-		: /^(?:IN[ _-]PROGRESS|WORKING|WAITING|PAUSED|RUNNING)\b/i.test(line)
+		: /^IN(?: |-)PROGRESS\b/i.test(line)
 			? "in-progress"
 			: "terminal";
-	return { line, classification };
+}
+
+/**
+ * Parse Status from markdown/plain/marked labels, then fall back to a terminal
+ * token in the first ten non-empty lines. Only that line controls classification.
+ */
+export function parseResultArtifactStatus(content: string): ResultArtifactStatus | undefined {
+	const section = artifactSection(content, "Status");
+	let rawLine = section?.inline;
+	if (!rawLine) {
+		rawLine = section?.body
+			.split("\n")
+			.find((line) => line.trim() && !/^\s*#{1,6}(?:\s|$)/.test(line) && !anyArtifactLabel(line));
+	}
+	let line = rawLine ? normalizeStatusLine(rawLine) : "";
+	if (!line && !section) {
+		const fallback = content
+			.split("\n")
+			.filter((candidate) => candidate.trim())
+			.slice(0, 10)
+			.map((candidate) => normalizeStatusLine(candidate, true))
+			.find((candidate) => /^(?:PASS|FAIL|DONE|BLOCKED|IN(?: |-)PROGRESS)\b/i.test(candidate));
+		line = fallback ?? "";
+	}
+	return line ? { line, classification: classifyStatus(line) } : undefined;
+}
+
+/** Result validation v2: only blank content is invalid; formatting gaps become notes. */
+export function validateResultArtifact(content: string): ResultArtifactValidation {
+	if (!content.trim()) {
+		return {
+			valid: false,
+			classification: "terminal",
+			problems: ["result artifact is empty"],
+			notes: [],
+		};
+	}
+	const notes: string[] = [];
+	for (const heading of REQUIRED_ARTIFACT_HEADINGS) {
+		const section = artifactSection(content, heading);
+		if (!section) {
+			notes.push(`missing ${heading}`);
+			continue;
+		}
+		const prose = [section.inline, ...section.body.split("\n")]
+			.filter((line) => line.trim() && !/^\s*#{1,6}(?:\s|$)/.test(line))
+			.join("\n")
+			.trim();
+		if (!prose) notes.push(`empty ${heading}`);
+	}
+	const status = parseResultArtifactStatus(content);
+	if (!status) notes.push("no Status line found");
+	return {
+		valid: true,
+		...(status ? { status: status.line } : {}),
+		classification: status?.classification ?? "terminal",
+		problems: [],
+		notes,
+	};
 }
 
 async function readFilePrefix(path: string, maxBytes: number): Promise<string> {
@@ -887,13 +968,18 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			let finalState = state;
 			let finalNote = note;
 			let resultStatus: ResultArtifactStatus | undefined;
+			let resultNotes: string[] | undefined;
 			if (artifactPath) {
 				const issue = await settlementArtifactIssue(artifactPath);
 				if (finished) return true;
 				if (!issue) {
 					const content = await readFile(artifactPath, "utf8");
 					if (finished) return true;
-					resultStatus = parseResultArtifactStatus(content);
+					const validation = validateResultArtifact(content);
+					resultStatus = validation.status
+						? { line: validation.status, classification: validation.classification }
+						: undefined;
+					resultNotes = validation.notes;
 					if (resultStatus) record.resultStatus = resultStatus.line;
 				}
 				if (state === "done" || state === "idle") {
@@ -927,6 +1013,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 						? { exitCode: 0 }
 						: {}),
 					...(resultStatus ? { resultStatus: resultStatus.line } : {}),
+					...(resultNotes?.length ? { resultNotes } : {}),
 					...(finalNote ? { note: finalNote } : {}),
 				},
 				output,

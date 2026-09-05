@@ -270,6 +270,7 @@ export function createRegistry(options: RegistryOptions = {}): Registry {
 				record.termSignal = outcome.termSignal;
 				if (outcome.agentState) record.agentState = outcome.agentState;
 				if (outcome.resultStatus) record.resultStatus = outcome.resultStatus;
+				if (outcome.resultNotes) record.resultNotes = outcome.resultNotes;
 				if (outcome.note && record.kind === "agent") record.settlementNote = outcome.note;
 				record.endedAt = Date.now();
 				active.delete(key);

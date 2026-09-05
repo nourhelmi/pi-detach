@@ -18,10 +18,12 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import registerDetachExtension from "../extensions/index.ts";
 import type { Registry } from "../src/registry.ts";
+import type { RunRecord } from "../src/types.ts";
 import {
 	agentLabel,
 	agentTombstoneNote,
 	bgAgentResultLabel,
+	promotedResult,
 	settledResult,
 	withReservedResultArtifact,
 	workerHarness,
@@ -352,8 +354,8 @@ test("successfully started native runs retain their result reservation", async (
 	}
 });
 
-test("settled bg_agent result header surfaces result Status and discovered artifact", () => {
-	const finished = {
+test("bg_agent result builders surface settlement notes and result notes", () => {
+	const stalled: RunRecord = {
 		id: "agent1",
 		kind: "agent",
 		command: "pi",
@@ -363,25 +365,50 @@ test("settled bg_agent result header surfaces result Status and discovered artif
 		backend: "herdr",
 		paneId: "w1:p7",
 		agentName: "builder-abc",
-		agentState: "blocked",
+		agentState: "stalled",
 		resultPath: "/tmp/discovered/result.md",
-		resultStatus: "BLOCKED: needs input",
-		exitCode: 0,
+		settlementNote: "required result artifact is invalid: empty /tmp/discovered/result.md",
 		startedAt: 0,
 		endedAt: 1000,
 		promoted: false,
 		logPath: "/tmp/output.log",
-	} as const;
+	};
 	const registry = { tail: () => "" } as unknown as Registry;
-	const result = settledResult(
+	const settledStall = settledResult(
 		registry,
-		finished,
+		stalled,
 		{ command: "pi", prompt: "Build.", runtime: "pi" },
 		false,
 	);
-	assert.match(text(result), /settled: blocked · result Status: BLOCKED: needs input/);
-	assert.match(text(result), /Result artifact: \/tmp\/discovered\/result\.md/);
-	assert.equal(result.details.resultStatus, "BLOCKED: needs input");
-	assert.equal(result.details.resultPath, "/tmp/discovered/result.md");
-});
+	const promotedStall = promotedResult(
+		stalled,
+		{ command: "pi", prompt: "Build.", runtime: "pi" },
+		false,
+	);
+	assert.match(text(settledStall), /settled: stalled — required result artifact is invalid: empty/);
+	assert.equal(settledStall.details.settlementNote, stalled.settlementNote);
+	assert.equal(promotedStall.details.settlementNote, stalled.settlementNote);
 
+	const done: RunRecord = {
+		...stalled,
+		id: "agent2",
+		agentState: "done",
+		resultStatus: "PASS",
+		resultNotes: ["missing Evidence", "empty Files"],
+		settlementNote: undefined,
+	};
+	const settledDone = settledResult(
+		registry,
+		done,
+		{ command: "pi", prompt: "Build.", runtime: "pi" },
+		false,
+	);
+	const promotedDone = promotedResult(
+		done,
+		{ command: "pi", prompt: "Build.", runtime: "pi" },
+		false,
+	);
+	assert.match(text(settledDone), /result notes: missing Evidence; empty Files/);
+	assert.deepEqual(settledDone.details.resultNotes, done.resultNotes);
+	assert.deepEqual(promotedDone.details.resultNotes, done.resultNotes);
+});

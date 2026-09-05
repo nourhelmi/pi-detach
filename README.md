@@ -133,12 +133,12 @@ contract. The caller is woken when the helper settles as `done`, `idle`,
 result artifact is missing or looks terminal; the pause notice names that live
 sub-work. Transient child lookup failures are indeterminate and also keep the
 worker supervised rather than failing open. A final discovery give-up note is
-logged only when settlement actually becomes terminal. When a valid result
-artifact is available, its first line under
-`Status` is authoritative: a line beginning `BLOCKED` settles as blocked even
-if Herdr reports done, while `IN PROGRESS`, `WAITING`, and the other
-working-status aliases keep the run supervised when the worker ledger is absent
-or unreadable. If that ledger is readable and shows no live sub-work, an
+logged only when settlement actually becomes terminal. When a present, non-blank
+result artifact is available, its leniently parsed `Status` label (markdown,
+plain, marked, inline, or a recognized token in the first ten non-empty lines)
+is authoritative: a line beginning `BLOCKED` settles as blocked even if Herdr
+reports done, while `IN PROGRESS` or `IN-PROGRESS` keeps the run supervised when
+the worker ledger is absent or unreadable. If that ledger is readable and shows no live sub-work, an
 in-progress Status is treated as stale and settles as `stalled` so the parent is
 woken instead of waiting forever. The parent receives at most one pause notice
 and is woken later when the artifact becomes terminal or blocked.
@@ -201,12 +201,11 @@ Native routing is provider-based:
 Pi-detach translates the selected model and reasoning to native flags, runs the
 native CLI unattended, injects the same role/task/anchor/skills packet, and adds
 a durable result-artifact instruction. It reserves the empty artifact before
-launch and validates a nonempty result with Status, Claims, Evidence, Files,
-Decisions, and Remaining Risk headings before accepting successful settlement.
-A section may be organized into deeper subheadings (for example `## AC1` under
-`# Claims`); only a section with no prose under it or its subheadings is empty.
-Missing or malformed results become `stalled` and retain their pane, and the
-completion notice names the validation problem rather than a generic stall. The path defaults to
+launch; validation v2 stalls only for a missing, unreadable, or blank artifact,
+parses Status leniently, and reports missing or empty Status, Claims, Evidence,
+Files, Decisions, and Remaining Risk sections as non-blocking result notes.
+Invalid results retain their pane, and the completion notice names the validation
+problem rather than a generic stall. The path defaults to
 `$ADVISOR_STATE_ROOT/runs/native/<uuid>/result.md` (or a temporary fallback) and
 is included in `bg_agent` details and completion output. Successful native panes
 close on settlement exactly like successful Pi panes; blocked or failed panes
