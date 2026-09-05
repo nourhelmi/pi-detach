@@ -287,7 +287,11 @@ exactly as it was.
 starts a fresh turn (`triggerTurn`). When it is mid-stream the completion is
 steered into the running turn (`deliverAs: "steer"`). The message is worded as an
 FYI and says to keep going. Failures carry a longer tail than successes, since
-that's when the context is actually wanted inline.
+that's when the context is actually wanted inline. A promoted agent finalized
+as killed is the exception: it emits one silent `pi-detach:agent-settled` event
+for host extensions after its log flush, without sending a message, steering,
+or starting a model turn. Killed runs, watches, and inline agents emit no such
+event.
 
 **Dedupe is keyed on `(cwd, command)`, not command.** Running `bun dev` twice in
 the same directory reuses the first process instead of fighting over the port.
@@ -343,6 +347,10 @@ back at its prompt and settles the run as killed.
 - Logs are written to `~/.pi/detach/runs/<runId>/output.log` and kept after
   exit, so `bg_output` works on finished runs. The in-memory tail keeps the
   last 500 lines.
+- For an agent, `bg_stop` sends Escape and finalizes pi-detach's supervision
+  record as killed. That records the supervision outcome; it does not claim the
+  native agent process exited or acknowledged Escape, and the agent remains
+  alive in its Herdr pane.
 - Local processes are spawned into their own process group, so `bg_stop`
   reaches child processes — killing a dev server takes its workers with it.
 

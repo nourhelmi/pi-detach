@@ -17,6 +17,23 @@ const TAIL_ON_FAILURE = 80;
 const TAIL_ON_AGENT = 120;
 const ERROR_LINE_COOLDOWN_MS = 60_000;
 
+export const AGENT_SETTLED_EVENT = "pi-detach:agent-settled";
+
+export interface AgentSettledSignal {
+	v: 1;
+	id: string;
+	kind: "agent";
+	promoted: true;
+	status: "killed";
+	endedAt: number;
+	agentName?: string;
+	paneId?: string;
+	resultPath?: string;
+	resultStatus?: string;
+	settlementNote?: string;
+	closeOnSettle?: boolean;
+}
+
 const CONTINUE_HINT =
 	"Informational — continue what you were doing unless you were waiting on this.";
 
@@ -111,11 +128,35 @@ export function createNotifier(
 		deliver("detach_agent_settled", lines.join("\n"), record);
 	}
 
+	function emitKilledAgent(record: RunRecord): void {
+		if (record.endedAt === undefined) return;
+		const snapshot: AgentSettledSignal = {
+			v: 1,
+			id: record.id,
+			kind: "agent",
+			promoted: true,
+			status: "killed",
+			endedAt: record.endedAt,
+			...(record.agentName !== undefined ? { agentName: record.agentName } : {}),
+			...(record.paneId !== undefined ? { paneId: record.paneId } : {}),
+			...(record.resultPath !== undefined ? { resultPath: record.resultPath } : {}),
+			...(record.resultStatus !== undefined ? { resultStatus: record.resultStatus } : {}),
+			...(record.settlementNote !== undefined ? { settlementNote: record.settlementNote } : {}),
+			...(record.closeOnSettle !== undefined ? { closeOnSettle: record.closeOnSettle } : {}),
+		};
+		pi.events.emit(AGENT_SETTLED_EVENT, snapshot);
+	}
+
 	return {
 		runFinished(record) {
 			// Not promoted: the originating call is still awaiting it inline.
-			// Killed: someone asked for this via bg_stop or shutdown, so it is not news.
-			if (!record.promoted || record.status === "killed") return;
+			if (!record.promoted) return;
+			// Killed agents are lifecycle evidence for another extension, never a
+			// message or a turn. Other killed work remains deliberately silent.
+			if (record.status === "killed") {
+				if (record.kind === "agent") emitKilledAgent(record);
+				return;
+			}
 			if (record.kind === "agent") {
 				agentFinished(record);
 				return;

@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { createNotifier } from "../src/notify.ts";
+import { AGENT_SETTLED_EVENT, createNotifier, type AgentSettledSignal } from "../src/notify.ts";
 import { createRegistry } from "../src/registry.ts";
-import type { RunRecord } from "../src/types.ts";
+import type { DriverStart, RunController, RunRecord } from "../src/types.ts";
 
 const cwd = tmpdir();
 
@@ -16,9 +17,17 @@ interface Sent {
 
 function harness(idle: boolean) {
 	const sent: Sent[] = [];
+	const signals: AgentSettledSignal[] = [];
 	const pi = {
 		sendMessage(message: { customType: string; content: string }, options?: Sent["options"]) {
 			sent.push({ customType: message.customType, content: message.content, options });
+		},
+		events: {
+			emit(channel: string, data: unknown) {
+				assert.equal(channel, AGENT_SETTLED_EVENT);
+				signals.push(data as AgentSettledSignal);
+			},
+			on: () => () => {},
 		},
 	} as unknown as ExtensionAPI;
 	const registry = createRegistry();
@@ -26,7 +35,56 @@ function harness(idle: boolean) {
 	const notifier = createNotifier(pi, registry, () => ctx);
 	registry.onExit((record) => notifier.runFinished(record));
 	registry.onErrorLine((record, line) => notifier.watchErrorLine(record, line));
-	return { sent, registry, notifier };
+	return { sent, signals, registry, notifier };
+}
+
+function controlledAgentHarness(idle: boolean) {
+	const sent: Sent[] = [];
+	const signals: AgentSettledSignal[] = [];
+	const flushedLogs: string[] = [];
+	let controller: RunController | undefined;
+	let stopCalls = 0;
+	const driver: DriverStart = async (_options, value) => {
+		controller = value;
+		return {
+			paneId: "w1:p9",
+			agentName: "builder-cancelled",
+			stop: () => {
+				stopCalls += 1;
+			},
+		};
+	};
+	const registry = createRegistry({ herdrDriver: driver });
+	const pi = {
+		sendMessage(message: { customType: string; content: string }, options?: Sent["options"]) {
+			sent.push({ customType: message.customType, content: message.content, options });
+		},
+		events: {
+			emit(channel: string, data: unknown) {
+				assert.equal(channel, AGENT_SETTLED_EVENT);
+				const signal = data as AgentSettledSignal;
+				flushedLogs.push(readFileSync(controller?.record.logPath ?? "", "utf8"));
+				signals.push(signal);
+			},
+			on: () => () => {},
+		},
+	} as unknown as ExtensionAPI;
+	const ctx = { isIdle: () => idle } as ExtensionContext;
+	const notifier = createNotifier(pi, registry, () => ctx);
+	registry.onExit((record) => notifier.runFinished(record));
+	return {
+		registry,
+		sent,
+		signals,
+		flushedLogs,
+		get controller() {
+			assert.ok(controller);
+			return controller;
+		},
+		get stopCalls() {
+			return stopCalls;
+		},
+	};
 }
 
 function settledAgent(closeOnSettle: boolean): RunRecord {
@@ -91,10 +149,86 @@ test("a run still awaited inline is not announced", async () => {
 });
 
 test("a deliberately stopped run is not announced", async () => {
-	const { sent, registry } = harness(true);
+	const { sent, signals, registry } = harness(true);
 	const { record, completion } = await registry.start({ kind: "watch", command: "sleep 30", cwd });
 	registry.stop(record.id);
 	await completion;
+	assert.equal(sent.length, 0);
+	assert.equal(signals.length, 0);
+});
+
+for (const idle of [true, false]) {
+	test(`a promoted killed agent emits one flushed detached signal without messaging when ${idle ? "idle" : "busy"}`, async () => {
+		const host = controlledAgentHarness(idle);
+		const started = await host.registry.start({
+			kind: "agent",
+			command: "pi",
+			cwd,
+			prompt: "Build it.",
+			closeOnSettle: false,
+			requiredArtifactPath: "/tmp/cancel-result.md",
+		});
+		host.registry.markPromoted(started.record.id);
+		host.registry.stop(started.record.id);
+		assert.equal(host.stopCalls, 1);
+		assert.equal(host.signals.length, 0, "a stop request is not terminal evidence");
+		assert.equal(host.sent.length, 0);
+
+		host.controller.emitOutput("complete log before cancellation\n");
+		host.controller.finish({
+			killed: true,
+			note: "sent esc to interrupt the turn; the agent is still alive in its pane",
+		});
+		const finished = await started.completion;
+		assert.equal(host.signals.length, 1);
+		assert.equal(host.sent.length, 0, "killed delivery never calls sendMessage");
+		assert.match(host.flushedLogs[0] ?? "", /complete log before cancellation/);
+		assert.match(host.flushedLogs[0] ?? "", /sent esc to interrupt/);
+		assert.deepEqual(host.signals[0], {
+			v: 1,
+			id: finished.id,
+			kind: "agent",
+			promoted: true,
+			status: "killed",
+			endedAt: finished.endedAt,
+			agentName: "builder-cancelled",
+			paneId: "w1:p9",
+			resultPath: "/tmp/cancel-result.md",
+			settlementNote: "sent esc to interrupt the turn; the agent is still alive in its pane",
+			closeOnSettle: false,
+		});
+
+		finished.agentName = "mutated-after-delivery";
+		assert.equal(host.signals[0]?.agentName, "builder-cancelled", "delivery is a detached snapshot");
+		host.controller.finish({ killed: true, note: "replayed finish" });
+		host.registry.stop(finished.id);
+		assert.equal(host.stopCalls, 1, "stopping a terminal record does not call the driver again");
+		assert.equal(host.signals.length, 1, "finish replay and terminal stop do not emit again");
+	});
+}
+
+test("killed runs, watches, and non-promoted agents stay off the terminal event bus", () => {
+	const { sent, signals, notifier } = harness(true);
+	for (const kind of ["run", "watch"] as const) {
+		notifier.runFinished({
+			id: kind,
+			kind,
+			command: "sleep 30",
+			cwd,
+			label: kind,
+			status: "killed",
+			backend: "herdr",
+			startedAt: 1,
+			endedAt: 2,
+			promoted: true,
+			logPath: "",
+		});
+	}
+	const inline = settledAgent(false);
+	inline.status = "killed";
+	inline.promoted = false;
+	notifier.runFinished(inline);
+	assert.equal(signals.length, 0);
 	assert.equal(sent.length, 0);
 });
 
