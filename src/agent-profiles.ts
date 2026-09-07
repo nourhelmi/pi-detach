@@ -312,12 +312,15 @@ function rolePrompt(
 		`Named skills are installed under ${join(config.baseDir, "skills")}. Resolve a named skill to <skill-root>/<name>/SKILL.md when present; otherwise use the harness's native skill discovery.`,
 		skills.length ? skills.map((skill) => `- ${skill}`).join("\n") : "- None beyond the role contract.",
 	];
-	if (maxTurns) packet.push("", `TURN CAP: ${maxTurns}`);
+	if (maxTurns) {
+		packet.push("", `TURN CAP: ${maxTurns} (advisory ceiling; finish integration and verification before settling)`);
+	}
 	if (resultPath) {
 		packet.push(
 			"",
 			"RESULT ARTIFACT:",
 			`Create the parent directory and write the durable bounded result to ${resultPath}.`,
+			"The file already exists as an empty placeholder created by the launcher with default file modes, and that is expected.",
 			"Include Status, Claims, Evidence, Files, Decisions, and Remaining Risk. Return this path in the final response.",
 		);
 	}

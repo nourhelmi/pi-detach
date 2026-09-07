@@ -14,8 +14,17 @@ import type { RunRecord } from "./types.ts";
 
 const TAIL_ON_SUCCESS = 25;
 const TAIL_ON_FAILURE = 80;
-const TAIL_ON_AGENT = 120;
+const TAIL_ON_AGENT_FAILURE = 40;
 const ERROR_LINE_COOLDOWN_MS = 60_000;
+
+/** Stable message types for extensions that recognize or filter detach notices. */
+export const DETACH_NOTICE_CUSTOM_TYPES = {
+	finished: "detach_finished",
+	agentSettled: "detach_agent_settled",
+	agentPaused: "detach_agent_paused",
+	watchError: "detach_watch_error",
+	watchDone: "detach_watch_done",
+} as const;
 
 export const AGENT_SETTLED_EVENT = "pi-detach:agent-settled";
 
@@ -67,8 +76,10 @@ export function createNotifier(
 	}
 
 	function agentFinished(record: RunRecord): void {
-		const tail = registry.tail(record.id, TAIL_ON_AGENT);
 		const state = record.agentState ?? "unknown";
+		const tail = state === "done" || state === "idle"
+			? ""
+			: registry.tail(record.id, TAIL_ON_AGENT_FAILURE);
 		// A stalled settlement has several distinct causes (prompt never started, the
 		// agent vanished, an invalid result artifact after real work). The driver's
 		// note names the actual cause; only fall back to the generic label without one.
@@ -125,7 +136,7 @@ export function createNotifier(
 			);
 		}
 		lines.push(CONTINUE_HINT);
-		deliver("detach_agent_settled", lines.join("\n"), record);
+		deliver(DETACH_NOTICE_CUSTOM_TYPES.agentSettled, lines.join("\n"), record);
 	}
 
 	function emitKilledAgent(record: RunRecord): void {
@@ -173,7 +184,7 @@ export function createNotifier(
 				lines.push("", tail.trimEnd());
 			}
 			lines.push("", `Full log: bg_output({ runId: "${record.id}" })`, CONTINUE_HINT);
-			deliver("detach_finished", lines.join("\n"), record);
+			deliver(DETACH_NOTICE_CUSTOM_TYPES.finished, lines.join("\n"), record);
 		},
 
 		agentPaused(record, note) {
@@ -185,7 +196,7 @@ export function createNotifier(
 				...(record.resultPath ? [`Result artifact: ${record.resultPath}`] : []),
 				CONTINUE_HINT,
 			];
-			deliver("detach_agent_paused", lines.join("\n"), record);
+			deliver(DETACH_NOTICE_CUSTOM_TYPES.agentPaused, lines.join("\n"), record);
 		},
 
 		watchErrorLine(record, line) {
@@ -202,7 +213,7 @@ export function createNotifier(
 				`More context: bg_output({ runId: "${record.id}" })`,
 				CONTINUE_HINT,
 			].join("\n");
-			deliver("detach_watch_error", content, record);
+			deliver(DETACH_NOTICE_CUSTOM_TYPES.watchError, content, record);
 		},
 
 		watchDoneLine(record, line) {
@@ -215,7 +226,7 @@ export function createNotifier(
 				`Full log: bg_output({ runId: "${record.id}" })`,
 				CONTINUE_HINT,
 			].join("\n");
-			deliver("detach_watch_done", content, record);
+			deliver(DETACH_NOTICE_CUSTOM_TYPES.watchDone, content, record);
 		},
 	};
 }

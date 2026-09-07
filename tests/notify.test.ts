@@ -3,7 +3,12 @@ import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { AGENT_SETTLED_EVENT, createNotifier, type AgentSettledSignal } from "../src/notify.ts";
+import {
+	AGENT_SETTLED_EVENT,
+	createNotifier,
+	DETACH_NOTICE_CUSTOM_TYPES,
+	type AgentSettledSignal,
+} from "../src/notify.ts";
 import { createRegistry } from "../src/registry.ts";
 import type { DriverStart, RunController, RunRecord } from "../src/types.ts";
 
@@ -240,8 +245,8 @@ test("a watch that dies on its own is announced", async () => {
 	assert.match(sent[0]?.content ?? "", /exit 1/);
 });
 
-test("failures carry a longer tail than successes", async () => {
-	const seed = "for i in $(seq 1 60); do echo line-$i; done";
+test("failures keep 80 tail lines while successful run notices cap at 25", async () => {
+	const seed = "for i in $(seq 1 120); do echo line-$i; done";
 
 	const ok = harness(true);
 	const okRun = await ok.registry.start({ kind: "run", command: seed, cwd });
@@ -253,9 +258,9 @@ test("failures carry a longer tail than successes", async () => {
 	bad.registry.markPromoted(badRun.record.id);
 	await badRun.completion;
 
-	const okLines = (ok.sent[0]?.content ?? "").split("\n").length;
-	const badLines = (bad.sent[0]?.content ?? "").split("\n").length;
-	assert.ok(badLines > okLines, `expected failure tail ${badLines} > success tail ${okLines}`);
+	const tailLines = (messages: Sent[]) => (messages[0]?.content ?? "").split("\n").filter((line) => /^line-\d+$/.test(line));
+	assert.deepEqual(tailLines(ok.sent), Array.from({ length: 25 }, (_, i) => `line-${i + 96}`));
+	assert.deepEqual(tailLines(bad.sent), Array.from({ length: 80 }, (_, i) => `line-${i + 41}`));
 });
 
 test("watch error lines are rate limited", () => {
@@ -276,6 +281,65 @@ test("the completion message tells the agent to keep going", async () => {
 	assert.match(sent[0]?.content ?? "", /continue what you were doing/i);
 	assert.match(sent[0]?.content ?? "", /bg_output/);
 });
+
+test("detach notice custom types retain their public values and identify every delivery", () => {
+	assert.deepEqual(DETACH_NOTICE_CUSTOM_TYPES, {
+		finished: "detach_finished",
+		agentSettled: "detach_agent_settled",
+		agentPaused: "detach_agent_paused",
+		watchError: "detach_watch_error",
+		watchDone: "detach_watch_done",
+	});
+	const { sent, notifier } = harness(true);
+	const record = settledAgent(false);
+	notifier.runFinished({ ...record, kind: "run" });
+	notifier.runFinished(record);
+	notifier.agentPaused(record, "waiting for checks");
+	notifier.watchErrorLine(record, "ERROR: inspect this");
+	notifier.watchDoneLine(record, "done");
+	assert.deepEqual(sent.map((message) => message.customType), Object.values(DETACH_NOTICE_CUSTOM_TYPES));
+});
+
+for (const state of ["done", "idle", "blocked", "stalled", "unknown", undefined] as const) {
+	test(`${state ?? "failed without a state"} agent settlement keeps only the appropriate notice tail`, async () => {
+		const host = controlledAgentHarness(true);
+		const started = await host.registry.start({
+			kind: "agent",
+			command: "pi",
+			cwd,
+			label: "lean-worker",
+			prompt: "Build it.",
+			requiredArtifactPath: "/tmp/lean-result.md",
+		});
+		host.registry.markPromoted(started.record.id);
+		const tail = Array.from({ length: 120 }, (_, i) => `pane-tail-${i + 1}`);
+		host.controller.emitOutput(`${tail.join("\n")}\n`);
+		const successful = state === "done" || state === "idle";
+		host.controller.finish({
+			...(state ? { agentState: state } : {}),
+			exitCode: successful ? 0 : 1,
+			resultStatus: successful ? "PASS" : state === "blocked" ? "BLOCKED: needs input" : "FAIL",
+			resultNotes: ["missing Claims"],
+		});
+		const record = await started.completion;
+		assert.equal(host.sent.length, 1);
+		const content = host.sent[0]?.content ?? "";
+		assert.ok(content.startsWith(`[detach] agent ${record.id} · lean-worker (builder-cancelled)`));
+		assert.ok(content.includes(`result Status: ${record.resultStatus}`));
+		assert.match(content, /pane: w1:p9 \(visible in herdr\)/);
+		assert.match(content, /Result artifact: \/tmp\/lean-result\.md/);
+		assert.deepEqual(content.split("\n").filter((line) => /^pane-tail-\d+$/.test(line)), successful ? [] : tail.slice(-40));
+		if (successful) {
+			assert.doesNotMatch(content, /pane-tail-/);
+			assert.match(content, state === "done" ? /finished its task/ : /finished and is idle/);
+			assert.match(content, /result notes: missing Claims/);
+			assert.ok(content.includes(`Full transcript: bg_output({ runId: "${record.id}" })`));
+		} else if (state === "blocked") {
+			assert.match(content, /It needs an answer\. Reply with bg_agent/);
+		}
+		assert.equal(await host.registry.readLog(record.id, { lines: 120 }), tail.join("\n"), "the full transcript stays available on demand");
+	});
+}
 
 test("an auto-closing agent notice tells the model to launch fresh", () => {
 	const { sent, notifier } = harness(true);

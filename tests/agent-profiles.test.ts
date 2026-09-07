@@ -79,7 +79,8 @@ test("role launch needs no model and preserves skill, tool, anchor, and turn gua
 	assert.match(launch.prompt, /^Load and follow the role-reviewer skill before starting\.\n\nROLE: reviewer/);
 	assert.match(launch.prompt, /ACCEPTANCE CRITERIA:\n[^\n]+\n1\. Report evidence-backed findings\./);
 	assert.match(launch.prompt, /REQUIRED SKILLS:\nLoad and follow each listed skill before starting\.[\s\S]+- review-pr/);
-	assert.match(launch.prompt, /TURN CAP: 4$/);
+	assert.match(launch.prompt, /TURN CAP: 4 \(advisory ceiling; finish integration and verification before settling\)$/);
+	assert.doesNotMatch(launch.prompt, /empty placeholder|RESULT ARTIFACT:/);
 });
 
 test("a profile harness constraint overrides the parent transport default", async () => {
@@ -208,7 +209,7 @@ test("per-launch maxTurns overrides the profile turn cap", async () => {
 	});
 	assert.equal(launch.maxTurns, 7);
 	assert.match(launch.command, /--worker-max-turns 7$/);
-	assert.match(launch.prompt, /TURN CAP: 7$/);
+	assert.match(launch.prompt, /TURN CAP: 7 \(advisory ceiling; finish integration and verification before settling\)$/);
 });
 
 test("plain Pi launch forwards a supplied model and reasoning", async () => {
@@ -333,6 +334,7 @@ test("builds every semantic role in native Codex or Claude from the selected mod
 		model: "openai-codex/gpt-5.6-luna",
 		thinking: "max",
 		harness: "native",
+		maxTurns: 6,
 		prompt: "Inspect.",
 		resultPath: "/tmp/native-scout/result.md",
 		label: "codex scout",
@@ -346,6 +348,8 @@ test("builds every semantic role in native Codex or Claude from the selected mod
 	assert.match(codex.prompt, /advisor-worker\/roles\/scout\/SKILL\.md before starting/);
 	assert.match(codex.prompt, /Named skills are installed under .*\/skills/);
 	assert.match(codex.prompt, /RESULT ARTIFACT:\nCreate the parent directory.*\/tmp\/native-scout\/result\.md/);
+	assert.match(codex.prompt, /RESULT ARTIFACT:[\s\S]*The file already exists as an empty placeholder created by the launcher with default file modes, and that is expected\./);
+	assert.match(codex.prompt, /^TURN CAP: 6 \(advisory ceiling; finish integration and verification before settling\)$/m);
 	assert.equal(codex.resultPath, "/tmp/native-scout/result.md");
 
 	const claude = await resolveAgentLaunch({

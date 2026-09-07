@@ -71,6 +71,10 @@ returns a run id and notifies later — and, inside herdr, opens a live viewer
 pane for the now-background run. Aborting the turn (Esc) detaches the run
 rather than killing it.
 
+Completion notices include at most 25 log-tail lines for exit 0 and 80 for
+non-zero exits. Read more with `bg_output({ runId })`; inline tool results are
+unchanged.
+
 ### `bg_watch`
 
 ```jsonc
@@ -142,6 +146,18 @@ the worker ledger is absent or unreadable. If that ledger is readable and shows 
 in-progress Status is treated as stale and settles as `stalled` so the parent is
 woken instead of waiting forever. The parent receives at most one pause notice
 and is woken later when the artifact becomes terminal or blocked.
+
+Successful `done`/`idle` settlement notices contain the header, result Status and
+notes when known, pane hint, result-artifact path when known, and follow-up
+guidance — no transcript tail. `blocked`, failed, `stalled`, and `unknown`
+settlements include at most the final 40 tail lines for diagnosis or input.
+Use `bg_output({ runId })` to read the full captured transcript on demand.
+
+Extensions can import `DETACH_NOTICE_CUSTOM_TYPES` from `pi-detach/src/notify.ts`
+to recognize or filter these messages. Its stable values are `detach_finished`,
+`detach_agent_settled`, `detach_agent_paused`, `detach_watch_error`, and
+`detach_watch_done`.
+
 Successful `done`/`idle` panes close after their transcript is captured. Blocked,
 stalled, and failed panes remain visible. Preserve a successful pane only for a
 planned follow-up:
@@ -201,7 +217,10 @@ Native routing is provider-based:
 Pi-detach translates the selected model and reasoning to native flags, runs the
 native CLI unattended, injects the same role/task/anchor/skills packet, and adds
 a durable result-artifact instruction. It reserves the empty artifact before
-launch; validation v2 stalls only for a missing, unreadable, or blank artifact,
+launch with default file modes; the packet explicitly describes this expected
+empty placeholder. Its `TURN CAP` is an advisory ceiling: finish integration and
+verification before settling. Validation v2 stalls only for a missing,
+unreadable, or blank artifact,
 parses Status leniently, and reports missing or empty Status, Claims, Evidence,
 Files, Decisions, and Remaining Risk sections as non-blocking result notes.
 Invalid results retain their pane, and the completion notice names the validation
