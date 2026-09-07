@@ -336,6 +336,19 @@ function agentSessionPath(value: unknown): string | undefined {
 	}
 	return undefined;
 }
+/** Protocol 20 AgentSessionInfo, including native id references. */
+function runtimeAgentSession(value: unknown): string | undefined {
+    if (!value || typeof value !== "object") return undefined;
+    const record = value as Record<string, unknown>;
+    const session = record.agent_session as Record<string, unknown> | undefined;
+    if (session && ["id", "path"].includes(String(session.kind)) &&
+        [session.source, session.agent, session.value].every(field => typeof field === "string" && field.length > 0)) {
+        return JSON.stringify([session.source, session.agent, session.kind, session.value]);
+    }
+    for (const child of Object.values(record)) { const found = runtimeAgentSession(child); if (found) return found; }
+    return undefined;
+}
+
 function agentSessionIdFromPath(path: string): string | undefined {
 	const filename = basename(path);
 	const stem = filename.endsWith(".jsonl") ? filename.slice(0, -".jsonl".length) : filename;
@@ -398,6 +411,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		label: string,
 		cwd: string,
 		argv: string[],
+        bridge?: StartOptions["runtimeExecution"],
 	): Promise<string> {
 		const predecessor = agentStartQueue;
 		let release!: () => void;
@@ -406,7 +420,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		});
 		await predecessor;
 		try {
-			return await startAgentPaneUnlocked(name, label, cwd, argv);
+			return await startAgentPaneUnlocked(name, label, cwd, argv, bridge);
 		} finally {
 			release();
 		}
@@ -417,6 +431,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		label: string,
 		cwd: string,
 		argv: string[],
+        bridge?: StartOptions["runtimeExecution"],
 	): Promise<string> {
 		await pruneAgentPanes();
 		// herdr >= 0.8 signature: the pane is always created first, then
@@ -425,7 +440,13 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		const kind = (argv[0] ?? "").split("/").pop() ?? "";
 		if (!kind) throw new Error("agent command is empty");
 		const agentArgs = argv.slice(1);
-		const workerPane = await panes.splitOff(cwd, agentPaneStack, agentPaneEnvironment);
+		bridge?.assertActive();
+        let splitAttempts = 0;
+        const beforeSplit = bridge ? () => {
+            bridge.assertActive();
+            if (splitAttempts++ !== 0) throw new Error("BRIDGE_ACQUISITION_AMBIGUOUS");
+        } : undefined;
+        const workerPane = await panes.splitOff(cwd, agentPaneStack, bridge?.environment ?? agentPaneEnvironment, beforeSplit);
 		// Shell startup can briefly report one foreground zsh before later init
 		// jobs run. process-info is therefore only a cheap gate; Herdr's own
 		// `agent start` precondition is authoritative. Retry only its exact
@@ -434,7 +455,8 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		for (let attempt = 0; attempt < SHELL_READY_ATTEMPTS; attempt++) {
 			const info = await cli.exec(["pane", "process-info", "--pane", workerPane]);
 			if (info.ok && isIdleShell(info.json)) {
-				started = await cli.exec(
+				bridge?.assertActive();
+                started = await cli.exec(
 					["agent", "start", name, "--kind", kind, "--pane", workerPane, "--", ...agentArgs],
 					{ timeoutMs: AGENT_START_TIMEOUT_MS },
 				);
@@ -446,7 +468,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		}
 		if (!started?.ok) {
 			// Do not leak the split pane when the start is refused.
-			void cli.exec(["pane", "close", workerPane]);
+			if (!bridge) void cli.exec(["pane", "close", workerPane]);
 			panes.forgetTarget(workerPane);
 			const detail = started?.errorMessage ?? started?.stderr.trim() ?? "shell readiness timed out";
 			throw new Error(`herdr agent start failed: ${detail}`);
@@ -1320,8 +1342,96 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 		};
 	}
 
+
+    // The shared service supplies durable admission/ownership hooks. Reuse the
+    // same acquisition/layout driver; never enter legacy retry/settlement logic.
+    async function startRuntimeAgentRun(options: StartOptions, controller: RunController): Promise<DriverHandle> {
+        const bridge = options.runtimeExecution!;
+        bridge.assertActive();
+        const prior = bridge.expectedHandle ? JSON.parse(bridge.expectedHandle.id) as [string, string, string, number] : undefined;
+        const name = prior?.[1] ?? agentName(controller.record.label, controller.record.id.slice(-12));
+        const paneId = prior?.[0] ?? await startAgentPane(name, controller.record.label, options.cwd, tokenize(options.command), bridge);
+        let detached = false;
+        let cancelled = false;
+        const waiters: Waiter[] = [];
+        const inspect = async () => {
+            bridge.assertActive();
+            const got = await cli.exec(["agent", "get", paneId]);
+            const occupant = got.ok ? occupantFrom(got.json) : undefined;
+            const session = runtimeAgentSession(got.json);
+            if (!occupant || occupant.paneId !== paneId || occupant.agentName !== name || !session || !Number.isSafeInteger(occupant.stateChangeSeq)) throw new Error("BRIDGE_IDENTITY_UNAVAILABLE");
+            return { occupant, session, seq: occupant.stateChangeSeq! };
+        };
+        const acquired = await inspect();
+        if (prior && (acquired.session !== prior[2] || acquired.seq < prior[3] || acquired.seq !== bridge.expectedGeneration)) throw new Error("BRIDGE_HANDLE_MISMATCH");
+        // An actual UI prompt is not a typed runtime question. Do not type into it.
+        if (!["idle", "done"].includes(acquired.occupant.status)) throw new Error("BRIDGE_AGENT_NOT_IDLE");
+        const identity = prior ?? [paneId, name, acquired.session, acquired.seq] as [string, string, string, number];
+        bridge.recordHandle({ id: JSON.stringify(identity), session: acquired.session });
+        const checkIdentity = async () => {
+            const current = await inspect();
+            if (current.session !== identity[2] || current.seq < identity[3]) throw new Error("BRIDGE_HANDLE_MISMATCH");
+            return current;
+        };
+        bridge.assertActive();
+        // A submission ACK alone can precede the first working report. Require
+        // Herdr's post-submission lifecycle change before arming settled waits;
+        // include fast terminal turns without relaxing identity or retry rules.
+        const prompted = await cli.exec(["agent", "prompt", paneId, options.prompt!,
+            "--wait", "--until", "working", "--until", "done", "--until", "idle", "--until", "blocked", "--timeout", "5000"], { timeoutMs: 6000 });
+        // A timeout/stall is ambiguous. No Enter recovery and no second prompt.
+        if (!prompted.ok) throw new Error("BRIDGE_PROMPT_AMBIGUOUS");
+        const detach = () => { detached = true; for (const waiter of waiters) waiter.kill(); };
+        void (async () => {
+            try {
+                const settled = await new Promise<AgentSettledState>((resolve, reject) => {
+                    let failed = 0;
+                    for (const state of ["done", "idle", "blocked"] as const) {
+                        const waiter = cli.spawnWaiter(["agent", "wait", paneId, "--until", state, "--timeout", String(WAIT_FOREVER_MS)]);
+                        waiters.push(waiter);
+                        void waiter.promise.then(result => {
+                            if (detached) return;
+                            if (result.ok) resolve(state);
+                            else if (++failed === 3) reject(new Error("BRIDGE_OBSERVATION_AMBIGUOUS"));
+                        });
+                    }
+                });
+                if (detached || cancelled) return;
+                const current = await checkIdentity();
+                if (current.seq <= acquired.seq || current.occupant.status !== settled) throw new Error("BRIDGE_STALE_SETTLEMENT");
+                const output = await readPane(paneId);
+                if (detached || cancelled) return;
+                const close = bridge.settled(settled, output, current.seq);
+                if (close && options.closeOnSettle) {
+                    const confirmed = await checkIdentity();
+                    if (confirmed.seq !== current.seq || confirmed.occupant.status !== current.occupant.status) throw new Error("BRIDGE_CLOSE_IDENTITY_CHANGED");
+                    await cli.exec(["pane", "close", paneId]);
+                    panes.forgetTarget(paneId);
+                }
+                // Canonical validation decides whether closing is permitted.
+                detach();
+            } catch { if (!detached) { detach(); bridge.recoveryRequired(); } }
+        })();
+        controller.record.paneId = paneId;
+        controller.record.agentName = name;
+        return {
+            paneId, agentName: name, detach,
+            stop() { throw new Error("BRIDGE_ADMITTED_CANCEL_REQUIRED"); },
+            async interrupt() {
+                await checkIdentity();
+                bridge.assertActive();
+                cancelled = true;
+                const escaped = await cli.exec(["pane", "send-keys", paneId, "esc"]);
+                detach();
+                if (!escaped.ok) throw new Error("BRIDGE_CANCEL_AMBIGUOUS");
+                // Escape has no process-exit or terminal-cancel acknowledgement.
+            },
+            readLive: async lines => { await checkIdentity(); return readPane(paneId, lines); },
+        };
+    }
+
 	return (options, controller) =>
 		options.kind === "agent"
-			? startAgentRun(options, controller)
+			? options.runtimeExecution ? startRuntimeAgentRun(options, controller) : startAgentRun(options, controller)
 			: startCommandRun(options, controller);
 }

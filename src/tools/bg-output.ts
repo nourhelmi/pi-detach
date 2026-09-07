@@ -4,6 +4,8 @@ import { Type } from "typebox";
 import { formatDuration, outcomeLabel } from "../format.ts";
 import type { Registry } from "../registry.ts";
 
+import { bridgeEnabled, bridgeOutput } from "../runtime-bridge.ts";
+
 interface Details {
 	runId: string;
 	status: string;
@@ -32,8 +34,9 @@ export function registerBgOutputTool(pi: ExtensionAPI, registry: Registry): void
 		}),
 		executionMode: "parallel",
 
-		async execute(_toolCallId, params): Promise<AgentToolResult<Details>> {
-			const record = registry.get(params.runId);
+		async execute(_toolCallId, params, _signal, _update, ctx): Promise<AgentToolResult<Details>> {
+			if (bridgeEnabled() && !registry.get(params.runId)) return bridgeOutput(ctx, params.runId, params);
+            const record = registry.get(params.runId);
 			if (!record) {
 				return {
 					content: [{ type: "text", text: `No run with id ${params.runId}.` }],

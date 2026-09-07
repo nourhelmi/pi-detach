@@ -3,9 +3,12 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import type { Registry } from "../registry.ts";
 
+import { bridgeEnabled, bridgeStop } from "../runtime-bridge.ts";
+
 interface Details {
 	runId: string;
 	stopped: boolean;
+    status?: string;
 }
 
 export function registerBgStopTool(pi: ExtensionAPI, registry: Registry): void {
@@ -21,8 +24,9 @@ export function registerBgStopTool(pi: ExtensionAPI, registry: Registry): void {
 		}),
 		executionMode: "parallel",
 
-		async execute(_toolCallId, params): Promise<AgentToolResult<Details>> {
-			const record = registry.stop(params.runId);
+		async execute(_toolCallId, params, _signal, _update, ctx): Promise<AgentToolResult<Details>> {
+			if (bridgeEnabled() && (!registry.get(params.runId) || registry.get(params.runId)?.kind === "agent")) return bridgeStop(ctx, _toolCallId, params.runId);
+            const record = registry.stop(params.runId);
 			if (!record) {
 				return {
 					content: [{ type: "text", text: `No run with id ${params.runId}.` }],
@@ -47,7 +51,8 @@ export function registerBgStopTool(pi: ExtensionAPI, registry: Registry): void {
 
 		renderResult(result) {
 			const details = result.details as Details | undefined;
-			return new Text(details?.stopped ? `stopped ${details.runId}` : "not found", 0, 0);
+			if (details?.status === "cancel-pending") return new Text("cancel pending; exit unconfirmed", 0, 0);
+            return new Text(details?.stopped ? `stopped ${details.runId}` : "not found", 0, 0);
 		},
 	});
 }

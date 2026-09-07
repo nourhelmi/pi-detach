@@ -5,6 +5,8 @@ import { formatDuration } from "../format.ts";
 import type { Registry } from "../registry.ts";
 import type { RunSummary } from "../types.ts";
 
+import { bridgeEnabled, bridgeList } from "../runtime-bridge.ts";
+
 interface Details {
 	runs: RunSummary[];
 }
@@ -20,8 +22,17 @@ export function registerBgListTool(pi: ExtensionAPI, registry: Registry): void {
 		parameters: Type.Object({}),
 		executionMode: "parallel",
 
-		async execute(): Promise<AgentToolResult<Details>> {
+		async execute(_id, _params, _signal, _update, ctx): Promise<AgentToolResult<Details>> {
 			const runs = registry.list();
+            if (bridgeEnabled()) {
+                const bridged = await bridgeList(ctx);
+                const runtimeRuns: RunSummary[] = bridged.map(({ runId, node }) => ({
+                    id: runId, kind: "agent", backend: "herdr", label: `${node?.packet.execution.label ?? runId} (${node?.runtimeState === "recovery-required" ? "recovery-required" : node?.snapshot.cancel ? "cancel-pending" : node?.status ?? "binding incomplete"})`,
+                    command: "runtime agent", cwd: ctx.cwd, status: node?.snapshot.state === "terminal" ? "exited" : "running", agentName: runId, startedAt: 0, durationMs: 0,
+                }));
+                const all = [...runs, ...runtimeRuns];
+                return { content: [{ type: "text", text: JSON.stringify(all) }], details: { runs: all } };
+            }
 			const text =
 				runs.length === 0
 					? "No background runs."
