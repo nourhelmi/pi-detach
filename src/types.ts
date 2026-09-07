@@ -57,6 +57,7 @@ export interface RuntimeExecutionHooks {
  recordHandle(handle: { id: string; session: string }): void;
  expectedHandle?: { id: string; session?: string };
  expectedGeneration?: number;
+ childrenSettled?(): Promise<boolean>;
  settled(state: AgentSettledState, output: string, generation: number): boolean;
  recoveryRequired(): void;
  environment: Record<string, string>;

@@ -21,7 +21,7 @@ import {
 	type ThinkingLevel,
 	type WorkerHarness,
 } from "../agent-profiles.ts";
-import { bridgeEnabled, bridgeAgent } from "../runtime-bridge.ts";
+import { bridgeEnabled, bridgeAgent, assertBackend } from "../runtime-bridge.ts";
 import { formatDuration } from "../format.ts";
 import type { Registry } from "../registry.ts";
 import type { RunRecord } from "../types.ts";
@@ -482,7 +482,8 @@ export function registerBgAgentTool(pi: ExtensionAPI, registry: Registry): void 
 
 		async execute(...args) {
 			const [toolCallId, params, signal, , ctx] = args;
-            if (process.env.ADVISOR_RUNTIME_CANONICAL_OWNER === "1") throw new Error("BRIDGE_NESTED_AGENT_FORBIDDEN");
+            assertBackend(ctx);
+            if (process.env.ADVISOR_RUNTIME_CANONICAL_OWNER === "1" && !process.env.ADVISOR_BRIDGE_CHILD_STATE) throw new Error("BRIDGE_NESTED_AGENT_FORBIDDEN");
             if (bridgeEnabled()) {
                 const harness = params.name ? undefined : workerHarness(params);
                 return bridgeAgent(ctx, toolCallId, { ...params, ...(harness ? { harness } : {}) }, signal);

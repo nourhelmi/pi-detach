@@ -400,21 +400,48 @@ herdr session stop pidetachtest && herdr session delete pidetachtest
 
 MIT
 
-## Optional shared advisor runtime bridge
+## Shared advisor runtime bridge
 
-Matching bridge revisions can route the **existing** bg_agent/bg_stop handlers to
-an externally hosted shared runtime. Set `PI_DETACH_RUNTIME_BRIDGE` to the Meta
+For trusted manual embedding, matching revisions can route the existing
+bg_agent/bg_stop handlers to an externally hosted shared runtime. Set `PI_DETACH_RUNTIME_BRIDGE` to the Meta
 package's absolute `scripts/advisor-runtime/pi-detach-client.mjs` path and
 `ADVISOR_RUNTIME_DESCRIPTOR` to its private descriptor before Pi loads. The
 service uses this package's exported `pi-detach/execution-port` (TypeScript; load
 with tsx), so normal Pi/Herdr remains the visible worker interface. Setup and
 boundaries are in the matching Meta package's `docs/pi-detach-runtime-bridge.md`.
 
-Default mode and input schemas are unchanged. Bridge mode fails closed on an
+Public input schemas are unchanged. Bridge mode fails closed on an
 unavailable/incompatible connection. It issues durable `pib-…` IDs usable with
 list/output/stop; an owned artifact BLOCKED reply uses that ID as `name`.
-Credential replies, busy steer, terminal resume, arbitrary names, explicit agent
+Credential replies, busy steer, arbitrary names, explicit agent
 commands and custom result paths are unsupported. keepAlive retains a successful
-pane for inspection. Escape returns cancel-pending, never confirmed process exit.
+pane for inspection or a bounded follow-up. Escape returns cancel-pending, never confirmed process exit.
 The shared service owns completion observation and delivery across Pi reloads;
 service crash recovery never blindly relaunches an ambiguous execution.
+
+### Managed Meta runtime backend
+
+A matching managed Pi Meta Harness install automatically selects the shared
+runtime at ordinary Pi session startup inside Herdr. No bridge environment or
+manual service command is required. Pi remains the root and owns these tools;
+SQLite/admission/results/delivery live in the existing separate non-LLM service.
+The Pi client supports Node22; the configured service executable requires
+Node24.18+. Missing prerequisites fail visibly without legacy fallback.
+
+Use `/bg_backend` for diagnostics. `/reload` reconnects to the same service and
+pending deliveries without relaunching. Issued `pib-…` identities support artifact
+BLOCKED replies and bounded follow-up tasks after PASS/FAIL when the original
+worker used `keepAlive:true`; omit settings on follow-up. Busy steering, arbitrary
+pane-name takeover, terminal dialogs, custom commands/results and crash adoption
+are unsupported. Output remains available while a worker runs.
+
+Managed workspace grants cover the owning repository and registered Git worktrees
+at startup. Exact scopes enroll on demand, with a finite 256-launch service limit;
+identities are never recycled. Granted foremen use separate child services, and
+parent settlement waits for child completion plus a fresh parent turn.
+
+`/bg_runtime_close` refuses active, uncertain or unacknowledged work; it never
+synthesizes cancellation. Use a new root to upgrade from legacy or change backend.
+Standalone installations remain supported. `PI_DETACH_BACKEND=legacy` is an explicit
+escape for a new root. See Meta's `docs/pi-detach-runtime-bridge.md` for installation,
+Node selection, reload/recovery boundaries and the parent-owned live proof recipe.

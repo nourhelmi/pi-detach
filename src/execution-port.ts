@@ -1,4 +1,6 @@
 /** Service-owned execution port. Public tool arguments never supply these hooks. */
+import { createHash } from "node:crypto";
+import { resolve } from "node:path";
 import { Value } from "typebox/value";
 import { BgAgentParameters, agentLabel, prepareLaunch, type BgAgentParams } from "./tools/bg-agent.ts";
 import { createHerdrDriver, type HerdrDriverDeps } from "./herdr/driver.ts";
@@ -55,7 +57,7 @@ export function createAgentExecutionPort(deps: HerdrDriverDeps): AgentExecutionP
     maxTurns: launch.maxTurns ?? params.maxTurns ?? null,
     requiredSkills: params.requiredSkills ?? [], harness: launch.runtime.split("/").pop() === "pi" ? "pi" : "native",
     keepAlive: params.keepAlive ?? false, label, resultDiscovery: launch.resultDiscovery ?? null,
-    resultPolicy: "runtime-capture", sourceDirectory, environment: executionEnvironment(sourceDirectory),
+    resultPolicy: "runtime-capture", sourceDirectory, environment: { ...executionEnvironment(sourceDirectory), ADVISOR_BRIDGE_CHILD_STATE: launch.command.split(" ").includes("--advisor-worker-allow-subagents") && !process.env.ADVISOR_BRIDGE_CHILD_STATE ? resolve(sourceDirectory, "../../../..", "children", createHash("sha256").update(sourceDirectory.split("/").at(-3)!).digest("hex").slice(0, 20)) : "" },
    };
   },
   async launch({ id, cwd, intent, hooks, reply }) {

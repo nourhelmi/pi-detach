@@ -25,10 +25,15 @@ export function registerBgListTool(pi: ExtensionAPI, registry: Registry): void {
 		async execute(_id, _params, _signal, _update, ctx): Promise<AgentToolResult<Details>> {
 			const runs = registry.list();
             if (bridgeEnabled()) {
-                const bridged = await bridgeList(ctx);
+                let bridged: Awaited<ReturnType<typeof bridgeList>>;
+                try { bridged = await bridgeList(ctx); }
+                catch (error) {
+                    const reason = error instanceof Error ? error.message : "unknown failure";
+                    return { content: [{ type: "text", text: `${JSON.stringify(runs)}\nRuntime agents unavailable: ${reason}; no legacy fallback.` }], details: { runs } };
+                }
                 const runtimeRuns: RunSummary[] = bridged.map(({ runId, node }) => ({
                     id: runId, kind: "agent", backend: "herdr", label: `${node?.packet.execution.label ?? runId} (${node?.runtimeState === "recovery-required" ? "recovery-required" : node?.snapshot.cancel ? "cancel-pending" : node?.status ?? "binding incomplete"})`,
-                    command: "runtime agent", cwd: ctx.cwd, status: node?.snapshot.state === "terminal" ? "exited" : "running", agentName: runId, startedAt: 0, durationMs: 0,
+                    command: "runtime agent", cwd: node?.packet.cwd ?? ctx.cwd, status: node?.snapshot.state === "terminal" ? "exited" : "running", agentName: runId, startedAt: 0, durationMs: 0,
                 }));
                 const all = [...runs, ...runtimeRuns];
                 return { content: [{ type: "text", text: JSON.stringify(all) }], details: { runs: all } };

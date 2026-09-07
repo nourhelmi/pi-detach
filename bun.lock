@@ -5,11 +5,11 @@
     "": {
       "name": "pi-detach",
       "dependencies": {
+        "tsx": "^4.22.3",
         "typebox": "^1.0.0",
       },
       "devDependencies": {
         "@types/node": "^22.0.0",
-        "tsx": "^4.22.3",
         "typescript": "^5.6.0",
       },
       "peerDependencies": {

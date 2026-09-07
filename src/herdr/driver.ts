@@ -1397,7 +1397,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
         const detach = () => { detached = true; for (const waiter of waiters) waiter.kill(); };
         void (async () => {
             try {
-                const settled = await new Promise<AgentSettledState>((resolve, reject) => {
+                let settled = await new Promise<AgentSettledState>((resolve, reject) => {
                     let failed = 0;
                     for (const state of ["done", "idle", "blocked"] as const) {
                         const waiter = cli.spawnWaiter(["agent", "wait", paneId, "--until", state, "--timeout", String(WAIT_FOREVER_MS)]);
@@ -1410,7 +1410,19 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
                     }
                 });
                 if (detached || cancelled) return;
-                const current = await checkIdentity();
+                let current = await checkIdentity();
+                // Once child work was live or indeterminate, the parent's old
+                // artifact/turn is insufficient even after the child finishes.
+                // Wait for its delivery-driven fresh turn as well as child quiescence.
+                if (bridge.childrenSettled && !await bridge.childrenSettled()) {
+                    const heldSequence = current.seq;
+                    do {
+                        if (detached || cancelled) return;
+                        await new Promise(resolve => setTimeout(resolve, 250));
+                        current = await checkIdentity();
+                    } while (!await bridge.childrenSettled() || current.seq <= heldSequence || !["done", "idle", "blocked"].includes(current.occupant.status));
+                    settled = current.occupant.status as AgentSettledState;
+                }
                 if (current.seq <= acquired.seq || current.occupant.status !== settled) throw new Error("BRIDGE_STALE_SETTLEMENT");
                 const output = await readPane(paneId);
                 if (detached || cancelled) return;
