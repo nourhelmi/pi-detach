@@ -94,6 +94,7 @@ function createFakeCli(): {
 		{ prefix: "pane run", handler: () => ok(undefined) },
 		{ prefix: "agent prompt", handler: () => ok({ result: { type: "agent_prompted" } }) },
 		{ prefix: "pane send-keys", handler: () => ok({ result: { type: "ok" } }) },
+		{ prefix: "pane send-text", handler: () => ok({ result: { type: "ok" } }) },
 		{ prefix: "pane read", handler: () => ok(undefined, "") },
 		{ prefix: "pane close", handler: () => ok({ result: { type: "ok" } }) },
 		{ prefix: "notification show", handler: () => ok({ result: { shown: false } }) },
@@ -2750,6 +2751,56 @@ test("failed Pi result discovery preserves ordinary settlement and logs one note
 	fake.waiters.find((waiter) => waiter.args.includes("done"))?.resolveWith(ok({}));
 	assert.equal((await completion).agentState, "done");
 	assert.equal(registry.tail(record.id, 20).match(/could not discover/g)?.length, 1);
+});
+
+test("a reply to a result-blocked Pi worker is typed into the pane when Herdr refuses the prompt", async () => {
+	const artifactDir = mkdtempSync(join(tmpdir(), "pi-detach-blocked-reply-"));
+	const artifactPath = join(artifactDir, "result.md");
+	await writeFile(artifactPath, resultArtifact("BLOCKED"));
+	try {
+		const fake = createFakeCli();
+		let status = "idle";
+		fake.respond("agent get", () => agentGet("w1:p7", "reviewer-abc", status, 1));
+		const registry = herdrRegistry(fake);
+		const first = await registry.start({
+			kind: "agent", command: "pi", cwd, prompt: "First.", reuseName: "reviewer-abc",
+			requiredArtifactPath: artifactPath,
+		});
+		fake.waiters.find((waiter) => waiter.args.includes("working"))?.resolveWith(ok({}));
+		await waitUntil(() => fake.waiters.some((waiter) => waiter.args.includes("blocked")));
+		fake.waiters.find((waiter) => waiter.args.includes("blocked"))?.resolveWith(ok({ result: { agent: { agent_status: "blocked" } } }));
+		const blocked = await first.completion;
+		assert.equal(blocked.agentState, "blocked");
+		assert.equal(blocked.resultStatus, "BLOCKED");
+
+		status = "blocked";
+		fake.respond("agent prompt", () => failed("agent_blocked", "agent reviewer-abc is blocked and requires interactive input"));
+		await writeFile(artifactPath, resultArtifact("PASS"));
+		const second = await registry.start({
+			kind: "agent", command: "pi", cwd, prompt: "Authorized:\nadd the ids.", reuseName: "reviewer-abc",
+			replyToResultBlock: true,
+		});
+		assert.deepEqual(
+			fake.execCalls.filter((args) => args[0] === "pane" && (args[1] === "send-text" || args[1] === "send-keys")).slice(-2),
+			[["pane", "send-text", "w1:p7", "Authorized: add the ids."], ["pane", "send-keys", "w1:p7", "enter"]],
+		);
+		status = "working";
+		fake.waiters.filter((waiter) => waiter.args.includes("working")).at(-1)?.resolveWith(ok({}));
+		await waitUntil(() => fake.waiters.some((waiter) => waiter.args.includes("done")));
+		status = "done";
+		fake.waiters.filter((waiter) => waiter.args.includes("done")).at(-1)?.resolveWith(ok({}));
+		assert.equal((await second.completion).resultStatus, "PASS");
+
+		status = "blocked";
+		await assert.rejects(
+			registry.start({ kind: "agent", command: "pi", cwd, prompt: "Plain.", reuseName: "reviewer-abc" }),
+			/is blocked and requires interactive input/,
+			"without the flag a refused prompt still fails instead of being typed into the pane",
+		);
+		assert.equal(fake.execCalls.filter((args) => args[0] === "pane" && args[1] === "send-text").length, 1);
+	} finally {
+		await rm(artifactDir, { force: true, recursive: true });
+	}
 });
 
 test("name reuse inherits the latest run result path", async () => {

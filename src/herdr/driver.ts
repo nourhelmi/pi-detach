@@ -1182,6 +1182,19 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 			} else {
 				promptFailureNote = "prompt submission stalled without a safe same-agent recovery";
 			}
+		} else if (
+			prompted.errorCode === "agent_blocked"
+			&& options.replyToResultBlock
+			&& isSameOccupant(beforePrompt, paneId, name)
+		) {
+			// Herdr rejects `agent prompt` for any pane reported blocked, but a Pi worker whose
+			// result.md said BLOCKED is idle at its composer, not at a dialog. Type the reply into
+			// the pane and let the working wait below confirm that a turn started.
+			const typed = await cli.exec(["pane", "send-text", paneId, (options.prompt ?? "").replace(/\s*\n\s*/g, " ")]);
+			const entered = typed.ok ? await cli.exec(["pane", "send-keys", paneId, "enter"]) : typed;
+			if (!entered.ok) {
+				promptFailureNote = `reply to the blocked result could not be typed into the pane: ${entered.errorMessage ?? entered.stderr.trim()}`;
+			}
 		} else if (prompted.errorCode === "timeout") {
 			const currentResult = await cli.exec(["agent", "get", paneId]);
 			const current = currentResult.ok ? occupantFrom(currentResult.json) : undefined;

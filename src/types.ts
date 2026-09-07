@@ -63,6 +63,11 @@ export interface StartOptions {
 	prompt?: string;
 	/** Agent runs: reuse this live herdr agent instead of starting a new one. */
 	reuseName?: string;
+	/**
+	 * Agent runs: the reused agent settled blocked only because its result artifact said BLOCKED,
+	 * so it is idle at its composer; deliver the prompt through the pane when Herdr refuses `agent prompt`.
+	 */
+	replyToResultBlock?: boolean;
 	/** Agent runs: close the dedicated pane after a successful done/idle settlement. */
 	closeOnSettle?: boolean;
 	/** Agent runs: require this durable result artifact before treating done/idle as success. */

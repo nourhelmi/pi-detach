@@ -42,6 +42,15 @@ export function agentTombstoneNote(registry: Registry, name: string): string | u
 	);
 }
 
+/**
+ * True when the latest run of this agent settled blocked because its result artifact said BLOCKED:
+ * the Pi worker is idle at its composer, and Herdr still refuses `agent prompt` for the blocked pane.
+ */
+export function resultBlockedReply(registry: Registry, name: string): boolean {
+	const past = registry.list().find((run) => run.kind === "agent" && run.agentName === name);
+	return past?.agentState === "blocked" && /^blocked\b/i.test(past.resultStatus ?? "");
+}
+
 const DEFAULT_PROMOTE_AFTER_MS = 30_000;
 const INLINE_TAIL_LINES = 120;
 
@@ -396,6 +405,7 @@ async function executeAgent(options: ExecuteAgentOptions): Promise<AgentToolResu
 			label,
 			prompt: launch.prompt,
 			...(params.name ? { reuseName: params.name } : {}),
+			...(params.name && resultBlockedReply(registry, params.name) ? { replyToResultBlock: true } : {}),
 			closeOnSettle: !params.keepAlive,
 			...(launch.resultPath ? { requiredArtifactPath: launch.resultPath } : {}),
 			...(launch.resultDiscovery ? { resultDiscovery: launch.resultDiscovery } : {}),
