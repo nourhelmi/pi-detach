@@ -399,3 +399,22 @@ herdr session stop pidetachtest && herdr session delete pidetachtest
 ## License
 
 MIT
+
+## Optional shared advisor runtime bridge
+
+Matching bridge revisions can route the **existing** bg_agent/bg_stop handlers to
+an externally hosted shared runtime. Set `PI_DETACH_RUNTIME_BRIDGE` to the Meta
+package's absolute `scripts/advisor-runtime/pi-detach-client.mjs` path and
+`ADVISOR_RUNTIME_DESCRIPTOR` to its private descriptor before Pi loads. The
+service uses this package's exported `pi-detach/execution-port` (TypeScript; load
+with tsx), so normal Pi/Herdr remains the visible worker interface. Setup and
+boundaries are in the matching Meta package's `docs/pi-detach-runtime-bridge.md`.
+
+Default mode and input schemas are unchanged. Bridge mode fails closed on an
+unavailable/incompatible connection. It issues durable `pib-…` IDs usable with
+list/output/stop; an owned artifact BLOCKED reply uses that ID as `name`.
+Credential replies, busy steer, terminal resume, arbitrary names, explicit agent
+commands and custom result paths are unsupported. keepAlive retains a successful
+pane for inspection. Escape returns cancel-pending, never confirmed process exit.
+The shared service owns completion observation and delivery across Pi reloads;
+service crash recovery never blindly relaunches an ambiguous execution.

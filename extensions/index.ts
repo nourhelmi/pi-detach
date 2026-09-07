@@ -37,6 +37,8 @@ import { registerBgRunTool } from "../src/tools/bg-run.ts";
 import { registerBgStopTool } from "../src/tools/bg-stop.ts";
 import { registerBgWatchTool } from "../src/tools/bg-watch.ts";
 
+import { bridgeEnabled, registerBridgeDelivery } from "../src/runtime-bridge.ts";
+
 const CLEANUP_KEY = "__piDetachCleanup";
 
 export default function registerDetachExtension(pi: ExtensionAPI): void {
@@ -52,7 +54,7 @@ export default function registerDetachExtension(pi: ExtensionAPI): void {
 
 	const herdrCtx = detectHerdrContext();
 	const herdrCli = herdrCtx ? createHerdrCli() : undefined;
-	const ledger = herdrCtx
+	const ledger = herdrCtx && !bridgeEnabled()
 		? createSessionLedger({
 				ledgerDir: DEFAULT_LEDGER_DIR,
 				sessionId: resolveOwningSessionId(),
@@ -72,16 +74,16 @@ export default function registerDetachExtension(pi: ExtensionAPI): void {
 			: undefined;
 	let herdrDriver: ReturnType<typeof createHerdrDriver> | undefined;
 	let viewer: ReturnType<typeof createViewerManager> | undefined;
-	if (herdrCtx && herdrCli && ledger && reapOrphans) {
+	if (herdrCtx && herdrCli) {
 		const panes = createPaneManager(herdrCli, herdrCtx);
 		// Activation sweep: other sessions' dead owners + our leftover closeOnSettle.
-		void reapOrphans();
+		void reapOrphans?.();
 		herdrDriver = createHerdrDriver({
 			cli: herdrCli,
 			ctx: herdrCtx,
 			panes,
-			ledger,
-			reapOrphans,
+			...(ledger ? { ledger } : {}),
+			...(reapOrphans ? { reapOrphans } : {}),
 		});
 		viewer = createViewerManager(herdrCli, panes);
 	}
@@ -108,6 +110,7 @@ export default function registerDetachExtension(pi: ExtensionAPI): void {
 	registerBgOutputTool(pi, registry);
 	registerBgListTool(pi, registry);
 	registerBgStopTool(pi, registry);
+    registerBridgeDelivery(pi);
 
 	const track = (_event: unknown, ctx: ExtensionContext): void => {
 		currentCtx = ctx;

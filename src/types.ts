@@ -51,7 +51,19 @@ export interface RunRecord {
 	quiet?: boolean | undefined;
 }
 
+/** Trusted service-only hooks. Never populated from public tool parameters. */
+export interface RuntimeExecutionHooks {
+ assertActive(): void;
+ recordHandle(handle: { id: string; session: string }): void;
+ expectedHandle?: { id: string; session?: string };
+ expectedGeneration?: number;
+ settled(state: AgentSettledState, output: string, generation: number): boolean;
+ recoveryRequired(): void;
+ environment: Record<string, string>;
+}
+
 export interface StartOptions {
+ runtimeExecution?: RuntimeExecutionHooks;
 	kind: RunKind;
 	command: string;
 	cwd: string;
@@ -135,6 +147,7 @@ export interface DriverHandle {
 	agentName?: string | undefined;
 	/** Ask the run to stop (SIGTERM / ctrl+c / esc). Must eventually lead to finish(). */
 	stop(): void;
+ interrupt?: () => Promise<void>;
 	/** Abandon supervision without touching the process; used on session shutdown for herdr runs. */
 	detach?: () => void;
 	/** Live read for runs whose output is not streamed into the registry (herdr panes). */

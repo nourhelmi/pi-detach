@@ -54,6 +54,7 @@ export interface PaneManager {
 		cwd: string,
 		preferredStack: readonly string[],
 		environment?: Readonly<Record<string, string>>,
+        beforeSplit?: () => void,
 	): Promise<string>;
 	/** Drop a pane from the shared surviving-target view (agent close/fail). */
 	forgetTarget(paneId: string): void;
@@ -113,6 +114,7 @@ async function execSplit(
 	direction: "right" | "down",
 	cwd: string,
 	environment: Readonly<Record<string, string>> = {},
+    beforeSplit?: () => void,
 ): Promise<{ ok: true; paneId: string } | { ok: false; errorMessage: string }> {
 	const args = [
 		"pane",
@@ -127,7 +129,8 @@ async function execSplit(
 		args.push("--env", `${key}=${value}`);
 	}
 	args.push("--no-focus");
-	const result = await cli.exec(args);
+	beforeSplit?.();
+    const result = await cli.exec(args);
 	if (!result.ok) {
 		return { ok: false, errorMessage: result.errorMessage ?? (result.stderr.trim() || "pane split refused") };
 	}
@@ -153,6 +156,7 @@ export async function splitStackFirst(
 		callerPaneId: string;
 		liveCallerSplits: number;
 		environment?: Readonly<Record<string, string>>;
+        beforeSplit?: () => void;
 	},
 ): Promise<SplitStackFirstResult> {
 	let lastError = "pane split refused";
@@ -160,13 +164,13 @@ export async function splitStackFirst(
 
 	for (const target of stackTargets) {
 		const direction = await splitDirectionFor(cli, target);
-		const attempt = await execSplit(cli, target, direction, cwd, params.environment);
+		const attempt = await execSplit(cli, target, direction, cwd, params.environment, params.beforeSplit);
 		if (attempt.ok) return { ok: true, paneId: attempt.paneId, consumedCallerSplit: false };
 		lastError = attempt.errorMessage;
 	}
 
 	const direction = await callerSplitDirection(cli, params.callerPaneId, params.liveCallerSplits);
-	const attempt = await execSplit(cli, params.callerPaneId, direction, cwd, params.environment);
+	const attempt = await execSplit(cli, params.callerPaneId, direction, cwd, params.environment, params.beforeSplit);
 	if (attempt.ok) return { ok: true, paneId: attempt.paneId, consumedCallerSplit: true };
 	return { ok: false, errorMessage: attempt.errorMessage || lastError };
 }
@@ -223,12 +227,14 @@ function createCallerSplitCoordinator(cli: HerdrCli, ctx: HerdrContext) {
 		cwd: string,
 		preferredStack: readonly string[],
 		environment?: Readonly<Record<string, string>>,
+        beforeSplit?: () => void,
 	): Promise<string> {
 		const outcome = await splitStackFirst(cli, cwd, {
 			stackTargets: stackTargetsFor(preferredStack, surviving, callerPaneId),
 			callerPaneId,
 			liveCallerSplits: callerChildren.size,
 			...(environment ? { environment } : {}),
+            ...(beforeSplit ? { beforeSplit } : {}),
 		});
 		if (!outcome.ok) {
 			throw new Error(`herdr pane split failed: ${outcome.errorMessage}`);
@@ -247,7 +253,8 @@ function createCallerSplitCoordinator(cli: HerdrCli, ctx: HerdrContext) {
 			cwd: string,
 			preferredStack: readonly string[],
 			environment?: Readonly<Record<string, string>>,
-		) => exclusive(() => splitUnlocked(cwd, preferredStack, environment)),
+        beforeSplit?: () => void,
+		) => exclusive(() => splitUnlocked(cwd, preferredStack, environment, beforeSplit)),
 	};
 }
 
@@ -305,8 +312,8 @@ export function createPaneManager(cli: HerdrCli, ctx: HerdrContext): PaneManager
 			});
 		},
 
-		splitOff(cwd, preferredStack, environment) {
-			return coordinator.split(cwd, preferredStack, environment);
+		splitOff(cwd, preferredStack, environment, beforeSplit) {
+			return coordinator.split(cwd, preferredStack, environment, beforeSplit);
 		},
 
 		forgetTarget(paneId) {

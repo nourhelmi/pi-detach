@@ -21,6 +21,7 @@ import {
 	type ThinkingLevel,
 	type WorkerHarness,
 } from "../agent-profiles.ts";
+import { bridgeEnabled, bridgeAgent } from "../runtime-bridge.ts";
 import { formatDuration } from "../format.ts";
 import type { Registry } from "../registry.ts";
 import type { RunRecord } from "../types.ts";
@@ -54,7 +55,7 @@ export function resultBlockedReply(registry: Registry, name: string): boolean {
 const DEFAULT_PROMOTE_AFTER_MS = 30_000;
 const INLINE_TAIL_LINES = 120;
 
-const BgAgentParameters = Type.Object({
+export const BgAgentParameters = Type.Object({
 	prompt: Type.String({
 		description: "Task for the helper agent. Self-contained; it shares no context with you.",
 	}),
@@ -148,7 +149,7 @@ const BgAgentParameters = Type.Object({
 	),
 });
 
-type BgAgentParams = Static<typeof BgAgentParameters>;
+export type BgAgentParams = Static<typeof BgAgentParameters>;
 
 interface Details {
 	runId: string;
@@ -265,7 +266,7 @@ export function workerHarness(params: BgAgentParams): WorkerHarness | undefined 
 	return requested ?? configured;
 }
 
-async function prepareLaunch(params: BgAgentParams, label: string): Promise<ResolvedAgentLaunch> {
+export async function prepareLaunch(params: BgAgentParams, label: string): Promise<ResolvedAgentLaunch> {
 	if (params.name) {
 		return { command: params.agent ?? "pi", prompt: params.prompt, runtime: "existing" };
 	}
@@ -480,7 +481,12 @@ export function registerBgAgentTool(pi: ExtensionAPI, registry: Registry): void 
 		executionMode: "parallel",
 
 		async execute(...args) {
-			const [, params, signal, , ctx] = args;
+			const [toolCallId, params, signal, , ctx] = args;
+            if (process.env.ADVISOR_RUNTIME_CANONICAL_OWNER === "1") throw new Error("BRIDGE_NESTED_AGENT_FORBIDDEN");
+            if (bridgeEnabled()) {
+                const harness = params.name ? undefined : workerHarness(params);
+                return bridgeAgent(ctx, toolCallId, { ...params, ...(harness ? { harness } : {}) }, signal);
+            }
 			return executeAgent({ registry, params, signal, ctx });
 		},
 
