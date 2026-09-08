@@ -376,6 +376,8 @@ function discoveredRunDir(content: string, customType: string): string | undefin
 
 export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
 	const { cli, panes, ledger, reapOrphans } = deps;
+    // Runtime lifetime only: a restarted service must not adopt old terminals.
+    const codexSessions = new Map<string, { provider: string | undefined }>();
 	const runtimeEnv = deps.env ?? process.env;
 	const toasts = toastsEnabled(runtimeEnv);
 	const agentPaneEnvironment = Object.fromEntries(
@@ -1363,6 +1365,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
         bridge.assertActive();
         const prior = bridge.expectedHandle ? JSON.parse(bridge.expectedHandle.id) as [string, string, string, number] : undefined;
         const name = prior?.[1] ?? agentName(controller.record.label, controller.record.id.slice(-12));
+        const codex = basename(tokenize(options.command)[0] ?? "") === "codex";
         const paneId = prior?.[0] ?? await startAgentPane(name, controller.record.label, options.cwd, tokenize(options.command), bridge);
         let detached = false;
         let cancelled = false;
@@ -1371,21 +1374,50 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
             bridge.assertActive();
             const got = await cli.exec(["agent", "get", paneId]);
             const occupant = got.ok ? occupantFrom(got.json) : undefined;
-            const session = runtimeAgentSession(got.json);
-            if (!occupant || occupant.paneId !== paneId || occupant.agentName !== name || !session || !Number.isSafeInteger(occupant.stateChangeSeq)) throw new Error("BRIDGE_IDENTITY_UNAVAILABLE");
-            return { occupant, session, seq: occupant.stateChangeSeq! };
+            const provider = runtimeAgentSession(got.json);
+            let session = provider;
+            if (codex) {
+                // Codex's thread hook arrives only after submission. Bind the
+                // real transport/process first; never invent a provider thread.
+                const agent = (got.json as { result?: { agent?: Record<string, unknown> } })?.result?.agent;
+                const info = await cli.exec(["pane", "process-info", "--pane", paneId]);
+                const process = (info.json as { result?: { process_info?: Record<string, unknown> } })?.result?.process_info;
+                const native = Array.isArray(process?.foreground_processes)
+                    ? process.foreground_processes.filter(p => p?.name === "codex" && p?.argv0 === "codex") : [];
+                const ids = [process?.shell_pid, process?.foreground_process_group_id, native[0]?.pid];
+                const reported = agent?.agent_session as Record<string, unknown> | undefined;
+                if (!info.ok || agent?.agent !== "codex" || typeof agent.terminal_id !== "string" || !agent.terminal_id ||
+                    process?.pane_id !== paneId || native.length !== 1 ||
+                    !ids.every(id => Number.isSafeInteger(id) && Number(id) > 0) ||
+                    (reported && (reported.agent !== "codex" || reported.kind !== "id" || reported.source !== "herdr:codex" || !provider))) {
+                    throw new Error("BRIDGE_IDENTITY_UNAVAILABLE");
+                }
+                session = JSON.stringify(["herdr-codex-process", agent.terminal_id, ...ids]);
+            }
+            if (!occupant || occupant.paneId !== paneId || occupant.agentName !== name || !session || !Number.isSafeInteger(occupant.stateChangeSeq) || occupant.stateChangeSeq! < 0) throw new Error("BRIDGE_IDENTITY_UNAVAILABLE");
+            return { occupant, session, provider, seq: occupant.stateChangeSeq! };
         };
         const acquired = await inspect();
         if (prior && (acquired.session !== prior[2] || acquired.seq < prior[3] || acquired.seq !== bridge.expectedGeneration)) throw new Error("BRIDGE_HANDLE_MISMATCH");
         // An actual UI prompt is not a typed runtime question. Do not type into it.
         if (!["idle", "done"].includes(acquired.occupant.status)) throw new Error("BRIDGE_AGENT_NOT_IDLE");
         const identity = prior ?? [paneId, name, acquired.session, acquired.seq] as [string, string, string, number];
-        bridge.recordHandle({ id: JSON.stringify(identity), session: acquired.session });
-        const checkIdentity = async () => {
+        const handleId = JSON.stringify(identity);
+        const binding = codex ? prior ? codexSessions.get(handleId) : { provider: acquired.provider } : undefined;
+        if (codex && (!binding || (prior && !binding.provider))) throw new Error("BRIDGE_HANDLE_MISMATCH");
+        bridge.recordHandle({ id: handleId, session: acquired.session });
+        if (binding) codexSessions.set(handleId, binding);
+        const checkIdentity = async (requireProvider = false) => {
             const current = await inspect();
             if (current.session !== identity[2] || current.seq < identity[3]) throw new Error("BRIDGE_HANDLE_MISMATCH");
+            if (binding) {
+                if ((binding.provider && current.provider !== binding.provider) || (requireProvider && !current.provider)) throw new Error("BRIDGE_HANDLE_MISMATCH");
+                binding.provider ??= current.provider;
+            }
             return current;
         };
+        const beforePrompt = await checkIdentity(Boolean(prior));
+        if (beforePrompt.seq !== acquired.seq || beforePrompt.occupant.status !== acquired.occupant.status || beforePrompt.provider !== acquired.provider) throw new Error("BRIDGE_HANDLE_MISMATCH");
         bridge.assertActive();
         // A submission ACK alone can precede the first working report. Require
         // Herdr's post-submission lifecycle change before arming settled waits;
@@ -1410,7 +1442,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
                     }
                 });
                 if (detached || cancelled) return;
-                let current = await checkIdentity();
+                let current = await checkIdentity(true);
                 // Once child work was live or indeterminate, the parent's old
                 // artifact/turn is insufficient even after the child finishes.
                 // Wait for its delivery-driven fresh turn as well as child quiescence.
