@@ -27,6 +27,7 @@ import type {
 	AgentSettledState,
 	DriverHandle,
 	DriverStart,
+	InterruptObserver,
 	RunController,
 	StartOptions,
 } from "../types.ts";
@@ -44,6 +45,9 @@ const AGENT_PROMPT_WAIT_TIMEOUT_MS = 20_000;
 const AGENT_PROMPT_PROCESS_TIMEOUT_MS = AGENT_PROMPT_WAIT_TIMEOUT_MS + 5_000;
 // herdr 0.8 waits require an explicit --timeout; emulate the old indefinite wait.
 const WAIT_FOREVER_MS = 7 * 24 * 60 * 60 * 1000;
+// Cancellation truth: after Escape, the same occupant must be observed settled.
+const RUNTIME_SETTLED_STATES = ["idle", "done", "blocked"];
+const CANCEL_OBSERVE_POLL_MS = 500;
 const SHELL_READY_ATTEMPTS = 120;
 const SHELL_READY_POLL_MS = 250;
 const RESULT_DISCOVERY_WINDOW_MS = 60_000;
@@ -1369,6 +1373,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
         const paneId = prior?.[0] ?? await startAgentPane(name, controller.record.label, options.cwd, tokenize(options.command), bridge);
         let detached = false;
         let cancelled = false;
+        let naturallySettled = false;
         const waiters: Waiter[] = [];
         const inspect = async () => {
             bridge.assertActive();
@@ -1458,8 +1463,11 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
                 if (current.seq <= acquired.seq || current.occupant.status !== settled) throw new Error("BRIDGE_STALE_SETTLEMENT");
                 const output = await readPane(paneId);
                 if (detached || cancelled) return;
-                const close = bridge.settled(settled, output, current.seq);
-                if (close && options.closeOnSettle) {
+                // Only canonical terminal settlement supersedes cancellation. Artifact
+                // BLOCKED is a completed UI turn, but must remain interruptible.
+                const outcome = bridge.settled(settled, output, current.seq);
+                naturallySettled = outcome.terminal;
+                if (outcome.close && options.closeOnSettle) {
                     const confirmed = await checkIdentity();
                     if (confirmed.seq !== current.seq || confirmed.occupant.status !== current.occupant.status) throw new Error("BRIDGE_CLOSE_IDENTITY_CHANGED");
                     await cli.exec(["pane", "close", paneId]);
@@ -1474,14 +1482,37 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
         return {
             paneId, agentName: name, detach,
             stop() { throw new Error("BRIDGE_ADMITTED_CANCEL_REQUIRED"); },
-            async interrupt() {
-                await checkIdentity();
-                bridge.assertActive();
+            async interrupt(observer?: InterruptObserver) {
+                // One atomic winner: a turn that already settled naturally is never
+                // re-reported as cancelled, and once cancellation begins the launch
+                // observer may no longer settle the turn.
+                if (naturallySettled) { observer?.superseded(); return; }
                 cancelled = true;
+                const before = await checkIdentity();
+                bridge.assertActive();
                 const escaped = await cli.exec(["pane", "send-keys", paneId, "esc"]);
                 detach();
                 if (!escaped.ok) throw new Error("BRIDGE_CANCEL_AMBIGUOUS");
                 // Escape has no process-exit or terminal-cancel acknowledgement.
+                if (!observer) return;
+                // Cancellation truth: report cancelled only from an observation taken
+                // after Escape that shows this same occupant settled. A previously
+                // working occupant must also show a newer generation; one already at
+                // its composer (artifact BLOCKED) confirms at its current generation.
+                const wasWorking = !RUNTIME_SETTLED_STATES.includes(before.occupant.status);
+                void (async () => {
+                    try {
+                        let current = await checkIdentity();
+                        while (!RUNTIME_SETTLED_STATES.includes(current.occupant.status) || (wasWorking && current.seq <= before.seq)) {
+                            await new Promise(resolve => setTimeout(resolve, CANCEL_OBSERVE_POLL_MS));
+                            current = await checkIdentity();
+                        }
+                        const output = await readPane(paneId);
+                        observer.settled(current.occupant.status as AgentSettledState, output, current.seq);
+                    } catch {
+                        try { observer.recoveryRequired(); } catch { /* runtime already closed */ }
+                    }
+                })();
             },
             readLive: async lines => { await checkIdentity(); return readPane(paneId, lines); },
         };

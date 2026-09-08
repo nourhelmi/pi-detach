@@ -15,8 +15,33 @@ interface RunView { runId: string; node: NodeView | null }
 const managedConfig = () => join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "pi-detach-runtime.json");
 export const bridgeEnabled = () => process.env.PI_DETACH_BACKEND !== "legacy" && (Boolean(process.env.PI_DETACH_RUNTIME_BRIDGE) || existsSync(managedConfig()));
 let activationFailure: string | undefined;
+// A reconnected service keeps the code it started with; newer installed code is reported, never hot-swapped.
+let staleRuntime = false;
+// Read-only recomputation of the installed code revision for /bg_backend; never relaunches or hot-swaps.
+let revisionProbe: (() => string) | undefined;
 const clients = new Map<string, Promise<Client>>();
-export function resetBridgeClients(): void { clients.clear(); activationFailure = undefined; }
+export function resetBridgeClients(): void { clients.clear(); activationFailure = undefined; staleRuntime = false; revisionProbe = undefined; }
+const STALE_RUNTIME_NOTICE = "The connected runtime service runs older code than the installed pi-detach/runtime files. Start a fresh Pi session to use the update; this session keeps its existing service.";
+const CLOSE_REFUSALS: Record<string, string> = {
+ SHUTDOWN_ACTIVE: "a worker is still running, blocked, or cancel-pending; wait for it to settle or inspect its pane",
+ SHUTDOWN_PENDING: "an admitted command is still executing; retry after it settles",
+ SHUTDOWN_DELIVERY: "unacknowledged deliveries remain; let this session process them (reload if delivery stopped)",
+ SHUTDOWN_BUSY: "the service is dispatching; retry in a moment",
+ SHUTDOWN_CHILD_ACTIVE: "a foreman's child service still has active or unacknowledged work; let that foreman finish first",
+ SHUTDOWN_CHILD_UNCERTAIN: "a foreman's child service is owned but unreachable; inspect it before closing",
+};
+const RECOVERY_CAUSES: Record<string, string> = {
+ "effect-unproven": "the runtime could not prove the worker received its input",
+ "adapter-protocol-or-bound": "the Herdr observation became ambiguous (identity drift, ambiguous prompt, or stale settlement)",
+ "owner-restarted": "the runtime service restarted while this worker was active",
+};
+/** Actionable text for a recovery-required delivery. Never suggests resend, adoption, or kill. */
+export function recoveryGuidance(delivery: { reason?: string }, handle: { id: string } | null | undefined): string {
+ const cause = RECOVERY_CAUSES[delivery.reason ?? ""] ?? `of ${delivery.reason ?? "an unknown reason"}`;
+ let where = "No worker pane was bound; check for an empty split pane and close it by hand.";
+ try { const [paneId, agentName] = JSON.parse(handle!.id) as [string, string]; if (paneId && agentName) where = `Worker pane ${paneId} (agent ${agentName}) may still be running, or may never have received its input.`; } catch { /* unbound */ }
+ return `Recovery required because ${cause}. ${where} Inspect that pane directly before deciding; the runtime will not resend, adopt, or kill it. This run ID accepts no further commands; launch a new worker for the task after inspection.`;
+}
 async function runtimeClient(ctx: ExtensionContext): Promise<Client> {
  if (activationFailure) throw new Error(activationFailure);
  if (process.env.PI_DETACH_RUNTIME_BRIDGE) {
@@ -38,6 +63,9 @@ async function runtimeClient(ctx: ExtensionContext): Promise<Client> {
    if (module.PI_DETACH_BOOTSTRAP_VERSION !== 1) throw new Error("PI_DETACH_BRIDGE_VERSION");
    const { detectHerdrContext } = await import("./herdr/context.ts");
    const started = await module.ensurePiDetach({ cwd: ctx.cwd, sessionId, detachPath: resolve(fileURLToPath(new URL("..", import.meta.url))), herdr: detectHerdrContext() });
+   staleRuntime = started.stale === true;
+   const detachPath = resolve(fileURLToPath(new URL("..", import.meta.url)));
+   if (typeof module.installedRevision === "function" && typeof started.identity?.host === "string") revisionProbe = () => module.installedRevision(detachPath, started.identity.host) as string;
    return started.client as Client;
   })();
   clients.set(key, pending);
@@ -50,7 +78,7 @@ async function request(ctx: ExtensionContext, action: string, payload: object): 
  return (await runtimeClient(ctx)).request(sessionId, action, payload);
 }
 function result<T extends object>(text: string, details: T): AgentToolResult<T> { return { content: [{ type: "text", text }], details }; }
-interface BridgeAgentDetails { runId: string; agentName: string; promoted: boolean; status: string; agentState: string; durationMs: number; reusable: boolean }
+interface BridgeAgentDetails { runId: string; agentName: string; promoted: boolean; status: string; agentState: string; durationMs: number; keepAlive: boolean; reusable: boolean }
 export function assertBackend(ctx: ExtensionContext): void {
  if (bridgeEnabled()) return;
  const entries = ctx.sessionManager.getEntries?.() ?? [];
@@ -58,7 +86,7 @@ export function assertBackend(ctx: ExtensionContext): void {
 }
 export async function bridgeAgent(ctx: ExtensionContext, toolCallId: string, params: BgAgentParams, signal?: AbortSignal): Promise<AgentToolResult<BridgeAgentDetails>> {
  const accepted = await request(ctx, "call", { tool: "bg_agent", toolCallId, params, cwd: ctx.cwd }) as { runId: string; status: string };
- const format = (details: BridgeAgentDetails) => result(`Runtime agent ${details.runId}: ${details.status}. Use this exact ID for bg_output/bg_stop. BLOCKED artifact replies use name: "${details.runId}". A completed keepAlive worker accepts a bounded follow-up using the same name. Busy steering is unsupported.`, details);
+ const format = (details: BridgeAgentDetails) => result(`Runtime agent ${details.runId}: ${details.status}. Use this exact ID for bg_output/bg_stop. BLOCKED artifact replies use name: "${details.runId}". A fresh task requires PASS/FAIL, original keepAlive, and no admitted cancellation or recovery. Busy steering is unsupported.`, details);
  const prior = await request(ctx, "result", { toolCallId, seal: false }) as BridgeAgentDetails | null;
  if (prior) return format(prior);
  const deadline = Date.now() + Math.max(0, params.promoteAfterMs ?? 30000);
@@ -91,12 +119,17 @@ export function registerBridgeDelivery(pi: ExtensionAPI): void {
  let generation = 0;
  pi.registerCommand?.("bg_backend", { description: "Show pi-detach backend readiness without launching a worker", async handler(_args, ctx) {
   if (!bridgeEnabled()) { ctx.ui.notify("pi-detach backend: legacy/unmanaged", "info"); return; }
-  try { const state = await request(ctx, "supervision", {}) as { settled: boolean }; ctx.ui.notify(`pi-detach backend: runtime connected; ${state.settled ? "no active worker work" : "worker work remains active or uncertain"}`, "info"); }
+  try {
+   const state = await request(ctx, "supervision", {}) as { settled: boolean; revision?: string | null };
+   // Compare the service's loaded revision against the files installed now, not the session-start snapshot.
+   const stale = revisionProbe ? state.revision !== revisionProbe() : staleRuntime;
+   ctx.ui.notify(`pi-detach backend: runtime connected; ${state.settled ? "no active worker work" : "worker work remains active or uncertain"}${stale ? `. ${STALE_RUNTIME_NOTICE}` : ""}`, stale ? "warning" : "info");
+  }
   catch (error) { ctx.ui.notify(`pi-detach backend: runtime unavailable (${error instanceof Error ? error.message : "unknown failure"}); no legacy fallback`, "error"); }
  } });
  pi.registerCommand?.("bg_runtime_close", { description: "Close only an inactive, acknowledged runtime; never cancel workers", async handler(_args, ctx) {
   try { await request(ctx, "shutdown", {}); generation += 1; ctx.ui.notify("Runtime closed safely. Use a new Pi session for subsequent work.", "info"); }
-  catch (error) { ctx.ui.notify(`Runtime close refused: ${error instanceof Error ? error.message : "unknown failure"}`, "error"); }
+  catch (error) { const code = error instanceof Error ? error.message : "unknown failure"; ctx.ui.notify(`Runtime close refused: ${code}${CLOSE_REFUSALS[code] ? ` (${CLOSE_REFUSALS[code]})` : ""}`, "error"); }
  } });
  pi.on("session_shutdown", () => { generation += 1; resetBridgeClients(); });
  pi.on("session_start", async (_event, ctx) => {
@@ -110,6 +143,7 @@ export function registerBridgeDelivery(pi: ExtensionAPI): void {
   })());
   if (legacy) activationFailure = "PI_DETACH_LEGACY_SESSION_REQUIRES_NEW_ROOT";
   try { await runtimeClient(ctx); } catch (error) { ctx.ui.notify(`pi-detach runtime unavailable: ${error instanceof Error ? error.message : "startup failed"}. bg_agent remains fenced.`, "error"); return; }
+  if (staleRuntime) ctx.ui.notify(`pi-detach runtime: ${STALE_RUNTIME_NOTICE}`, "warning");
   void (async () => {
    try {
     while (own === generation) {
@@ -121,7 +155,12 @@ export function registerBridgeDelivery(pi: ExtensionAPI): void {
       for (const delivery of deliveries) {
        if (own !== generation) return;
        if (["settled", "recovery-required"].includes(delivery.kind)) {
-        pi.sendMessage({ customType: "pi-detach-runtime", content: `${run.runId}: ${delivery.status ?? delivery.kind}. ${delivery.reason ?? ""}`, display: true, details: { runId: run.runId, deliveryId: delivery.id } }, ctx.isIdle() ? { triggerTurn: true } : { deliverAs: "steer" });
+        let content = `${run.runId}: ${delivery.status ?? delivery.kind}. ${delivery.reason ?? ""}`;
+        if (delivery.kind === "recovery-required") {
+         const node = await request(ctx, "get", { runId: run.runId }) as { handle?: { id: string } | null };
+         content = `${run.runId}: recovery-required. ${recoveryGuidance(delivery, node.handle)}`;
+        }
+        pi.sendMessage({ customType: "pi-detach-runtime", content, display: true, details: { runId: run.runId, deliveryId: delivery.id } }, ctx.isIdle() ? { triggerTurn: true } : { deliverAs: "steer" });
        }
        if (own !== generation) return;
        await request(ctx, "ack", { runId: run.runId, deliveryId: delivery.id });

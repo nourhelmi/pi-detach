@@ -440,8 +440,19 @@ at startup. Exact scopes enroll on demand, with a finite 256-launch service limi
 identities are never recycled. Granted foremen use separate child services, and
 parent settlement waits for child completion plus a fresh parent turn.
 
-`/bg_runtime_close` refuses active, uncertain or unacknowledged work; it never
-synthesizes cancellation. Use a new root to upgrade from legacy or change backend.
+`bg_stop` sends Escape once and settles `cancelled` only after Herdr shows the
+same worker settled afterwards; this includes a worker waiting on artifact BLOCKED.
+If canonical terminal settlement wins the race first, no Escape is sent and that
+result is retained. Neither case permits another task after an admitted cancel.
+The pane stays open after cancellation and process exit is never claimed.
+Tool results separate `keepAlive` intent from `reusable` eligibility at sealing.
+`/bg_runtime_close` refuses active, uncertain or unacknowledged work,
+closes reachable foreman child services by typed shutdown, and never synthesizes
+cancellation. Recovery-required notices name the bound pane and agent; inspect it,
+then launch a new worker. `/bg_backend` recomputes the installed code revision on
+every call and warns when the connected service runs older code; start a fresh Pi
+session to use an update.
+Use a new root to upgrade from legacy or change backend.
 Standalone installations remain supported. `PI_DETACH_BACKEND=legacy` is an explicit
 escape for a new root. See Meta's `docs/pi-detach-runtime-bridge.md` for installation,
 Node selection, reload/recovery boundaries and the parent-owned live proof recipe.

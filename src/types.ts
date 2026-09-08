@@ -58,7 +58,7 @@ export interface RuntimeExecutionHooks {
  expectedHandle?: { id: string; session?: string };
  expectedGeneration?: number;
  childrenSettled?(): Promise<boolean>;
- settled(state: AgentSettledState, output: string, generation: number): boolean;
+ settled(state: AgentSettledState, output: string, generation: number): { terminal: boolean; close: boolean };
  recoveryRequired(): void;
  environment: Record<string, string>;
 }
@@ -148,11 +148,20 @@ export interface DriverHandle {
 	agentName?: string | undefined;
 	/** Ask the run to stop (SIGTERM / ctrl+c / esc). Must eventually lead to finish(). */
 	stop(): void;
- interrupt?: () => Promise<void>;
+ /** Interrupt the current turn. A runtime observer, when supplied, is told how the same occupant settled afterwards. */
+ interrupt?: (observer?: InterruptObserver) => Promise<void>;
 	/** Abandon supervision without touching the process; used on session shutdown for herdr runs. */
 	detach?: () => void;
 	/** Live read for runs whose output is not streamed into the registry (herdr panes). */
 	readLive?: (lines: number) => Promise<string>;
+}
+
+/** Trusted service-only cancellation observer. Settlement after an interrupt is observed, never invented. */
+export interface InterruptObserver {
+ settled(state: AgentSettledState, output: string, generation: number): void;
+ /** The turn had already settled naturally before the interrupt began; no Escape was sent. */
+ superseded(): void;
+ recoveryRequired(): void;
 }
 
 export type DriverStart = (

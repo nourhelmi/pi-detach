@@ -46,7 +46,7 @@ function fixture() {
             environment: {}, assertActive() {},
             ...(followup ? { expectedHandle: bound!, expectedGeneration: agent.state_change_seq } : {}),
             recordHandle(handle) { if (bound) assert.deepEqual(handle, bound); bound = handle; },
-            settled() { settled++; return true; }, recoveryRequired() { recovered++; },
+            settled() { settled++; return { terminal: true, close: true }; }, recoveryRequired() { recovered++; },
         };
         const controller: RunController = {
             record: { id: "test-native-1", kind: "agent", command: "codex", cwd: "/tmp", label: "native", status: "running", backend: "herdr", startedAt: 0, promoted: false, logPath: "" },

@@ -32,7 +32,7 @@ export function registerBgListTool(pi: ExtensionAPI, registry: Registry): void {
                     return { content: [{ type: "text", text: `${JSON.stringify(runs)}\nRuntime agents unavailable: ${reason}; no legacy fallback.` }], details: { runs } };
                 }
                 const runtimeRuns: RunSummary[] = bridged.map(({ runId, node }) => ({
-                    id: runId, kind: "agent", backend: "herdr", label: `${node?.packet.execution.label ?? runId} (${node?.runtimeState === "recovery-required" ? "recovery-required" : node?.snapshot.cancel ? "cancel-pending" : node?.status ?? "binding incomplete"})`,
+                    id: runId, kind: "agent", backend: "herdr", label: `${node?.packet.execution.label ?? runId} (${node?.runtimeState === "recovery-required" ? "recovery-required" : node?.snapshot.cancel && node.snapshot.state !== "terminal" ? "cancel-pending" : node?.status ?? "binding incomplete"})`,
                     command: "runtime agent", cwd: node?.packet.cwd ?? ctx.cwd, status: node?.snapshot.state === "terminal" ? "exited" : "running", agentName: runId, startedAt: 0, durationMs: 0,
                 }));
                 const all = [...runs, ...runtimeRuns];
