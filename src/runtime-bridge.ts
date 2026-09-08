@@ -84,8 +84,22 @@ export function assertBackend(ctx: ExtensionContext): void {
  const entries = ctx.sessionManager.getEntries?.() ?? [];
  if (entries.some(entry => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "bg_agent" && String((entry.message.details as { runId?: string } | undefined)?.runId ?? "").startsWith("pib-"))) throw new Error("PI_DETACH_BACKEND_CHANGE_REQUIRES_NEW_ROOT");
 }
+const LAUNCH_CORRECTIONS: Record<string, string> = {
+ BRIDGE_CUSTOM_ARTIFACT_UNSUPPORTED: "Omit resultPath: the runtime owns and returns the result artifact path.",
+ BRIDGE_EXPLICIT_COMMAND_UNSUPPORTED: "Omit agent: select the worker using role, harness, and model instead.",
+ BRIDGE_FOLLOWUP_REQUIRES_BINDING: "Use the exact runtime run ID as name for a supported follow-up.",
+ BRIDGE_EMPTY_PROMPT: "Provide a non-empty task prompt.",
+ BRIDGE_INVALID_SKILL: "Use lowercase hyphenated skill names in requiredSkills.",
+ BRIDGE_INVALID_INPUT: "Use only the documented bg_agent fields and value types.",
+};
 export async function bridgeAgent(ctx: ExtensionContext, toolCallId: string, params: BgAgentParams, signal?: AbortSignal): Promise<AgentToolResult<BridgeAgentDetails>> {
- const accepted = await request(ctx, "call", { tool: "bg_agent", toolCallId, params, cwd: ctx.cwd }) as { runId: string; status: string };
+ let accepted: { runId: string; status: string };
+ try { accepted = await request(ctx, "call", { tool: "bg_agent", toolCallId, params, cwd: ctx.cwd }) as typeof accepted; }
+ catch (error) {
+  const correction = error instanceof Error && Object.hasOwn(LAUNCH_CORRECTIONS, error.message) ? LAUNCH_CORRECTIONS[error.message] : undefined;
+  if (correction) throw new Error(`${(error as Error).message}: ${correction} This call was rejected; no worker launched. Submit corrected arguments as a new tool call.`);
+  throw error;
+ }
  const format = (details: BridgeAgentDetails) => result(`Runtime agent ${details.runId}: ${details.status}. Use this exact ID for bg_output/bg_stop. BLOCKED artifact replies use name: "${details.runId}". A fresh task requires PASS/FAIL, original keepAlive, and no admitted cancellation or recovery. Busy steering is unsupported.`, details);
  const prior = await request(ctx, "result", { toolCallId, seal: false }) as BridgeAgentDetails | null;
  if (prior) return format(prior);

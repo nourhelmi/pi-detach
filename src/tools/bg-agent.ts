@@ -115,7 +115,7 @@ export const BgAgentParameters = Type.Object({
 	),
 	resultPath: Type.Optional(
 		Type.String({
-			description: "Optional durable result.md path for a native role worker. Generated automatically when omitted.",
+            description: "Legacy backend only: optional durable result.md path for a native role worker. Omit with the managed runtime; it owns and returns the artifact path.",
 		}),
 	),
 	requiredSkills: Type.Optional(
@@ -127,7 +127,7 @@ export const BgAgentParameters = Type.Object({
 	agent: Type.Optional(
 		Type.String({
 			description:
-				'Explicit compatibility command, for example "codex" or "claude". Defaults to Pi. Cannot be combined with role and is ignored when `name` is set.',
+                'Legacy backend only: explicit compatibility command such as "codex" or "claude". Omit with the managed runtime; use role, harness, and model instead. Cannot be combined with role; ignored when name is set.',
 		}),
 	),
 	name: Type.Optional(
