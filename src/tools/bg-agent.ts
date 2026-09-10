@@ -57,7 +57,7 @@ const INLINE_TAIL_LINES = 120;
 
 export const BgAgentParameters = Type.Object({
 	prompt: Type.String({
-		description: "Task for the helper agent. Self-contained; it shares no context with you.",
+		description: "Task for the helper agent. Self-contained; it shares no context with you. In managed graph work, include the returned graph-evidence prompt block intact: launch/reply admission records its input lineage automatically.",
 	}),
 	role: Type.Optional(
 		Type.String({

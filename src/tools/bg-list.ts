@@ -5,7 +5,7 @@ import { formatDuration } from "../format.ts";
 import type { Registry } from "../registry.ts";
 import type { RunSummary } from "../types.ts";
 
-import { bridgeEnabled, bridgeList } from "../runtime-bridge.ts";
+import { bridgeEnabled, bridgeList, formatHandoff } from "../runtime-bridge.ts";
 
 interface Details {
 	runs: RunSummary[];
@@ -36,7 +36,7 @@ export function registerBgListTool(pi: ExtensionAPI, registry: Registry): void {
                     command: "runtime agent", cwd: node?.packet.cwd ?? ctx.cwd, status: node?.snapshot.state === "terminal" ? "exited" : "running", agentName: runId, startedAt: 0, durationMs: 0,
                 }));
                 const all = [...runs, ...runtimeRuns];
-                return { content: [{ type: "text", text: JSON.stringify(all) }], details: { runs: all } };
+                return { content: [{ type: "text", text: JSON.stringify(all) + bridged.map(({ runId, node }) => `\n${runId}: ${node ? formatHandoff(node) : "binding incomplete"}`).join("\n") }], details: { runs: all } };
             }
 			const text =
 				runs.length === 0

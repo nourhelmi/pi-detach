@@ -11,7 +11,12 @@ interface NodeView {
  snapshot: { state: string; attempt: number; cancel: unknown };
  packet: { cwd: string; execution: { label: string; role: string; model: string; thinking: string; maxTurns: number | null; keepAlive: boolean } };
 }
-interface RunView { runId: string; node: NodeView | null }
+interface ResultHandoff { status: string; attempt?: number; reusable?: boolean; continuation?: string; result?: { path: string; sha256: string; attempt: number; status: string; claims: string; risks: string; evidence: string; integrity: string; proof: string; tested: unknown; lastCheck?: unknown; limitation: string } | null }
+interface RunView { runId: string; node: (NodeView & ResultHandoff) | null }
+export function formatHandoff(handoff: ResultHandoff): string {
+ const report = handoff.result;
+ return `Current status: ${handoff.status}; attempt: ${handoff.attempt ?? "unknown"}; continuation: ${handoff.continuation ?? "none"}.` + (report ? `\nCaptured worker report: ${report.path}\nSHA256: ${report.sha256}; report attempt: ${report.attempt}; integrity: ${report.integrity}; proof: ${report.proof}.\nTested: ${report.tested ? JSON.stringify(report.tested).slice(0, 4096) : "unknown"}\nLast host check: ${report.lastCheck ? JSON.stringify(report.lastCheck).slice(0, 4096) : "none"}\nWorker status: ${report.status}\nClaims: ${report.claims}\nEvidence: ${report.evidence}\nRemaining risk: ${report.risks}\n${report.limitation}` : "\nNo current captured result; tested content unknown.");
+}
 const managedConfig = () => join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "pi-detach-runtime.json");
 export const bridgeEnabled = () => process.env.PI_DETACH_BACKEND !== "legacy" && (Boolean(process.env.PI_DETACH_RUNTIME_BRIDGE) || existsSync(managedConfig()));
 let activationFailure: string | undefined;
@@ -78,7 +83,7 @@ async function request(ctx: ExtensionContext, action: string, payload: object): 
  return (await runtimeClient(ctx)).request(sessionId, action, payload);
 }
 function result<T extends object>(text: string, details: T): AgentToolResult<T> { return { content: [{ type: "text", text }], details }; }
-interface BridgeAgentDetails { runId: string; agentName: string; promoted: boolean; status: string; agentState: string; durationMs: number; keepAlive: boolean; reusable: boolean }
+interface BridgeAgentDetails extends ResultHandoff { runId: string; agentName: string; promoted: boolean; agentState: string; durationMs: number; keepAlive: boolean; reusable: boolean }
 export function assertBackend(ctx: ExtensionContext): void {
  if (bridgeEnabled()) return;
  const entries = ctx.sessionManager.getEntries?.() ?? [];
@@ -100,7 +105,7 @@ export async function bridgeAgent(ctx: ExtensionContext, toolCallId: string, par
   if (correction) throw new Error(`${(error as Error).message}: ${correction} This call was rejected; no worker launched. Submit corrected arguments as a new tool call.`);
   throw error;
  }
- const format = (details: BridgeAgentDetails) => result(`Runtime agent ${details.runId}: ${details.status}. Use this exact ID for bg_output/bg_stop. BLOCKED artifact replies use name: "${details.runId}". A fresh task requires PASS/FAIL, original keepAlive, and no admitted cancellation or recovery. Busy steering is unsupported.`, details);
+ const format = (details: BridgeAgentDetails) => result(`Runtime agent ${details.runId}. Use this exact ID for bg_output/bg_stop or name for eligible continuation. Busy steering is unsupported.\n${formatHandoff(details)}`, details);
  const prior = await request(ctx, "result", { toolCallId, seal: false }) as BridgeAgentDetails | null;
  if (prior) return format(prior);
  const deadline = Date.now() + Math.max(0, params.promoteAfterMs ?? 30000);
@@ -131,6 +136,12 @@ export async function bridgeOutput(ctx: ExtensionContext, runId: string, options
 /** Reconnecting delivery consumer only. No execution ownership lives in Pi. */
 export function registerBridgeDelivery(pi: ExtensionAPI): void {
  let generation = 0;
+ let currentContext: ExtensionContext | undefined;
+ pi.events?.on("pi-detach:request", (value: unknown) => {
+  const requestValue = value as { sessionId: string; action: string; payload: object; response?: Promise<unknown> };
+  if (!currentContext || requestValue.sessionId !== currentContext.sessionManager.getSessionId() || requestValue.action !== "graph.evidence") return;
+  requestValue.response = request(currentContext, requestValue.action, requestValue.payload);
+ });
  pi.registerCommand?.("bg_backend", { description: "Show pi-detach backend readiness without launching a worker", async handler(_args, ctx) {
   if (!bridgeEnabled()) { ctx.ui.notify("pi-detach backend: legacy/unmanaged", "info"); return; }
   try {
@@ -145,9 +156,10 @@ export function registerBridgeDelivery(pi: ExtensionAPI): void {
   try { await request(ctx, "shutdown", {}); generation += 1; ctx.ui.notify("Runtime closed safely. Use a new Pi session for subsequent work.", "info"); }
   catch (error) { const code = error instanceof Error ? error.message : "unknown failure"; ctx.ui.notify(`Runtime close refused: ${code}${CLOSE_REFUSALS[code] ? ` (${CLOSE_REFUSALS[code]})` : ""}`, "error"); }
  } });
- pi.on("session_shutdown", () => { generation += 1; resetBridgeClients(); });
+ pi.on("session_shutdown", () => { currentContext = undefined; generation += 1; resetBridgeClients(); });
  pi.on("session_start", async (_event, ctx) => {
   if (!bridgeEnabled()) return;
+  currentContext = ctx;
   const own = ++generation;
   // A newly installed backend may not adopt agents launched by the old registry.
   const entries = ctx.sessionManager.getEntries?.() ?? [];
@@ -165,16 +177,18 @@ export function registerBridgeDelivery(pi: ExtensionAPI): void {
      for (const run of runs) {
       if (own !== generation) return;
       if (!run.node) continue;
-      const deliveries = await request(ctx, "wait", { runId: run.runId, timeoutMs: 0 }) as Array<{ id: number; kind: string; status?: string; reason?: string }>;
+      const deliveries = await request(ctx, "wait", { runId: run.runId, timeoutMs: 0 }) as Array<{ id: number; kind: string; status?: string; reason?: string; attempt?: number; result?: ResultHandoff["result"]; handoff?: ResultHandoff }>;
       for (const delivery of deliveries) {
        if (own !== generation) return;
        if (["settled", "recovery-required"].includes(delivery.kind)) {
         let content = `${run.runId}: ${delivery.status ?? delivery.kind}. ${delivery.reason ?? ""}`;
+        if (delivery.result) content += `\nHistorical settlement report: ${delivery.result.path} (attempt ${delivery.attempt ?? "unknown"}); integrity: ${delivery.result.integrity}; historical report, not current proof.`;
+        if (delivery.handoff) content += `\n${formatHandoff(delivery.handoff)}`;
         if (delivery.kind === "recovery-required") {
          const node = await request(ctx, "get", { runId: run.runId }) as { handle?: { id: string } | null };
-         content = `${run.runId}: recovery-required. ${recoveryGuidance(delivery, node.handle)}`;
+         content += `\n${recoveryGuidance(delivery, node.handle)}`;
         }
-        pi.sendMessage({ customType: "pi-detach-runtime", content, display: true, details: { runId: run.runId, deliveryId: delivery.id } }, ctx.isIdle() ? { triggerTurn: true } : { deliverAs: "steer" });
+        pi.sendMessage({ customType: "pi-detach-runtime", content, display: true, details: { runId: run.runId, deliveryId: delivery.id, result: delivery.result, handoff: delivery.handoff } }, ctx.isIdle() ? { triggerTurn: true } : { deliverAs: "steer" });
        }
        if (own !== generation) return;
        await request(ctx, "ack", { runId: run.runId, deliveryId: delivery.id });
