@@ -257,7 +257,7 @@ export function agentLabel(params: BgAgentParams): string {
 export function workerHarness(params: BgAgentParams): WorkerHarness | undefined {
 	const requested = params.harness === "pi" || params.harness === "native" ? params.harness : undefined;
 	const value = process.env.PI_DETACH_WORKER_HARNESS;
-	const configured = value === "pi" || value === "native" ? value : undefined;
+	const configured = params.role === "advisor" ? "pi" : value === "pi" || value === "native" ? value : undefined;
 	if (requested && configured && requested !== configured) {
 		throw new Error(
 			`bg_agent harness ${requested} conflicts with the parent session harness ${configured}`,

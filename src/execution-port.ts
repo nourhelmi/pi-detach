@@ -1,6 +1,4 @@
 /** Service-owned execution port. Public tool arguments never supply these hooks. */
-import { createHash } from "node:crypto";
-import { resolve } from "node:path";
 import { Value } from "typebox/value";
 import { BgAgentParameters, agentLabel, prepareLaunch, type BgAgentParams } from "./tools/bg-agent.ts";
 import { createHerdrDriver, type HerdrDriverDeps } from "./herdr/driver.ts";
@@ -27,7 +25,7 @@ export interface AgentExecutionIntent {
 }
 export interface AgentExecutionPort {
  version: 1;
- prepare(params: unknown, sourceDirectory: string): Promise<AgentExecutionIntent>;
+ prepare(params: unknown, sourceDirectory: string, scope?: { childState: string; workstream?: string; workerHarness?: "pi" | "native" }): Promise<AgentExecutionIntent>;
  launch(input: { id: string; cwd: string; intent: AgentExecutionIntent; hooks: Omit<RuntimeExecutionHooks, "environment">; reply?: string }): Promise<DriverHandle>;
 }
 export function createAgentExecutionPort(deps: HerdrDriverDeps): AgentExecutionPort {
@@ -38,7 +36,7 @@ export function createAgentExecutionPort(deps: HerdrDriverDeps): AgentExecutionP
  };
  return {
   version: 1,
-  async prepare(input, sourceDirectory) {
+  async prepare(input, sourceDirectory, scope) {
    if (!Value.Check(BgAgentParameters, input) || !input || typeof input !== "object" || Object.keys(input).some(key => !Object.hasOwn(BgAgentParameters.properties, key))) throw new Error("BRIDGE_INVALID_INPUT");
    const params = input as BgAgentParams;
    if (params.resultPath !== undefined) throw new Error("BRIDGE_CUSTOM_ARTIFACT_UNSUPPORTED");
@@ -57,7 +55,10 @@ export function createAgentExecutionPort(deps: HerdrDriverDeps): AgentExecutionP
     maxTurns: launch.maxTurns ?? params.maxTurns ?? null,
     requiredSkills: params.requiredSkills ?? [], harness: launch.runtime.split("/").pop() === "pi" ? "pi" : "native",
     keepAlive: params.keepAlive ?? false, label, resultDiscovery: launch.resultDiscovery ?? null,
-    resultPolicy: "runtime-capture", sourceDirectory, environment: { ...executionEnvironment(sourceDirectory), ADVISOR_BRIDGE_CHILD_STATE: launch.command.split(" ").includes("--advisor-worker-allow-subagents") && !process.env.ADVISOR_BRIDGE_CHILD_STATE ? resolve(sourceDirectory, "../../../..", "children", createHash("sha256").update(sourceDirectory.split("/").at(-3)!).digest("hex").slice(0, 20)) : "" },
+    resultPolicy: "runtime-capture", sourceDirectory, environment: { ...executionEnvironment(sourceDirectory),
+     ...(scope?.workstream ? { ADVISOR_WORKSTREAM: scope.workstream } : {}),
+     ...(scope?.workerHarness ? { PI_DETACH_WORKER_HARNESS: scope.workerHarness } : {}),
+     ADVISOR_BRIDGE_CHILD_STATE: launch.command.split(" ").includes("--advisor-worker-allow-subagents") ? scope?.childState ?? "" : "" },
    };
   },
   async launch({ id, cwd, intent, hooks, reply }) {

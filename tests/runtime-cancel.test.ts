@@ -12,8 +12,28 @@ async function until(condition: () => boolean, ms = 3000): Promise<void> {
     while (!condition()) { assert.ok(Date.now() < deadline, "condition not reached"); await sleep(20); }
 }
 
+test("ancestor Escape settlement waits for descendant quiescence, not acknowledgement", async () => {
+    let settled = false;
+    const f = fixture(async () => settled); const handle = await f.driver();
+    await handle.interrupt!(f.observer);
+    f.agent.agent_status = "idle"; f.agent.state_change_seq++;
+    await sleep(300);
+    assert.equal(f.observed.length, 0, "live or ambiguous descendants keep the advisor cancel-pending");
+    settled = true;
+    await until(() => f.observed.length === 1);
+    assert.equal(f.escapes(), 1); assert.equal(f.counts().settled, 0);
+});
+
+test("descendant supervision failure cannot fabricate ancestor cancellation", async () => {
+    const f = fixture(async () => { throw new Error("unreachable child"); }); const handle = await f.driver();
+    await handle.interrupt!(f.observer);
+    f.agent.agent_status = "idle"; f.agent.state_change_seq++;
+    await until(() => f.counts().observerRecovery === 1);
+    assert.deepEqual(f.observed, []); assert.equal(f.escapes(), 1);
+});
+
 /** Pi occupant that starts working after its prompt; Escape alone changes nothing until the fixture settles it. */
-function fixture() {
+function fixture(childrenSettled?: () => Promise<boolean>) {
     const calls: string[][] = [];
     const agent: any = { pane_id: "w1:p2", name: "", agent: "pi", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-1" }, state_change_seq: 1, agent_status: "idle" };
     const waiters: Array<{ args: string[]; resolve: (result: CliResult) => void }> = [];
@@ -38,7 +58,7 @@ function fixture() {
         },
     };
     const driver = createHerdrDriver({ cli, panes: createPaneManager(cli, { paneId: "w1:p1" }), ctx: { paneId: "w1:p1" }, env: {} });
-    const hooks: RuntimeExecutionHooks = { environment: {}, assertActive() {}, recordHandle() {}, settled() { settled++; return { terminal: true, close: true }; }, recoveryRequired() { recovered++; } };
+    const hooks: RuntimeExecutionHooks = { environment: {}, ...(childrenSettled ? { childrenSettled } : {}), assertActive() {}, recordHandle() {}, settled() { settled++; return { terminal: true, close: true }; }, recoveryRequired() { recovered++; } };
     const controller: RunController = {
         record: { id: "cancel-1", kind: "agent", command: "pi", cwd: "/tmp", label: "cancel", status: "running", backend: "herdr", startedAt: 0, promoted: false, logPath: "" },
         emitOutput() {}, finish() { throw new Error("legacy settlement forbidden"); },

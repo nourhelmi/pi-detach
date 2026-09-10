@@ -138,6 +138,9 @@ test("the parent session harness is authoritative over per-launch overrides", ()
 	const previous = process.env.PI_DETACH_WORKER_HARNESS;
 	process.env.PI_DETACH_WORKER_HARNESS = "native";
 	try {
+		assert.equal(workerHarness({ role: "advisor", prompt: "Own outcome." }), "pi");
+		assert.equal(workerHarness({ role: "advisor", harness: "pi", prompt: "Own outcome." }), "pi");
+		assert.throws(() => workerHarness({ role: "advisor", harness: "native", prompt: "Own outcome." }), /conflicts/);
 		assert.equal(workerHarness({ role: "builder", prompt: "Build." }), "native");
 		assert.equal(workerHarness({ role: "builder", harness: "native", prompt: "Build." }), "native");
 		assert.throws(

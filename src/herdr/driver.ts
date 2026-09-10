@@ -1503,7 +1503,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
                 void (async () => {
                     try {
                         let current = await checkIdentity();
-                        while (!RUNTIME_SETTLED_STATES.includes(current.occupant.status) || (wasWorking && current.seq <= before.seq)) {
+                        while (!RUNTIME_SETTLED_STATES.includes(current.occupant.status) || (wasWorking && current.seq <= before.seq) || (bridge.childrenSettled && !await bridge.childrenSettled())) {
                             await new Promise(resolve => setTimeout(resolve, CANCEL_OBSERVE_POLL_MS));
                             current = await checkIdentity();
                         }

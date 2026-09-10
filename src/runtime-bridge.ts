@@ -138,7 +138,14 @@ export function registerBridgeDelivery(pi: ExtensionAPI): void {
  let generation = 0;
  let currentContext: ExtensionContext | undefined;
  pi.events?.on("pi-detach:request", (value: unknown) => {
-  const requestValue = value as { sessionId: string; action: string; payload: object; response?: Promise<unknown> };
+  const requestValue = value as { sessionId: string; action: string; payload: object; context?: ExtensionContext; response?: Promise<unknown> };
+  // Root restoration may bind before this extension's session_start handler.
+  // This private event carries the host context, never public tool parameters.
+  if (requestValue.action === "advisor.bind" && bridgeEnabled()) {
+   const ctx = requestValue.context;
+   if (ctx && requestValue.sessionId === ctx.sessionManager.getSessionId()) requestValue.response = request(ctx, requestValue.action, requestValue.payload);
+   return;
+  }
   if (!currentContext || requestValue.sessionId !== currentContext.sessionManager.getSessionId() || requestValue.action !== "graph.evidence") return;
   requestValue.response = request(currentContext, requestValue.action, requestValue.payload);
  });
