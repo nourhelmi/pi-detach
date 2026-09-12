@@ -36,6 +36,7 @@ import { registerBgOutputTool } from "../src/tools/bg-output.ts";
 import { registerBgRunTool } from "../src/tools/bg-run.ts";
 import { registerBgStopTool } from "../src/tools/bg-stop.ts";
 import { registerBgWatchTool } from "../src/tools/bg-watch.ts";
+import { registerManagedTeamTools } from "../src/tools/team.ts";
 
 import { bridgeEnabled, registerBridgeDelivery } from "../src/runtime-bridge.ts";
 
@@ -111,6 +112,7 @@ export default function registerDetachExtension(pi: ExtensionAPI): void {
 	registerBgListTool(pi, registry);
 	registerBgStopTool(pi, registry);
     registerBridgeDelivery(pi);
+    registerManagedTeamTools(pi);
 
 	const track = (_event: unknown, ctx: ExtensionContext): void => {
 		currentCtx = ctx;

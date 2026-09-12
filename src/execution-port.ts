@@ -25,7 +25,7 @@ export interface AgentExecutionIntent {
 }
 export interface AgentExecutionPort {
  version: 1;
- prepare(params: unknown, sourceDirectory: string, scope?: { childState: string; workstream?: string; workerHarness?: "pi" | "native" }): Promise<AgentExecutionIntent>;
+ prepare(params: unknown, sourceDirectory: string, scope?: { childState: string; workstream?: string; workerHarness?: "pi" | "native"; teamMode?: boolean }): Promise<AgentExecutionIntent>;
  launch(input: { id: string; cwd: string; intent: AgentExecutionIntent; hooks: Omit<RuntimeExecutionHooks, "environment">; reply?: string }): Promise<DriverHandle>;
 }
 export function createAgentExecutionPort(deps: HerdrDriverDeps): AgentExecutionPort {
@@ -46,7 +46,7 @@ export function createAgentExecutionPort(deps: HerdrDriverDeps): AgentExecutionP
    const requiredSkills = params.requiredSkills ?? [];
    if (requiredSkills.some(skill => !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(skill))) throw new Error("BRIDGE_INVALID_SKILL");
    const label = agentLabel(params);
-   const launch = await prepareLaunch({ ...params, resultPath: `${sourceDirectory}/result.md` }, label);
+   const launch = await prepareLaunch({ ...params, resultPath: `${sourceDirectory}/result.md` }, label, scope?.workerHarness);
    return {
     v: 1, command: launch.command,
     prompt: launch.prompt + (!launch.role ? `${requiredSkills.length ? "\nREQUIRED SKILLS:\nLoad and follow: " + requiredSkills.join(", ") : ""}${params.maxTurns ? "\nTURN CAP: " + params.maxTurns : ""}` : "") + `\n\nRESULT ARTIFACT:\nWrite the bounded result to ${sourceDirectory}/result.md. Include Status, Claims, Evidence, Files, Decisions, Remaining Risk.`,
@@ -58,6 +58,7 @@ export function createAgentExecutionPort(deps: HerdrDriverDeps): AgentExecutionP
     resultPolicy: "runtime-capture", sourceDirectory, environment: { ...executionEnvironment(sourceDirectory),
      ...(scope?.workstream ? { ADVISOR_WORKSTREAM: scope.workstream } : {}),
      ...(scope?.workerHarness ? { PI_DETACH_WORKER_HARNESS: scope.workerHarness } : {}),
+     ...(scope?.teamMode && launch.role === "advisor" ? { ADVISOR_TEAM_MODE: "1" } : {}),
      ADVISOR_BRIDGE_CHILD_STATE: launch.command.split(" ").includes("--advisor-worker-allow-subagents") ? scope?.childState ?? "" : "" },
    };
   },

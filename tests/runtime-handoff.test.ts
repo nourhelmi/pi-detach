@@ -38,3 +38,67 @@ test('formatter reports actual tested metadata and does not hide invalid report 
   const text = formatHandoff({ status: 'done', result: { path: '/captured/result.md', sha256: 'hash', attempt: 2, status: 'PASS', claims: '', risks: '', evidence: '', integrity: 'invalid', proof: 'unknown', tested: { surface: { revision: 'actual-revision' }, producer: 'host', limitations: ['git-visible only'] }, limitation: 'Not an independent verdict' } });
   assert.match(text, /integrity: invalid; proof: unknown/); assert.match(text, /actual-revision/); assert.match(text, /git-visible only/);
 });
+
+test('root delivery consumer queues teammate advice while busy without claiming read or done', async t => {
+  const dir = await mkdtemp('/tmp/detach-team-delivery-'); const modulePath = join(dir, 'client.mjs');
+  await writeFile(modulePath, `export const PI_DETACH_CLIENT_VERSION = 1; let sent=false;
+export function createPiDetachClient() { return { async request(session, action, payload) {
+ if(action==='list') return [{runId:'pib-member',node:{}}];
+ if(action==='wait' && !sent) { sent=true; return [{id:7,kind:'team.message',message:{id:'message-7',from:'pib-peer',fromName:'peer',text:'review the boundary',status:'queued'}}]; }
+ if(action==='wait') return []; if(action==='ack') { globalThis.__teamDeliveryAck=payload; return {}; } throw Error(action);
+} }; }`);
+  const previous = { bridge: process.env.PI_DETACH_RUNTIME_BRIDGE, descriptor: process.env.ADVISOR_RUNTIME_DESCRIPTOR };
+  process.env.PI_DETACH_RUNTIME_BRIDGE = modulePath; process.env.ADVISOR_RUNTIME_DESCRIPTOR = join(dir, 'descriptor');
+  const record = globalThis as typeof globalThis & { __teamDeliveryAck?: unknown };
+  t.after(async () => { if (previous.bridge === undefined) delete process.env.PI_DETACH_RUNTIME_BRIDGE; else process.env.PI_DETACH_RUNTIME_BRIDGE = previous.bridge; if (previous.descriptor === undefined) delete process.env.ADVISOR_RUNTIME_DESCRIPTOR; else process.env.ADVISOR_RUNTIME_DESCRIPTOR = previous.descriptor; delete record.__teamDeliveryAck; resetBridgeClients(); await rm(dir, { recursive: true, force: true }); });
+  const handlers: Record<string, any> = {}; let delivered!: (value: any) => void;
+  const received = new Promise<any>(resolve => { delivered = resolve; });
+  registerBridgeDelivery({ on(name: string, fn: any) { handlers[name] = fn; }, registerCommand() {}, sendMessage(message: any, options: any) { delivered({ message, options }); } } as unknown as ExtensionAPI);
+  const ctx = { cwd: dir, sessionManager: { getSessionId: () => 'owner', getEntries: () => [] }, isIdle: () => false, ui: { notify() {} } } as unknown as ExtensionContext;
+  await handlers.session_start({}, ctx); const delivery = await received;
+  assert.match(delivery.message.content, /does not grant scope or change any assignment/); assert.deepEqual(delivery.options, { deliverAs: 'steer' });
+  assert.equal(delivery.message.details.read, null); assert.equal(delivery.message.details.done, null);
+  for (let i = 0; i < 50 && !record.__teamDeliveryAck; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.deepEqual(record.__teamDeliveryAck, { runId: 'pib-member', deliveryId: 7 });
+  handlers.session_shutdown();
+});
+
+test('root teammate advice dedupes repeated delivery and reconnect after lost ack within the same session', async t => {
+  const dir = await mkdtemp('/tmp/detach-team-retry-'); const modulePath = join(dir, 'client.mjs');
+  await writeFile(modulePath, `export const PI_DETACH_CLIENT_VERSION = 1; let waits=0, acks=0;
+const delivery={id:7,kind:'team.message',message:{id:'message-7',from:'pib-peer',fromName:'peer',text:'one update',status:'queued'}};
+export function createPiDetachClient() { return { async request(session, action) {
+ if(action==='list') return [{runId:'pib-member',node:{}}];
+ if(action==='wait') return ++waits===1 ? [delivery,delivery] : [delivery];
+ if(action==='ack') { globalThis.__teamRetry.acks=++acks; if(acks===2) throw Error('lost ack'); if(acks===3) globalThis.__teamRetry.done(); return {}; }
+ throw Error(action);
+} }; }`);
+  const previous = { bridge: process.env.PI_DETACH_RUNTIME_BRIDGE, descriptor: process.env.ADVISOR_RUNTIME_DESCRIPTOR };
+  process.env.PI_DETACH_RUNTIME_BRIDGE = modulePath; process.env.ADVISOR_RUNTIME_DESCRIPTOR = join(dir, 'descriptor');
+  const global = globalThis as typeof globalThis & { __teamRetry?: { acks: number; done(): void } };
+  const consumers: Record<string, any>[] = []; const sent: any[] = [];
+  // A foreign session's conversation entry is never receipt authority for this root.
+  const entries: any[] = [{ type: 'message', message: { role: 'custom', customType: 'managed-team-message', details: { rootSession: 'foreign', runId: 'pib-member', messageId: 'message-7' } } }];
+  let disconnected!: () => void; const lostAck = new Promise<void>(resolve => { disconnected = resolve; });
+  const ctx = { cwd: dir, sessionManager: { getSessionId: () => 'owner', getEntries: () => entries }, isIdle: () => false, ui: { notify() { disconnected(); } } } as unknown as ExtensionContext;
+  function consumer() {
+    const handlers: Record<string, any> = {}; consumers.push(handlers);
+    registerBridgeDelivery({ on(name: string, fn: any) { handlers[name] = fn; }, registerCommand() {}, sendMessage(message: any) { sent.push(message); entries.push({ type: 'message', message: { role: 'custom', ...message } }); } } as unknown as ExtensionAPI);
+    return handlers;
+  }
+  t.after(async () => {
+    for (const handler of consumers) handler.session_shutdown();
+    if (previous.bridge === undefined) delete process.env.PI_DETACH_RUNTIME_BRIDGE; else process.env.PI_DETACH_RUNTIME_BRIDGE = previous.bridge;
+    if (previous.descriptor === undefined) delete process.env.ADVISOR_RUNTIME_DESCRIPTOR; else process.env.ADVISOR_RUNTIME_DESCRIPTOR = previous.descriptor;
+    delete global.__teamRetry; resetBridgeClients(); await rm(dir, { recursive: true, force: true });
+  });
+  global.__teamRetry = { acks: 0, done() {} };
+  const first = consumer(); await first.session_start({}, ctx); await lostAck;
+  assert.equal(sent.length, 1); assert.equal(global.__teamRetry.acks, 2); first.session_shutdown();
+  const second = consumer(); let acked!: () => void; const receipt = new Promise<void>(resolve => { acked = resolve; });
+  global.__teamRetry.done = () => { second.session_shutdown(); acked(); };
+  await second.session_start({}, ctx); await receipt;
+  assert.equal(sent.length, 1, 'reconnect re-acks persisted delivery without reinjection');
+  assert.equal(global.__teamRetry.acks, 3); assert.equal(sent[0].details.rootSession, 'owner');
+  assert.equal(sent[0].details.read, null); assert.equal(sent[0].details.done, null);
+});

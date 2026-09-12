@@ -254,23 +254,24 @@ export function agentLabel(params: BgAgentParams): string {
 	return `${prefix} ${words.join(" ") || "task"}`;
 }
 
-export function workerHarness(params: BgAgentParams): WorkerHarness | undefined {
-	const requested = params.harness === "pi" || params.harness === "native" ? params.harness : undefined;
-	const value = process.env.PI_DETACH_WORKER_HARNESS;
-	const configured = params.role === "advisor" ? "pi" : value === "pi" || value === "native" ? value : undefined;
+export function workerHarness(params: BgAgentParams, inherited = process.env.PI_DETACH_WORKER_HARNESS): WorkerHarness | undefined {
+  const requested = params.harness === "pi" || params.harness === "native" ? params.harness : undefined;
+  // Hosting a child advisor in Pi does not change its family's specialist preference.
+  const value = inherited;
+  const configured = params.role === 'advisor' && requested === 'pi' ? 'pi' : value === 'pi' || value === 'native' ? value : undefined;
 	if (requested && configured && requested !== configured) {
 		throw new Error(
 			`bg_agent harness ${requested} conflicts with the parent session harness ${configured}`,
 		);
 	}
-	return requested ?? configured;
+  return params.role === 'advisor' ? 'pi' : requested ?? configured;
 }
 
-export async function prepareLaunch(params: BgAgentParams, label: string): Promise<ResolvedAgentLaunch> {
+export async function prepareLaunch(params: BgAgentParams, label: string, inherited?: WorkerHarness): Promise<ResolvedAgentLaunch> {
 	if (params.name) {
 		return { command: params.agent ?? "pi", prompt: params.prompt, runtime: "existing" };
 	}
-	const harness = workerHarness(params);
+  const harness = workerHarness(params, inherited);
 	return resolveAgentLaunch({
 		...(params.agent ? { agent: params.agent } : {}),
 		...(params.role ? { role: params.role } : {}),

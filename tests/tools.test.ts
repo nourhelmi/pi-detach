@@ -105,7 +105,7 @@ test("registers the full toolset", () => {
 	const { tools, shutdown } = host();
 	assert.deepEqual(
 		[...tools.keys()].sort(),
-		["bg_agent", "bg_await", "bg_list", "bg_output", "bg_run", "bg_stop", "bg_watch"],
+		["bg_agent", "bg_await", "bg_list", "bg_output", "bg_run", "bg_stop", "bg_watch", "team_manage", "team_message", "team_status"],
 	);
 	shutdown();
 });
@@ -140,14 +140,15 @@ test("the parent session harness is authoritative over per-launch overrides", ()
 	try {
 		assert.equal(workerHarness({ role: "advisor", prompt: "Own outcome." }), "pi");
 		assert.equal(workerHarness({ role: "advisor", harness: "pi", prompt: "Own outcome." }), "pi");
-		assert.throws(() => workerHarness({ role: "advisor", harness: "native", prompt: "Own outcome." }), /conflicts/);
+    assert.equal(workerHarness({ role: "advisor", harness: "native", prompt: "Own outcome." }), "pi");
 		assert.equal(workerHarness({ role: "builder", prompt: "Build." }), "native");
 		assert.equal(workerHarness({ role: "builder", harness: "native", prompt: "Build." }), "native");
 		assert.throws(
 			() => workerHarness({ role: "builder", harness: "pi", prompt: "Build." }),
 			/conflicts with the parent session harness native/,
 		);
-		process.env.PI_DETACH_WORKER_HARNESS = "pi";
+    process.env.PI_DETACH_WORKER_HARNESS = "pi";
+    assert.throws(() => workerHarness({ role: 'advisor', harness: 'native', prompt: 'Forbidden override.' }), /conflicts/);
 		assert.equal(workerHarness({ role: "checker", prompt: "Check." }), "pi");
 		assert.throws(
 			() => workerHarness({ role: "checker", harness: "native", prompt: "Check." }),

@@ -26,7 +26,10 @@ test('recursive delegation uses trusted per-launch child scope, never ambient pa
     assert.equal(child.environment.ADVISOR_WORKSTREAM, 'workstream');
     assert.equal(child.environment.PI_DETACH_WORKER_HARNESS, 'native');
     assert.equal(child.harness, 'pi');
-    assert.equal((await port.prepare({ role: 'specialist', prompt: 'leaf' }, '/worker/source', scope)).environment.ADVISOR_BRIDGE_CHILD_STATE, '');
+    const specialist = await port.prepare({ role: 'specialist', prompt: 'leaf', model: 'openai-codex/example' }, '/worker/source', scope);
+    assert.equal(specialist.environment.ADVISOR_BRIDGE_CHILD_STATE, '');
+    assert.equal(specialist.harness, 'native', 'trusted family preference also controls specialist execution');
+    await assert.rejects(port.prepare({ role: 'specialist', prompt: 'forbidden', harness: 'pi' }, '/worker/source', scope), /harness pi conflicts with the parent session harness native/);
     assert.equal((await port.prepare({ role: 'advisor', prompt: 'no trusted reservation' }, '/worker/source')).environment.ADVISOR_BRIDGE_CHILD_STATE, '');
     await assert.rejects(port.prepare({ role: 'advisor', prompt: 'untrusted extra field', childState: '/foreign' }, '/worker/source', scope), /BRIDGE_INVALID_INPUT/);
   } finally {

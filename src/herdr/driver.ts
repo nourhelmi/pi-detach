@@ -1479,6 +1479,16 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
         })();
         controller.record.paneId = paneId;
         controller.record.agentName = name;
+        const runtimeObservation = async () => {
+            const current = await checkIdentity(Boolean(binding));
+            let runtime: string | undefined;
+            try {
+                const provider = current.provider ? JSON.parse(current.provider) as unknown[] : [];
+                if (typeof provider[1] === "string" && provider[1]) runtime = provider[1];
+            } catch { /* An opaque provider identity remains unclassified. */ }
+            runtime ??= codex ? "codex" : undefined;
+            return { session: current.session, generation: current.seq, state: current.occupant.status, ...(runtime ? { runtime } : {}) };
+        };
         return {
             paneId, agentName: name, detach,
             stop() { throw new Error("BRIDGE_ADMITTED_CANCEL_REQUIRED"); },
@@ -1515,6 +1525,32 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
                 })();
             },
             readLive: async lines => { await checkIdentity(); return readPane(paneId, lines); },
+            runtimeObservation,
+            async message(input) {
+                let submitted = false;
+                try {
+                    bridge.assertActive();
+                    const current = await checkIdentity(Boolean(binding));
+                    if (input.target.handleId !== handleId || input.target.session !== current.session || input.target.generation !== current.seq || current.occupant.status !== "working") {
+                        return { status: "rejected", session: current.session, generation: current.seq, state: current.occupant.status };
+                    }
+                    bridge.assertActive();
+                    submitted = true;
+                    const queued = await cli.exec(["agent", "prompt", paneId, input.text], { timeoutMs: 6000 });
+                    if (!queued.ok) return { status: "unknown", session: current.session, generation: current.seq, state: current.occupant.status };
+                    const after = await checkIdentity(Boolean(binding));
+                    return { status: "queued", session: after.session, generation: after.seq, state: after.occupant.status };
+                } catch {
+                    let session = input.target.session;
+                    let generation = input.target.generation;
+                    try {
+                        const fallback = JSON.parse(handleId) as unknown[];
+                        if (!session && typeof fallback[2] === "string") session = fallback[2];
+                        if (!generation && Number.isInteger(fallback[3])) generation = fallback[3] as number;
+                    } catch { /* The target supplied the last exact durable identity. */ }
+                    return { status: submitted ? "unknown" : "rejected", session, generation, state: "unknown" };
+                }
+            },
         };
     }
 

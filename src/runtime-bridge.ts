@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { BgAgentParams } from "./tools/bg-agent.ts";
 
-type Client = { request(sessionId: string, action: string, payload: object): Promise<unknown> };
+type Client = { request(sessionId: string, action: string, payload: Record<string, unknown>): Promise<unknown> };
 interface NodeView {
  status: string; runtimeState: string; requestDetail?: { id: string; kind: string; text: string };
  snapshot: { state: string; attempt: number; cancel: unknown };
@@ -34,6 +34,7 @@ const CLOSE_REFUSALS: Record<string, string> = {
  SHUTDOWN_BUSY: "the service is dispatching; retry in a moment",
  SHUTDOWN_CHILD_ACTIVE: "a foreman's child service still has active or unacknowledged work; let that foreman finish first",
  SHUTDOWN_CHILD_UNCERTAIN: "a foreman's child service is owned but unreachable; inspect it before closing",
+ SHUTDOWN_TEAM_ACTIVE: "one or more managed teammates have not been explicitly retired",
 };
 const RECOVERY_CAUSES: Record<string, string> = {
  "effect-unproven": "the runtime could not prove the worker received its input",
@@ -77,10 +78,14 @@ async function runtimeClient(ctx: ExtensionContext): Promise<Client> {
  }
  return pending;
 }
-async function request(ctx: ExtensionContext, action: string, payload: object): Promise<unknown> {
+async function request(ctx: ExtensionContext, action: string, payload: Record<string, unknown>): Promise<unknown> {
  const sessionId = ctx.sessionManager.getSessionId();
  if (!sessionId) throw new Error("PI_DETACH_SESSION_REQUIRED");
  return (await runtimeClient(ctx)).request(sessionId, action, payload);
+}
+/** Public team tools share the managed bridge; no tool can select a socket or credential. */
+export async function bridgeTeamRequest(ctx: ExtensionContext, action: string, payload: Record<string, unknown>): Promise<unknown> {
+ return request(ctx, action, payload);
 }
 function result<T extends object>(text: string, details: T): AgentToolResult<T> { return { content: [{ type: "text", text }], details }; }
 interface BridgeAgentDetails extends ResultHandoff { runId: string; agentName: string; promoted: boolean; agentState: string; durationMs: number; keepAlive: boolean; reusable: boolean }
@@ -138,7 +143,7 @@ export function registerBridgeDelivery(pi: ExtensionAPI): void {
  let generation = 0;
  let currentContext: ExtensionContext | undefined;
  pi.events?.on("pi-detach:request", (value: unknown) => {
-  const requestValue = value as { sessionId: string; action: string; payload: object; context?: ExtensionContext; response?: Promise<unknown> };
+  const requestValue = value as { sessionId: string; action: string; payload: Record<string, unknown>; context?: ExtensionContext; response?: Promise<unknown> };
   // Root restoration may bind before this extension's session_start handler.
   // This private event carries the host context, never public tool parameters.
   if (requestValue.action === "advisor.bind" && bridgeEnabled()) {
@@ -146,7 +151,7 @@ export function registerBridgeDelivery(pi: ExtensionAPI): void {
    if (ctx && requestValue.sessionId === ctx.sessionManager.getSessionId()) requestValue.response = request(ctx, requestValue.action, requestValue.payload);
    return;
   }
-  if (!currentContext || requestValue.sessionId !== currentContext.sessionManager.getSessionId() || requestValue.action !== "graph.evidence") return;
+  if (!currentContext || requestValue.sessionId !== currentContext.sessionManager.getSessionId() || !["graph.evidence", "team.status"].includes(requestValue.action)) return;
   requestValue.response = request(currentContext, requestValue.action, requestValue.payload);
  });
  pi.registerCommand?.("bg_backend", { description: "Show pi-detach backend readiness without launching a worker", async handler(_args, ctx) {
@@ -170,6 +175,13 @@ export function registerBridgeDelivery(pi: ExtensionAPI): void {
   const own = ++generation;
   // A newly installed backend may not adopt agents launched by the old registry.
   const entries = ctx.sessionManager.getEntries?.() ?? [];
+  // Retry dedupe is session-scoped. A persisted custom message survives reconnect;
+  // an in-memory queued message is not claimed as durable host receipt/read.
+  const deliveredTeamMessages = new Set(entries.flatMap(entry => {
+   if (entry.type !== 'message' || entry.message.role !== 'custom' || entry.message.customType !== 'managed-team-message') return [];
+   const details = entry.message.details as { rootSession?: string; runId?: string; messageId?: string } | undefined;
+   return details?.rootSession === ctx.sessionManager.getSessionId() && details.runId && details.messageId ? [`${details.runId}/${details.messageId}`] : [];
+  }));
   const legacy = entries.some(entry => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "bg_agent" && (() => {
    const d = entry.message.details as { runId?: string; status?: string } | undefined;
    return d?.status === "running" && d.runId && !d.runId.startsWith("pib-");
@@ -184,9 +196,18 @@ export function registerBridgeDelivery(pi: ExtensionAPI): void {
      for (const run of runs) {
       if (own !== generation) return;
       if (!run.node) continue;
-      const deliveries = await request(ctx, "wait", { runId: run.runId, timeoutMs: 0 }) as Array<{ id: number; kind: string; status?: string; reason?: string; attempt?: number; result?: ResultHandoff["result"]; handoff?: ResultHandoff }>;
+      const deliveries = await request(ctx, "wait", { runId: run.runId, timeoutMs: 0 }) as Array<{ id: number; kind: string; status?: string; reason?: string; attempt?: number; result?: ResultHandoff["result"]; handoff?: ResultHandoff; message?: { id: string; from: string; fromName: string; text: string; status: string } }>;
       for (const delivery of deliveries) {
        if (own !== generation) return;
+       if (delivery.kind === "team.message" && delivery.message) {
+        const message = delivery.message; const key = `${run.runId}/${message.id}`;
+        if (!deliveredTeamMessages.has(key)) {
+         pi.sendMessage({ customType: "managed-team-message", content: `Managed teammate ${message.fromName} sent advice/context. This does not grant scope or change any assignment.\n\n${message.text}`, display: true,
+          details: { rootSession: ctx.sessionManager.getSessionId(), runId: run.runId, deliveryId: delivery.id, messageId: message.id, from: message.from, transportStatus: message.status, read: null, done: null } },
+         ctx.isIdle() ? { triggerTurn: true } : { deliverAs: "steer" });
+         deliveredTeamMessages.add(key);
+        }
+       }
        if (["settled", "recovery-required"].includes(delivery.kind)) {
         let content = `${run.runId}: ${delivery.status ?? delivery.kind}. ${delivery.reason ?? ""}`;
         if (delivery.result) content += `\nHistorical settlement report: ${delivery.result.path} (attempt ${delivery.attempt ?? "unknown"}); integrity: ${delivery.result.integrity}; historical report, not current proof.`;

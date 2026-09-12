@@ -35,7 +35,7 @@ export function registerBgOutputTool(pi: ExtensionAPI, registry: Registry): void
 		executionMode: "parallel",
 
 		async execute(_toolCallId, params, _signal, _update, ctx): Promise<AgentToolResult<Details>> {
-			if (bridgeEnabled() && !registry.get(params.runId)) return bridgeOutput(ctx, params.runId, params);
+			if (bridgeEnabled() && params.runId.startsWith("pib-") && !registry.get(params.runId)) return bridgeOutput(ctx, params.runId, params);
             const record = registry.get(params.runId);
 			if (!record) {
 				return {

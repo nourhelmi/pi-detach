@@ -154,6 +154,10 @@ export interface DriverHandle {
 	detach?: () => void;
 	/** Live read for runs whose output is not streamed into the registry (herdr panes). */
 	readLive?: (lines: number) => Promise<string>;
+	/** Exact managed occupant observation. Effective model/effort are deliberately not inferred. */
+	runtimeObservation?: () => Promise<{ session: string; generation: number; state: string; runtime?: string }>;
+	/** Queue advice to the same managed busy occupant. No lifecycle or assignment mutation. */
+	message?: (input: { text: string; target: { session: string; handleId: string; generation: number } }) => Promise<{ status: "queued" | "rejected" | "unknown"; session: string; generation: number; state: string }>;
 }
 
 /** Trusted service-only cancellation observer. Settlement after an interrupt is observed, never invented. */
