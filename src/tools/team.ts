@@ -108,5 +108,5 @@ export function registerManagedTeamTools(pi: ExtensionAPI, options: { enabled?: 
 		renderCall(args) { return new Text(`team ${args.action}${args.to ? ` ${args.to}` : ""}`, 0, 0); },
 		renderResult(output) { const details = output.details as { status?: string; outcome?: string } | undefined; return new Text(details?.status ?? details?.outcome ?? "accepted", 0, 0); },
 	});
-	syncActiveTools();
+	pi.on("session_start", syncActiveTools);
 }

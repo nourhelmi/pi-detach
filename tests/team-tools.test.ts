@@ -1,7 +1,26 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { DefaultResourceLoader, SettingsManager, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { registerManagedTeamTools } from "../src/tools/team.ts";
+
+for (const enabled of [false, true]) {
+	test(`team tools load through Pi before runtime actions are bound (enabled=${enabled})`, async (t) => {
+		const directory = mkdtempSync(join(tmpdir(), "pi-detach-team-loader-"));
+		t.after(() => rmSync(directory, { recursive: true, force: true }));
+		const loader = new DefaultResourceLoader({
+			cwd: directory, agentDir: directory, settingsManager: SettingsManager.inMemory(),
+			noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true,
+			extensionFactories: [(pi) => registerManagedTeamTools(pi, { enabled })],
+		});
+		await loader.reload();
+		const loaded = loader.getExtensions();
+		assert.deepEqual(loaded.errors, []);
+		assert.deepEqual([...loaded.extensions[0]!.tools.keys()], ["team_status", "team_message", "team_manage"]);
+	});
+}
 
 test("managed team tools stay gated until /cos activation and expose honest message semantics", async () => {
 	const requests: Array<{ action: string; payload: object }> = [];
@@ -18,12 +37,17 @@ test("managed team tools stay gated until /cos activation and expose honest mess
 	};
 	const tools = new Map<string, ToolDefinition<any, any, any>>(); const events = new Map<string, (value: unknown) => void>();
 	let activeTools = ["read", "bash", "team_status", "team_message", "team_manage"];
+	let runtimeReady = false;
 	registerManagedTeamTools({
 		registerTool(tool: ToolDefinition<any, any, any>) { tools.set(tool.name, tool); },
+		on(name: string, handler: (value: unknown) => void) { events.set(name, handler); },
 		events: { on(name: string, handler: (value: unknown) => void) { events.set(name, handler); } },
-		getActiveTools() { return activeTools; }, setActiveTools(names: string[]) { activeTools = names; },
+		getActiveTools() { assert.ok(runtimeReady, "runtime action during extension loading"); return activeTools; },
+		setActiveTools(names: string[]) { assert.ok(runtimeReady, "runtime action during extension loading"); activeTools = names; },
 	} as unknown as ExtensionAPI, { enabled: false, request });
 	const ctx = { cwd: "/tmp", sessionManager: { getSessionId: () => "root-session" } } as unknown as ExtensionContext;
+	runtimeReady = true;
+	events.get("session_start")?.({ type: "session_start", reason: "startup" });
 	assert.deepEqual(activeTools, ["read", "bash"]);
 	await assert.rejects(tools.get("team_status")!.execute("status", {}, undefined, undefined, ctx), /TEAM_MODE_INACTIVE/);
 	events.get("advisor:team-mode")?.({ enabled: true });
