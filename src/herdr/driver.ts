@@ -1378,6 +1378,7 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
         const inspect = async () => {
             bridge.assertActive();
             const got = await cli.exec(["agent", "get", paneId]);
+            if (!got.ok && got.errorCode === "not_found") throw new Error("BRIDGE_SESSION_UNAVAILABLE");
             const occupant = got.ok ? occupantFrom(got.json) : undefined;
             const provider = runtimeAgentSession(got.json);
             let session = provider;
@@ -1403,12 +1404,13 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
             return { occupant, session, provider, seq: occupant.stateChangeSeq! };
         };
         const acquired = await inspect();
-        if (prior && (acquired.session !== prior[2] || acquired.seq < prior[3] || acquired.seq !== bridge.expectedGeneration)) throw new Error("BRIDGE_HANDLE_MISMATCH");
+        if (bridge.expectedProviderSession && acquired.provider !== bridge.expectedProviderSession) throw new Error("BRIDGE_HANDLE_MISMATCH");
+        if (prior && (acquired.session !== prior[2] || acquired.seq < prior[3] || (!bridge.observeOnly && acquired.seq !== bridge.expectedGeneration))) throw new Error("BRIDGE_HANDLE_MISMATCH");
         // An actual UI prompt is not a typed runtime question. Do not type into it.
-        if (!["idle", "done"].includes(acquired.occupant.status)) throw new Error("BRIDGE_AGENT_NOT_IDLE");
+        if (!bridge.observeOnly && !["idle", "done"].includes(acquired.occupant.status)) throw new Error("BRIDGE_AGENT_NOT_IDLE");
         const identity = prior ?? [paneId, name, acquired.session, acquired.seq] as [string, string, string, number];
         const handleId = JSON.stringify(identity);
-        const binding = codex ? prior ? codexSessions.get(handleId) : { provider: acquired.provider } : undefined;
+        const binding = codex ? prior ? codexSessions.get(handleId) ?? (bridge.observeOnly ? { provider: acquired.provider } : undefined) : { provider: acquired.provider } : undefined;
         if (codex && (!binding || (prior && !binding.provider))) throw new Error("BRIDGE_HANDLE_MISMATCH");
         bridge.recordHandle({ id: handleId, session: acquired.session });
         if (binding) codexSessions.set(handleId, binding);
@@ -1427,12 +1429,13 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
         // A submission ACK alone can precede the first working report. Require
         // Herdr's post-submission lifecycle change before arming settled waits;
         // include fast terminal turns without relaxing identity or retry rules.
-        const prompted = await cli.exec(["agent", "prompt", paneId, options.prompt!,
+        const prompted = bridge.observeOnly ? { ok: true } : await cli.exec(["agent", "prompt", paneId, options.prompt!,
             "--wait", "--until", "working", "--until", "done", "--until", "idle", "--until", "blocked", "--timeout", "5000"], { timeoutMs: 6000 });
         // A timeout/stall is ambiguous. No Enter recovery and no second prompt.
-        if (!prompted.ok) throw new Error("BRIDGE_PROMPT_AMBIGUOUS");
+        if (!prompted.ok) throw new Error("BRIDGE_PROMPT_AMBIGUOUS"); // A lifecycle change cannot prove receipt of this input.
         const detach = () => { detached = true; for (const waiter of waiters) waiter.kill(); };
-        void (async () => {
+        naturallySettled = bridge.completed === true && ["done", "idle"].includes(acquired.occupant.status);
+        if (!naturallySettled) void (async () => {
             try {
                 let settled = await new Promise<AgentSettledState>((resolve, reject) => {
                     let failed = 0;
@@ -1448,46 +1451,34 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
                 });
                 if (detached || cancelled) return;
                 let current = await checkIdentity(true);
-                // Once child work was live or indeterminate, the parent's old
-                // artifact/turn is insufficient even after the child finishes.
-                // Wait for its delivery-driven fresh turn as well as child quiescence.
-                if (bridge.childrenSettled && !await bridge.childrenSettled()) {
-                    const heldSequence = current.seq;
-                    do {
-                        if (detached || cancelled) return;
-                        await new Promise(resolve => setTimeout(resolve, 250));
-                        current = await checkIdentity();
-                    } while (!await bridge.childrenSettled() || current.seq <= heldSequence || !["done", "idle", "blocked"].includes(current.occupant.status));
-                    settled = current.occupant.status as AgentSettledState;
-                }
-                if (current.seq <= acquired.seq || current.occupant.status !== settled) throw new Error("BRIDGE_STALE_SETTLEMENT");
+                if ((bridge.observeOnly ? current.seq <= (bridge.expectedGeneration ?? identity[3]) : current.seq <= acquired.seq) || current.occupant.status !== settled) throw new Error("BRIDGE_STALE_SETTLEMENT");
                 const output = await readPane(paneId);
                 if (detached || cancelled) return;
                 // Only canonical terminal settlement supersedes cancellation. Artifact
-                // BLOCKED is a completed UI turn, but must remain interruptible.
-                const outcome = bridge.settled(settled, output, current.seq);
+                // BLOCKED report text is separate from an actual blocked UI.
+                const outcome = bridge.settled(settled, output, current.seq, current.provider);
                 naturallySettled = outcome.terminal;
-                if (outcome.close && options.closeOnSettle) {
+                if (!bridge.observeOnly && outcome.close && options.closeOnSettle && (!bridge.childrenSettled || await bridge.childrenSettled())) {
                     const confirmed = await checkIdentity();
                     if (confirmed.seq !== current.seq || confirmed.occupant.status !== current.occupant.status) throw new Error("BRIDGE_CLOSE_IDENTITY_CHANGED");
                     await cli.exec(["pane", "close", paneId]);
                     panes.forgetTarget(paneId);
                 }
-                // Canonical validation decides whether closing is permitted.
+                // Observed turn completion and descendant quiescence govern cleanup.
                 detach();
-            } catch { if (!detached) { detach(); bridge.recoveryRequired(); } }
+            } catch (error) { if (!detached) { detach(); bridge.recoveryRequired(error instanceof Error ? error.message : undefined); } }
         })();
         controller.record.paneId = paneId;
         controller.record.agentName = name;
         const runtimeObservation = async () => {
-            const current = await checkIdentity(Boolean(binding));
+            const current = await checkIdentity();
             let runtime: string | undefined;
             try {
                 const provider = current.provider ? JSON.parse(current.provider) as unknown[] : [];
                 if (typeof provider[1] === "string" && provider[1]) runtime = provider[1];
             } catch { /* An opaque provider identity remains unclassified. */ }
             runtime ??= codex ? "codex" : undefined;
-            return { session: current.session, generation: current.seq, state: current.occupant.status, ...(runtime ? { runtime } : {}) };
+            return { session: current.session, generation: current.seq, state: current.occupant.status, ...(runtime ? { runtime } : {}), ...(current.provider ? { providerSession: current.provider } : {}) };
         };
         return {
             paneId, agentName: name, detach,
@@ -1499,6 +1490,9 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
                 if (naturallySettled) { observer?.superseded(); return; }
                 cancelled = true;
                 const before = await checkIdentity();
+                await observer?.beforeInterrupt?.();
+                const confirmed = await checkIdentity();
+                if (confirmed.seq !== before.seq || confirmed.occupant.status !== before.occupant.status) throw new Error("BRIDGE_CANCEL_TARGET_CHANGED");
                 bridge.assertActive();
                 const escaped = await cli.exec(["pane", "send-keys", paneId, "esc"]);
                 detach();

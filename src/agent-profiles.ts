@@ -96,6 +96,7 @@ export interface ResolveAgentLaunchOptions {
 	acceptance?: string[];
 	requiredSkills?: string[];
 	resultPath?: string;
+	resultPolicy?: "required" | "optional";
 	configPath?: string;
 }
 
@@ -315,7 +316,7 @@ function rolePrompt(
 	if (maxTurns) {
 		packet.push("", `TURN CAP: ${maxTurns} (advisory ceiling; finish integration and verification before settling)`);
 	}
-	if (resultPath) {
+	if (resultPath && options.resultPolicy !== "optional") {
 		packet.push(
 			"",
 			"RESULT ARTIFACT:",

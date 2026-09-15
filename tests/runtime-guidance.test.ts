@@ -7,7 +7,7 @@ test("recovery guidance names the bound pane and agent and never suggests resend
     assert.match(text, /could not prove the worker received its input/);
     assert.match(text, /Worker pane w1:p7 \(agent builder-task-abc\)/);
     assert.match(text, /will not resend, adopt, or kill/);
-    assert.match(text, /launch a new worker/);
+    assert.match(text, /explicitly launch a new task/);
 });
 
 test("recovery guidance without a bound handle points at a possible empty pane", () => {

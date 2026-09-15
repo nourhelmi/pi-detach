@@ -88,7 +88,7 @@ export function registerManagedTeamTools(pi: ExtensionAPI, options: { enabled?: 
 			text: Type.Optional(Type.String({ description: "Shared workstream context for context." })),
 			assignmentId: Type.Optional(Type.String({ description: "Unique ID for a distinct new assignment." })),
 			task: Type.Optional(Type.String({ description: "Task for a distinct new assignment." })),
-			acceptance: Type.Optional(Type.Array(Type.String(), { minItems: 1, maxItems: 12 })),
+			acceptance: Type.Optional(Type.Array(Type.String(), { minItems: 1 })),
 			riskTier: Type.Optional(Type.Union([Type.Literal("low"), Type.Literal("standard"), Type.Literal("high")])),
 		}),
 		executionMode: "parallel",

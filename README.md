@@ -410,12 +410,12 @@ service uses this package's exported `pi-detach/execution-port` (TypeScript; loa
 with tsx), so normal Pi/Herdr remains the visible worker interface. Setup and
 boundaries are in the matching Meta package's `docs/pi-detach-runtime-bridge.md`.
 
-Public input schemas are unchanged. Bridge mode fails closed on an
-unavailable/incompatible connection. It issues durable `pib-…` IDs usable with
-list/output/stop; an owned artifact BLOCKED reply uses that ID as `name`.
-Credential replies, busy steer, arbitrary names, explicit agent
-commands and custom result paths are unsupported. keepAlive retains a successful
-pane for inspection or a bounded follow-up. Escape returns cancel-pending, never confirmed process exit.
+Bridge mode fails visibly on an unavailable/incompatible connection. It issues
+stable `pib-…` IDs for list/output/stop and identity-checked follow-ups using `name`.
+Credential replies, arbitrary pane takeover, explicit agent commands and custom
+result paths are unsupported. `keepAlive` is a cleanup preference, not proof of
+completion or a substitute for checking current worker identity and availability.
+Escape requests cancellation; it never proves process exit.
 The shared service owns completion observation and delivery across Pi reloads;
 service crash recovery never blindly relaunches an ambiguous execution. An active
 Pi delivery consumer automatically retries after a connection failure; unacknowledged
@@ -431,31 +431,55 @@ SQLite/admission/results/delivery live in the existing separate non-LLM service.
 The Pi client supports Node22; the configured service executable requires
 Node24.18+. Missing prerequisites fail visibly without legacy fallback.
 
-Use `/bg_backend` for diagnostics. `/reload` reconnects to the same service and
-pending deliveries without relaunching. Issued `pib-…` identities support artifact
-BLOCKED replies and bounded follow-up tasks after PASS/FAIL when the original
-worker used `keepAlive:true`; omit settings on follow-up. Busy steering, arbitrary
-pane-name takeover, terminal dialogs, custom commands/results and crash adoption
-are unsupported. Output remains available while a worker runs.
+Use `/bg_backend` for diagnostics. `/reload` reconnects the client and pending
+deliveries without relaunching workers. Installing code, reloading a Pi client,
+and upgrading its already-running service are different operations; do not
+restart a service that owns active or uncertain work merely to pick up an update.
 
-Managed workspace grants cover the owning repository and registered Git worktrees
-at startup. Exact scopes enroll on demand, with a finite 256-launch service limit;
-identities are never recycled. Granted foremen use separate child services, and
-parent settlement waits for child completion plus a fresh parent turn.
+Managed workspace grants recognize currently registered same-repository Git
+worktrees, including ones created after startup. Unrelated directories, aliases
+and runtime/control paths remain outside the grant. Run IDs and accounting
+history are retained without a lifetime launch quota. Graphs are optional
+planning and evidence records, not execution permits or repair counters.
 
-`bg_stop` sends Escape once and settles `cancelled` only after Herdr shows the
-same worker settled afterwards; this includes a worker waiting on artifact BLOCKED.
-If canonical terminal settlement wins the race first, no Escape is sent and that
-result is retained. Neither case permits another task after an admitted cancel.
-The pane stays open after cancellation and process exit is never claimed.
-Tool results separate `keepAlive` intent from `reusable` eligibility at sealing.
-`/bg_runtime_close` refuses active, uncertain or unacknowledged work,
-closes reachable foreman child services by typed shutdown, and never synthesizes
-cancellation. Recovery-required notices name the bound pane and agent; inspect it,
-then launch a new worker. `/bg_backend` recomputes the installed code revision on
-every call and warns when the connected service runs older code; start a fresh Pi
-session to use an update.
-Use a new root to upgrade from legacy or change backend.
-Standalone installations remain supported. `PI_DETACH_BACKEND=legacy` is an explicit
-escape for a new root. See Meta's `docs/pi-detach-runtime-bridge.md` for installation,
-Node selection, reload/recovery boundaries and the parent-owned live proof recipe.
+A summary is a convenient handoff, not the worker's only memory or the completion
+signal. A missing, blank or malformed summary leaves report quality unknown;
+observed execution, process exit, report claims and host verification remain
+separate facts. Inspect referenced files and the run's recorded conversation for
+detail. Terminal scrollback alone is not a full transcript.
+
+```js
+bg_output({ runId: "pib-…", source: "transcript", grep: "decision", context: 2, limit: 20 })
+bg_output({ runId: "pib-…", source: "transcript", cursor: 0, limit: 20 })
+// Large entries return a projection and a stable reference for reading every byte.
+bg_output({ runId: "pib-…", source: "transcript", entryRef: "<returned ref>", offset: 0, maxBytes: 16384 })
+```
+
+Transcript search is literal and case-insensitive across recorded history. Use
+`nextCursor` for record pages; large-record byte pages return `nextOffset`, `eof`
+and base64 for lossless reassembly. The run's bound session selects the source;
+no arbitrary transcript paths are accepted. Unsupported providers/records report
+unavailable rather than disguising a terminal tail as a transcript.
+
+A settled parent turn and still-running descendants are also separate facts.
+Outstanding descendants remain visible and protected from accidental teardown;
+a fresh parent turn is not required merely to publish an observed settlement.
+
+`bg_stop` requests Escape once for a live owned worker; repeating it after
+settlement does not resend or destroy the retained capture. Cancellation is
+confirmed only by a later matching observation, never by the request receipt.
+Follow-ups and reconciliation must use the exact recorded identity and current
+availability: no arbitrary pane-name takeover, blind resend, or terminal-dialog
+guessing. An unavailable session is reported as unavailable rather than silently
+replaced by a new worker.
+
+Use `/bg_reconcile pib-…` for identity-checked reattachment to a recorded worker.
+It restores observation where supported, never replays input or adopts an
+unrelated pane. A missing exact session remains explicitly unavailable.
+
+`/bg_runtime_close` protects active and uncertain work. Durable unacknowledged
+notifications survive idle shutdown; they do not keep an otherwise idle service
+alive. Typed descendant shutdown never synthesizes cancellation. Standalone and
+legacy installations remain supported as distinct backends; `PI_DETACH_BACKEND=legacy`
+is an explicit choice for a new root, not a way to change backend around active work.
+See Meta's `docs/pi-detach-runtime-bridge.md` for installation and recovery details.

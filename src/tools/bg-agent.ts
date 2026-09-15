@@ -35,7 +35,7 @@ export function agentTombstoneNote(registry: Registry, name: string): string | u
 	const ago = formatDuration(Date.now() - (past.endedAt ?? past.startedAt));
 	const artifact = past.resultPath
 		? `Its durable result artifact: ${past.resultPath} — read it instead of resuming.`
-		: `Read its transcript with bg_output({ runId: "${past.id}" }).`;
+		: `Read its captured terminal output with bg_output({ runId: "${past.id}" }).`;
 	return (
 		`It settled ${past.agentState ?? "unknown"} ${ago} ago as run ${past.id} and its pane closed.\n` +
 		`${artifact}\n` +
@@ -57,7 +57,7 @@ const INLINE_TAIL_LINES = 120;
 
 export const BgAgentParameters = Type.Object({
 	prompt: Type.String({
-		description: "Task for the helper agent. Self-contained; it shares no context with you. In managed graph work, include the returned graph-evidence prompt block intact: launch/reply admission records its input lineage automatically.",
+		description: "Task for the helper agent. Self-contained; it shares no context with you. Optional graph evidence references record provenance; missing or stale references do not prevent execution.",
 	}),
 	role: Type.Optional(
 		Type.String({
@@ -108,7 +108,7 @@ export const BgAgentParameters = Type.Object({
 	),
 	acceptance: Type.Optional(
 		Type.Array(Type.String(), {
-			maxItems: 12,
+
 			description:
 				"Enumerated falsifiable acceptance criteria. Each states a claim the work must survive and how it is proven (command, evidence condition, or artifact). The worker must verify every criterion itself and map its result Claims one-to-one to them.",
 		}),
@@ -121,7 +121,7 @@ export const BgAgentParameters = Type.Object({
 	requiredSkills: Type.Optional(
 		Type.Array(Type.String(), {
 			description: "Skill names that the role must load for this task.",
-			maxItems: 12,
+
 		}),
 	),
 	agent: Type.Optional(
@@ -267,12 +267,13 @@ export function workerHarness(params: BgAgentParams, inherited = process.env.PI_
   return params.role === 'advisor' ? 'pi' : requested ?? configured;
 }
 
-export async function prepareLaunch(params: BgAgentParams, label: string, inherited?: WorkerHarness): Promise<ResolvedAgentLaunch> {
+export async function prepareLaunch(params: BgAgentParams, label: string, inherited?: WorkerHarness, resultPolicy: "required" | "optional" = "required"): Promise<ResolvedAgentLaunch> {
 	if (params.name) {
 		return { command: params.agent ?? "pi", prompt: params.prompt, runtime: "existing" };
 	}
   const harness = workerHarness(params, inherited);
 	return resolveAgentLaunch({
+    resultPolicy,
 		...(params.agent ? { agent: params.agent } : {}),
 		...(params.role ? { role: params.role } : {}),
 		...(params.model ? { model: params.model } : {}),

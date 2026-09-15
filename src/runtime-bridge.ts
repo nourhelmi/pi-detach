@@ -32,7 +32,7 @@ const CLOSE_REFUSALS: Record<string, string> = {
  SHUTDOWN_PENDING: "an admitted command is still executing; retry after it settles",
  SHUTDOWN_DELIVERY: "unacknowledged deliveries remain; let this session process them (reload if delivery stopped)",
  SHUTDOWN_BUSY: "the service is dispatching; retry in a moment",
- SHUTDOWN_CHILD_ACTIVE: "a foreman's child service still has active or unacknowledged work; let that foreman finish first",
+ SHUTDOWN_CHILD_ACTIVE: "an advisor's child service still has active or uncertain work; let that foreman finish first",
  SHUTDOWN_CHILD_UNCERTAIN: "a foreman's child service is owned but unreachable; inspect it before closing",
  SHUTDOWN_TEAM_ACTIVE: "one or more managed teammates have not been explicitly retired",
 };
@@ -46,7 +46,7 @@ export function recoveryGuidance(delivery: { reason?: string }, handle: { id: st
  const cause = RECOVERY_CAUSES[delivery.reason ?? ""] ?? `of ${delivery.reason ?? "an unknown reason"}`;
  let where = "No worker pane was bound; check for an empty split pane and close it by hand.";
  try { const [paneId, agentName] = JSON.parse(handle!.id) as [string, string]; if (paneId && agentName) where = `Worker pane ${paneId} (agent ${agentName}) may still be running, or may never have received its input.`; } catch { /* unbound */ }
- return `Recovery required because ${cause}. ${where} Inspect that pane directly before deciding; the runtime will not resend, adopt, or kill it. This run ID accepts no further commands; launch a new worker for the task after inspection.`;
+ return `Recovery required because ${cause}. ${where} Inspect that pane directly before deciding; the runtime will not resend, adopt, or kill it. Use /bg_reconcile with this run ID for read-only reattachment. If its exact session is unavailable, inspect the pane and explicitly launch a new task; old input is never replayed.`;
 }
 async function runtimeClient(ctx: ExtensionContext): Promise<Client> {
  if (activationFailure) throw new Error(activationFailure);
@@ -110,9 +110,10 @@ export async function bridgeAgent(ctx: ExtensionContext, toolCallId: string, par
   if (correction) throw new Error(`${(error as Error).message}: ${correction} This call was rejected; no worker launched. Submit corrected arguments as a new tool call.`);
   throw error;
  }
- const format = (details: BridgeAgentDetails) => result(`Runtime agent ${details.runId}. Use this exact ID for bg_output/bg_stop or name for eligible continuation. Busy steering is unsupported.\n${formatHandoff(details)}`, details);
+ const format = (details: BridgeAgentDetails) => result(`Runtime agent ${details.runId}. Use this exact ID for bg_output/bg_stop or name for eligible continuation. Advice to a working agent uses the typed message transport; queued, rejected and unknown delivery are separate from completion.\n${formatHandoff(details)}`, details);
  const prior = await request(ctx, "result", { toolCallId, seal: false }) as BridgeAgentDetails | null;
  if (prior) return format(prior);
+ if (accepted.status === "message-admitted") return format(await request(ctx, "result", { toolCallId, seal: true }) as BridgeAgentDetails);
  const deadline = Date.now() + Math.max(0, params.promoteAfterMs ?? 30000);
  do {
   const node = await request(ctx, "get", { runId: accepted.runId }) as NodeView;
@@ -122,11 +123,16 @@ export async function bridgeAgent(ctx: ExtensionContext, toolCallId: string, par
  return format(await request(ctx, "result", { toolCallId, seal: true }) as BridgeAgentDetails);
 }
 export async function bridgeStop(ctx: ExtensionContext, toolCallId: string, runId: string): Promise<AgentToolResult<{ runId: string; stopped: boolean; status: string }>> {
- await request(ctx, "call", { tool: "bg_stop", toolCallId, params: { runId }, cwd: ctx.cwd });
+ const stopped = await request(ctx, "call", { tool: "bg_stop", toolCallId, params: { runId }, cwd: ctx.cwd }) as { alreadySettled?: boolean; status: string };
+ if (stopped.alreadySettled) return result(`${runId} already completed; no interrupt sent.`, { runId, stopped: true, status: stopped.status });
  return result(`Cancellation admitted for ${runId}. Escape is pending or sent; terminal cancellation and process exit are unconfirmed.`, { runId, stopped: false, status: "cancel-pending" });
 }
 export async function bridgeList(ctx: ExtensionContext): Promise<RunView[]> { return await request(ctx, "list", {}) as RunView[]; }
-export async function bridgeOutput(ctx: ExtensionContext, runId: string, options: { lines?: number; grep?: string } = {}): Promise<AgentToolResult<{ runId: string; status: string; lines: number }>> {
+export async function bridgeOutput(ctx: ExtensionContext, runId: string, options: { lines?: number; grep?: string; source?: "terminal" | "transcript"; cursor?: number; limit?: number; context?: number; entryRef?: string; offset?: number; maxBytes?: number } = {}): Promise<AgentToolResult<{ runId: string; status: string; lines: number }>> {
+ if (options.source === "transcript") {
+  const transcript = await request(ctx, "transcript", { runId, ...(options.grep !== undefined ? { query: options.grep } : {}), ...(options.cursor !== undefined ? { cursor: options.cursor } : {}), ...(options.limit !== undefined ? { limit: options.limit } : {}), ...(options.context !== undefined ? { context: options.context } : {}), ...(options.entryRef !== undefined ? { entryRef: options.entryRef } : {}), ...(options.offset !== undefined ? { offset: options.offset } : {}), ...(options.maxBytes !== undefined ? { maxBytes: options.maxBytes } : {}) }) as { source: string; entries: unknown[] };
+  return result(JSON.stringify(transcript), { runId, status: transcript.source, lines: transcript.entries.length, ...transcript });
+ }
  const node = await request(ctx, "get", { runId }) as NodeView;
  const output = await request(ctx, "output", { runId }) as { text: string };
  let lines = output.text.split("\n");
@@ -163,6 +169,10 @@ export function registerBridgeDelivery(pi: ExtensionAPI): void {
    ctx.ui.notify(`pi-detach backend: runtime connected; ${state.settled ? "no active worker work" : "worker work remains active or uncertain"}${stale ? `. ${STALE_RUNTIME_NOTICE}` : ""}`, stale ? "warning" : "info");
   }
   catch (error) { ctx.ui.notify(`pi-detach backend: runtime unavailable (${error instanceof Error ? error.message : "unknown failure"}); no legacy fallback`, "error"); }
+ } });
+ pi.registerCommand?.("bg_reconcile", { description: "Inspect and reattach one recorded worker without resending input", async handler(args, ctx) {
+  try { const state = await request(ctx, "reconcile", { runId: args.trim() }); ctx.ui.notify(JSON.stringify(state), "info"); }
+  catch (error) { ctx.ui.notify(error instanceof Error ? error.message : "Reconcile unavailable", "error"); }
  } });
  pi.registerCommand?.("bg_runtime_close", { description: "Close only an inactive, acknowledged runtime; never cancel workers", async handler(_args, ctx) {
   try { await request(ctx, "shutdown", {}); generation += 1; ctx.ui.notify("Runtime closed safely. Use a new Pi session for subsequent work.", "info"); }

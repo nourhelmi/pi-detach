@@ -41,9 +41,10 @@ function fixture() {
     };
     const deps = { cli, panes: createPaneManager(cli, { paneId: "w1:p1" }), ctx: { paneId: "w1:p1" }, env: {} };
     const driver = createHerdrDriver(deps);
-    const launch = (followup = false, useDriver = driver) => {
+    const launch = (followup = false, useDriver = driver, observeOnly = false) => {
         const hooks: RuntimeExecutionHooks = {
             environment: {}, assertActive() {},
+            ...(observeOnly ? { observeOnly: true, completed: true, expectedProviderSession: JSON.stringify(["herdr:codex", "codex", "id", "thread-1"]) } : {}),
             ...(followup ? { expectedHandle: bound!, expectedGeneration: agent.state_change_seq } : {}),
             recordHandle(handle) { if (bound) assert.deepEqual(handle, bound); bound = handle; },
             settled() { settled++; return { terminal: true, close: true }; }, recoveryRequired() { recovered++; },
@@ -113,9 +114,11 @@ test("Codex process drift fences live output and Escape", async () => {
     handle.detach?.();
 });
 
-test("Codex prompt ambiguity never retries or sends Enter", async () => {
+test("Codex failed prompt acknowledgement stays uncertain despite an unrelated newer turn", async () => {
     const f = fixture(); f.failPrompt();
     await assert.rejects(f.launch(), /BRIDGE_PROMPT_AMBIGUOUS/);
+    f.provider(); await f.finish();
+    assert.equal(f.counts().settled, 0);
     assert.equal(f.counts().prompts, 1);
     assert.equal(f.calls.some(c => c[1] === "send-keys"), false);
 });
@@ -147,4 +150,17 @@ test("Codex missing or ambiguous native process identity receives no input", asy
         await assert.rejects(f.launch(), /BRIDGE_IDENTITY_UNAVAILABLE/);
         assert.equal(f.counts().prompts, 0);
     }
+});
+
+
+test("Codex explicit completed-session reattachment is read-only and pins the recorded provider", async () => {
+    const f = fixture(); await f.launch(); f.provider(); await f.finish();
+    const before = f.calls.length;
+    const reattached = await f.launch(true, f.newDriver(), true);
+    assert.equal(f.counts().prompts, 1);
+    assert.equal(f.calls.slice(before).some(c => ["start", "prompt", "send-keys", "close"].includes(c[1]!)), false);
+    assert.equal((await reattached.runtimeObservation!()).state, "done");
+    f.provider("foreign");
+    await assert.rejects(f.launch(true, f.newDriver(), true), /BRIDGE_HANDLE_MISMATCH/);
+    assert.equal(f.counts().prompts, 1); reattached.detach?.();
 });

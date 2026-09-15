@@ -33,7 +33,7 @@ test("descendant supervision failure cannot fabricate ancestor cancellation", as
 });
 
 /** Pi occupant that starts working after its prompt; Escape alone changes nothing until the fixture settles it. */
-function fixture(childrenSettled?: () => Promise<boolean>) {
+function fixture(childrenSettled?: () => Promise<boolean>, closeOnSettle = false) {
     const calls: string[][] = [];
     const agent: any = { pane_id: "w1:p2", name: "", agent: "pi", agent_session: { source: "herdr:pi", agent: "pi", kind: "id", value: "session-1" }, state_change_seq: 1, agent_status: "idle" };
     const waiters: Array<{ args: string[]; resolve: (result: CliResult) => void }> = [];
@@ -66,7 +66,7 @@ function fixture(childrenSettled?: () => Promise<boolean>) {
     const observed: Array<{ state: string; output: string; generation: number }> = []; let observerRecovery = 0; let superseded = 0;
     const observer: InterruptObserver = { settled(state, output, generation) { observed.push({ state, output, generation }); }, superseded() { superseded++; }, recoveryRequired() { observerRecovery++; } };
     return {
-        agent, calls, observer, observed, driver: () => driver({ kind: "agent", command: "pi", cwd: "/tmp", prompt: "task", runtimeExecution: hooks, closeOnSettle: false }, controller),
+        agent, calls, observer, observed, driver: () => driver({ kind: "agent", command: "pi", cwd: "/tmp", prompt: "task", runtimeExecution: hooks, closeOnSettle }, controller),
         failEscape() { escFails = true; }, swapOnEscape() { swapOnEscape = true; }, delayNextGet(ms: number) { getDelay = ms; },
         naturalDone() { agent.agent_status = "done"; agent.state_change_seq++; for (const waiter of waiters.splice(0)) if (waiter.args[4] === "done") waiter.resolve(ok()); },
         counts: () => ({ settled, recovered, observerRecovery, superseded }),
@@ -154,4 +154,30 @@ test("interrupt without an observer keeps the legacy fire-and-forget contract", 
     f.agent.agent_status = "idle"; f.agent.state_change_seq++;
     await sleep(60);
     assert.deepEqual(f.observed, []); assert.equal(f.counts().settled, 0);
+});
+
+test("parent turn completion is delivered while descendants remain active; cleanup stays guarded", async () => {
+    const f = fixture(async () => false, true); const handle = await f.driver();
+    f.naturalDone(); await until(() => f.counts().settled === 1);
+    assert.equal(f.calls.some(c => c[1] === "close"), false);
+    assert.equal(f.escapes(), 0); handle.detach?.();
+});
+
+
+test("cancellation rechecks exact identity and generation after descendant cancellation", async () => {
+    for (const drift of ["identity", "generation"]) {
+        const f = fixture(); const handle = await f.driver();
+        await assert.rejects(handle.interrupt!({ ...f.observer, async beforeInterrupt() {
+            if (drift === "identity") f.agent.agent_session.value = "replacement";
+            else f.agent.state_change_seq++;
+        } }), /BRIDGE_(HANDLE_MISMATCH|CANCEL_TARGET_CHANGED)/);
+        assert.equal(f.escapes(), 0); handle.detach?.();
+    }
+});
+
+test("natural settlement wins before descendant cancellation and sends no child effect", async () => {
+    const f = fixture(); const handle = await f.driver(); f.naturalDone(); await until(() => f.counts().settled === 1);
+    let childEffects = 0;
+    await handle.interrupt!({ ...f.observer, async beforeInterrupt() { childEffects++; } });
+    assert.equal(childEffects, 0); assert.equal(f.escapes(), 0); assert.equal(f.counts().superseded, 1);
 });

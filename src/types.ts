@@ -57,9 +57,12 @@ export interface RuntimeExecutionHooks {
  recordHandle(handle: { id: string; session: string }): void;
  expectedHandle?: { id: string; session?: string };
  expectedGeneration?: number;
+ observeOnly?: boolean;
+ completed?: boolean;
+ expectedProviderSession?: string;
  childrenSettled?(): Promise<boolean>;
- settled(state: AgentSettledState, output: string, generation: number): { terminal: boolean; close: boolean };
- recoveryRequired(): void;
+ settled(state: AgentSettledState, output: string, generation: number, providerSession?: string): { terminal: boolean; close: boolean };
+ recoveryRequired(cause?: string): void;
  environment: Record<string, string>;
 }
 
@@ -155,17 +158,19 @@ export interface DriverHandle {
 	/** Live read for runs whose output is not streamed into the registry (herdr panes). */
 	readLive?: (lines: number) => Promise<string>;
 	/** Exact managed occupant observation. Effective model/effort are deliberately not inferred. */
-	runtimeObservation?: () => Promise<{ session: string; generation: number; state: string; runtime?: string }>;
+	runtimeObservation?: () => Promise<{ session: string; generation: number; state: string; runtime?: string; providerSession?: string }>;
 	/** Queue advice to the same managed busy occupant. No lifecycle or assignment mutation. */
 	message?: (input: { text: string; target: { session: string; handleId: string; generation: number } }) => Promise<{ status: "queued" | "rejected" | "unknown"; session: string; generation: number; state: string }>;
 }
 
 /** Trusted service-only cancellation observer. Settlement after an interrupt is observed, never invented. */
 export interface InterruptObserver {
+ /** Called only after cancellation wins over natural settlement, before Escape. */
+ beforeInterrupt?(): Promise<void>;
  settled(state: AgentSettledState, output: string, generation: number): void;
  /** The turn had already settled naturally before the interrupt began; no Escape was sent. */
  superseded(): void;
- recoveryRequired(): void;
+ recoveryRequired(cause?: string): void;
 }
 
 export type DriverStart = (
