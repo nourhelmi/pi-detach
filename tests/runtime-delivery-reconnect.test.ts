@@ -3,7 +3,7 @@ import test from 'node:test';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
+import type { ExtensionAPI, ExtensionContext, SessionEntry } from '@earendil-works/pi-coding-agent';
 import { registerBridgeDelivery, resetBridgeClients } from '../src/runtime-bridge.ts';
 
 for (const fault of ['list', 'wait', 'ack']) test(`completion delivery reconnects after ${fault} failure without duplicate wake or worker execution`, { timeout: 5000 }, async t => {
@@ -27,7 +27,7 @@ export function createPiDetachClient() { return { async request(session, action,
   process.env.ADVISOR_RUNTIME_DESCRIPTOR = join(dir, 'descriptor');
   delete process.env.PI_DETACH_BACKEND;
   const consumers: Record<string, any>[] = [];
-  const entries: any[] = [{ type: 'message', message: { role: 'custom', customType: 'pi-detach-runtime', details: { rootSession: 'foreign', runId: 'pib-worker', deliveryId: 5 } } }];
+  const entries: SessionEntry[] = [{ type: 'custom_message', id: 'foreign', parentId: null, timestamp: new Date().toISOString(), customType: 'pi-detach-runtime', content: '', display: true, details: { rootSession: 'foreign', runId: 'pib-worker', deliveryId: 5 } }];
   const sent: any[] = []; const notifications: string[] = [];
   const ctx = { cwd: dir, sessionManager: { getSessionId: () => 'owner', getEntries: () => entries }, isIdle: () => true, ui: { notify(message: string) { notifications.push(message); } } } as unknown as ExtensionContext;
   t.after(async () => {
@@ -40,7 +40,7 @@ export function createPiDetachClient() { return { async request(session, action,
   function consumer() {
     const handlers: Record<string, any> = {}; consumers.push(handlers);
     registerBridgeDelivery({ on(name: string, handler: any) { handlers[name] = handler; }, registerCommand() {}, sendMessage(message: any, options: any) {
-      sent.push({ message, options }); entries.push({ type: 'message', message: { role: 'custom', ...message } });
+      sent.push({ message, options }); entries.push({ type: 'custom_message', id: `notification-${sent.length}`, parentId: null, timestamp: new Date().toISOString(), ...message });
     } } as unknown as ExtensionAPI);
     return handlers;
   }

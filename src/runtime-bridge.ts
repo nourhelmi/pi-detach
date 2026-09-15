@@ -178,13 +178,13 @@ export function registerBridgeDelivery(pi: ExtensionAPI): void {
   // Retry dedupe is session-scoped. A persisted custom message survives reconnect;
   // an in-memory queued message is not claimed as durable host receipt/read.
   const deliveredTeamMessages = new Set(entries.flatMap(entry => {
-   if (entry.type !== 'message' || entry.message.role !== 'custom' || entry.message.customType !== 'managed-team-message') return [];
-   const details = entry.message.details as { rootSession?: string; runId?: string; messageId?: string } | undefined;
+   if (entry.type !== 'custom_message' || entry.customType !== 'managed-team-message') return [];
+   const details = entry.details as { rootSession?: string; runId?: string; messageId?: string } | undefined;
    return details?.rootSession === ctx.sessionManager.getSessionId() && details.runId && details.messageId ? [`${details.runId}/${details.messageId}`] : [];
   }));
   const deliveredCompletions = new Set(entries.flatMap(entry => {
-   if (entry.type !== 'message' || entry.message.role !== 'custom' || entry.message.customType !== 'pi-detach-runtime') return [];
-   const details = entry.message.details as { rootSession?: string; runId?: string; deliveryId?: number } | undefined;
+   if (entry.type !== 'custom_message' || entry.customType !== 'pi-detach-runtime') return [];
+   const details = entry.details as { rootSession?: string; runId?: string; deliveryId?: number } | undefined;
    return details?.rootSession === ctx.sessionManager.getSessionId() && details.runId && details.deliveryId ? [`${details.runId}/${details.deliveryId}`] : [];
   }));
   const legacy = entries.some(entry => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "bg_agent" && (() => {

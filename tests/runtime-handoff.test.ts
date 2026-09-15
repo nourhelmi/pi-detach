@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { bridgeAgent, formatHandoff, registerBridgeDelivery, resetBridgeClients } from "../src/runtime-bridge.ts";
 import { registerBgListTool } from "../src/tools/bg-list.ts";
 import type { Registry } from "../src/registry.ts";
@@ -78,12 +78,12 @@ export function createPiDetachClient() { return { async request(session, action)
   const global = globalThis as typeof globalThis & { __teamRetry?: { acks: number; done(): void } };
   const consumers: Record<string, any>[] = []; const sent: any[] = [];
   // A foreign session's conversation entry is never receipt authority for this root.
-  const entries: any[] = [{ type: 'message', message: { role: 'custom', customType: 'managed-team-message', details: { rootSession: 'foreign', runId: 'pib-member', messageId: 'message-7' } } }];
+  const entries: SessionEntry[] = [{ type: 'custom_message', id: 'foreign', parentId: null, timestamp: new Date().toISOString(), customType: 'managed-team-message', content: '', display: true, details: { rootSession: 'foreign', runId: 'pib-member', messageId: 'message-7' } }];
   let disconnected!: () => void; const lostAck = new Promise<void>(resolve => { disconnected = resolve; });
   const ctx = { cwd: dir, sessionManager: { getSessionId: () => 'owner', getEntries: () => entries }, isIdle: () => false, ui: { notify() { disconnected(); } } } as unknown as ExtensionContext;
   function consumer() {
     const handlers: Record<string, any> = {}; consumers.push(handlers);
-    registerBridgeDelivery({ on(name: string, fn: any) { handlers[name] = fn; }, registerCommand() {}, sendMessage(message: any) { sent.push(message); entries.push({ type: 'message', message: { role: 'custom', ...message } }); } } as unknown as ExtensionAPI);
+    registerBridgeDelivery({ on(name: string, fn: any) { handlers[name] = fn; }, registerCommand() {}, sendMessage(message: any) { sent.push(message); entries.push({ type: 'custom_message', id: `notification-${sent.length}`, parentId: null, timestamp: new Date().toISOString(), ...message }); } } as unknown as ExtensionAPI);
     return handlers;
   }
   t.after(async () => {
