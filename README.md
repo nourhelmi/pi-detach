@@ -417,7 +417,10 @@ Credential replies, busy steer, arbitrary names, explicit agent
 commands and custom result paths are unsupported. keepAlive retains a successful
 pane for inspection or a bounded follow-up. Escape returns cancel-pending, never confirmed process exit.
 The shared service owns completion observation and delivery across Pi reloads;
-service crash recovery never blindly relaunches an ambiguous execution.
+service crash recovery never blindly relaunches an ambiguous execution. An active
+Pi delivery consumer automatically retries after a connection failure; unacknowledged
+completions remain durable. Lost acknowledgements do not duplicate an already queued
+notification, and persisted notifications are re-acknowledged after reload.
 
 ### Managed Meta runtime backend
 

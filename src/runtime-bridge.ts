@@ -26,7 +26,7 @@ let staleRuntime = false;
 let revisionProbe: (() => string) | undefined;
 const clients = new Map<string, Promise<Client>>();
 export function resetBridgeClients(): void { clients.clear(); activationFailure = undefined; staleRuntime = false; revisionProbe = undefined; }
-const STALE_RUNTIME_NOTICE = "The connected runtime service runs older code than the installed pi-detach/runtime files. Start a fresh Pi session to use the update; this session keeps its existing service.";
+const STALE_RUNTIME_NOTICE = "The connected runtime service has older code than the installed files. /reload updates the Pi client only; existing service and work are preserved. Service-code upgrades require a separate safe restart.";
 const CLOSE_REFUSALS: Record<string, string> = {
  SHUTDOWN_ACTIVE: "a worker is still running, blocked, or cancel-pending; wait for it to settle or inspect its pane",
  SHUTDOWN_PENDING: "an admitted command is still executing; retry after it settles",
@@ -182,6 +182,11 @@ export function registerBridgeDelivery(pi: ExtensionAPI): void {
    const details = entry.message.details as { rootSession?: string; runId?: string; messageId?: string } | undefined;
    return details?.rootSession === ctx.sessionManager.getSessionId() && details.runId && details.messageId ? [`${details.runId}/${details.messageId}`] : [];
   }));
+  const deliveredCompletions = new Set(entries.flatMap(entry => {
+   if (entry.type !== 'message' || entry.message.role !== 'custom' || entry.message.customType !== 'pi-detach-runtime') return [];
+   const details = entry.message.details as { rootSession?: string; runId?: string; deliveryId?: number } | undefined;
+   return details?.rootSession === ctx.sessionManager.getSessionId() && details.runId && details.deliveryId ? [`${details.runId}/${details.deliveryId}`] : [];
+  }));
   const legacy = entries.some(entry => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "bg_agent" && (() => {
    const d = entry.message.details as { runId?: string; status?: string } | undefined;
    return d?.status === "running" && d.runId && !d.runId.startsWith("pib-");
@@ -190,8 +195,9 @@ export function registerBridgeDelivery(pi: ExtensionAPI): void {
   try { await runtimeClient(ctx); } catch (error) { ctx.ui.notify(`pi-detach runtime unavailable: ${error instanceof Error ? error.message : "startup failed"}. bg_agent remains fenced.`, "error"); return; }
   if (staleRuntime) ctx.ui.notify(`pi-detach runtime: ${STALE_RUNTIME_NOTICE}`, "warning");
   void (async () => {
-   try {
-    while (own === generation) {
+   let disconnected = false;
+   while (own === generation) {
+    try {
      const runs = await bridgeList(ctx);
      for (const run of runs) {
       if (own !== generation) return;
@@ -208,7 +214,8 @@ export function registerBridgeDelivery(pi: ExtensionAPI): void {
          deliveredTeamMessages.add(key);
         }
        }
-       if (["settled", "recovery-required"].includes(delivery.kind)) {
+       const completionKey = `${run.runId}/${delivery.id}`;
+       if (["settled", "recovery-required"].includes(delivery.kind) && !deliveredCompletions.has(completionKey)) {
         let content = `${run.runId}: ${delivery.status ?? delivery.kind}. ${delivery.reason ?? ""}`;
         if (delivery.result) content += `\nHistorical settlement report: ${delivery.result.path} (attempt ${delivery.attempt ?? "unknown"}); integrity: ${delivery.result.integrity}; historical report, not current proof.`;
         if (delivery.handoff) content += `\n${formatHandoff(delivery.handoff)}`;
@@ -216,15 +223,21 @@ export function registerBridgeDelivery(pi: ExtensionAPI): void {
          const node = await request(ctx, "get", { runId: run.runId }) as { handle?: { id: string } | null };
          content += `\n${recoveryGuidance(delivery, node.handle)}`;
         }
-        pi.sendMessage({ customType: "pi-detach-runtime", content, display: true, details: { runId: run.runId, deliveryId: delivery.id, result: delivery.result, handoff: delivery.handoff } }, ctx.isIdle() ? { triggerTurn: true } : { deliverAs: "steer" });
+        pi.sendMessage({ customType: "pi-detach-runtime", content, display: true, details: { rootSession: ctx.sessionManager.getSessionId(), runId: run.runId, deliveryId: delivery.id, result: delivery.result, handoff: delivery.handoff } }, ctx.isIdle() ? { triggerTurn: true } : { deliverAs: "steer" });
+        deliveredCompletions.add(completionKey);
        }
        if (own !== generation) return;
        await request(ctx, "ack", { runId: run.runId, deliveryId: delivery.id });
       }
      }
-     await new Promise(resolve => setTimeout(resolve, 250));
+     disconnected = false;
+    } catch {
+     if (own !== generation) return;
+     if (!disconnected) ctx.ui.notify("pi-detach runtime delivery disconnected; reconnecting automatically. Unacked deliveries are retained.", "warning");
+     disconnected = true;
     }
-   } catch { if (own === generation) ctx.ui.notify("pi-detach runtime delivery disconnected; reload after restoring the service. Unacked deliveries are retained.", "error"); }
+    await new Promise(resolve => setTimeout(resolve, disconnected ? 1000 : 250));
+   }
   })();
  });
 }
