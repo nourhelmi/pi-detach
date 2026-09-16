@@ -99,8 +99,8 @@ export function registerManagedTeamTools(pi: ExtensionAPI, options: { enabled?: 
 			else if (params.action === "rename") { if (!params.to || !params.name) throw new Error("TEAM_MANAGE_INPUT: rename requires to and name."); payload.to = params.to; payload.name = params.name; }
 			else if (params.action === "context") { if (!params.text) throw new Error("TEAM_MANAGE_INPUT: context requires text."); payload.text = params.text; }
 			else if (params.action === "assign") {
-				if (!params.to || !params.assignmentId || !params.task || !params.acceptance?.length || !params.riskTier) throw new Error("TEAM_MANAGE_INPUT: assign requires to, assignmentId, task, acceptance, and riskTier.");
-				Object.assign(payload, { to: params.to, assignmentId: params.assignmentId, task: params.task, acceptance: params.acceptance, riskTier: params.riskTier });
+				if (!params.to || !params.assignmentId || !params.task || !params.acceptance?.length) throw new Error("TEAM_MANAGE_INPUT: assign requires to, assignmentId, task, and acceptance.");
+				Object.assign(payload, { to: params.to, assignmentId: params.assignmentId, task: params.task, acceptance: params.acceptance, ...(params.riskTier ? { riskTier: params.riskTier } : {}) });
 			} else { if (!params.to) throw new Error("TEAM_MANAGE_INPUT: retire requires to."); payload.to = params.to; }
 			const details = await teamRequest(ctx, `team.${params.action}`, payload) as Details;
 			return result(`Team ${params.action}: ${String(details.status ?? details.outcome ?? "accepted")}.`, details);
