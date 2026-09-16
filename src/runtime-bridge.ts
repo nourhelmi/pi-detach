@@ -11,11 +11,11 @@ interface NodeView {
  snapshot: { state: string; attempt: number; cancel: unknown };
  packet: { cwd: string; execution: { label: string; role: string; model: string; thinking: string; maxTurns: number | null; keepAlive: boolean } };
 }
-interface ResultHandoff { status: string; attempt?: number; reusable?: boolean; continuation?: string; result?: { path: string; sha256: string; attempt: number; status: string; claims: string; risks: string; evidence: string; integrity: string; proof: string; tested: unknown; lastCheck?: unknown; limitation: string } | null }
+interface ResultHandoff { status: string; attempt?: number; reusable?: boolean; continuation?: string; result?: { path: string; sha256: string; attempt: number; status: string; integrity: string; proof: string; tested: unknown; lastCheck?: unknown; limitation: string } | null }
 interface RunView { runId: string; node: (NodeView & ResultHandoff) | null }
 export function formatHandoff(handoff: ResultHandoff): string {
  const report = handoff.result;
- return `Current status: ${handoff.status}; attempt: ${handoff.attempt ?? "unknown"}; continuation: ${handoff.continuation ?? "none"}.` + (report ? `\nCaptured worker report: ${report.path}\nSHA256: ${report.sha256}; report attempt: ${report.attempt}; integrity: ${report.integrity}; proof: ${report.proof}.\nTested: ${report.tested ? JSON.stringify(report.tested).slice(0, 4096) : "unknown"}\nLast host check: ${report.lastCheck ? JSON.stringify(report.lastCheck).slice(0, 4096) : "none"}\nWorker status: ${report.status}\nClaims: ${report.claims}\nEvidence: ${report.evidence}\nRemaining risk: ${report.risks}\n${report.limitation}` : "\nNo current captured result; tested content unknown.");
+ return `Current status: ${handoff.status}; attempt: ${handoff.attempt ?? "unknown"}; continuation: ${handoff.continuation ?? "none"}.` + (report ? `\nCaptured worker report: ${report.path}\nSHA256: ${report.sha256}; report attempt: ${report.attempt}; integrity: ${report.integrity}; proof: ${report.proof}.\nTested: ${report.tested ? JSON.stringify(report.tested).slice(0, 4096) : "unknown"}\nLast host check: ${report.lastCheck ? JSON.stringify(report.lastCheck).slice(0, 4096) : "none"}\nWorker status: ${report.status}\n${report.limitation}` : "\nNo current captured result; tested content unknown.");
 }
 const managedConfig = () => join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "pi-detach-runtime.json");
 export const bridgeEnabled = () => process.env.PI_DETACH_BACKEND !== "legacy" && (Boolean(process.env.PI_DETACH_RUNTIME_BRIDGE) || existsSync(managedConfig()));

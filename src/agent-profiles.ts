@@ -289,7 +289,7 @@ function rolePrompt(
 		.filter(Boolean);
 	if (profile.requireAnchor && criteria.length === 0) {
 		throw new Error(
-			`bg_agent role ${role} requires at least one acceptance criterion (acceptance or anchor)`,
+			`bg_agent role ${role} requires a done-when line (anchor or acceptance)`,
 		);
 	}
 	const skills = options.requiredSkills ?? [];

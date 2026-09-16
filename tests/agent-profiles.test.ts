@@ -120,7 +120,7 @@ test("requires an anchor when the selected role profile requires one", async () 
 			label: "reviewer",
 			configPath: path,
 		}),
-		/requires at least one acceptance criterion/,
+		/requires a done-when line/,
 	);
 });
 
