@@ -62,11 +62,11 @@ test("managed team tools stay gated until /cos activation and expose honest mess
 	}, "public tool preserves runtime byte and projection bounds without inventing a quota");
 	const message = await tools.get("team_message")!.execute("message", { to: "alpha", text: "check transport" }, undefined, undefined, ctx);
 	assert.match((message.content[0] as { text: string }).text, /read unknown; done unknown/);
-	await tools.get("team_manage")!.execute("assign", { action: "assign", to: "alpha", assignmentId: "contract-2", task: "new work", acceptance: ["proof"], riskTier: "high" }, undefined, undefined, ctx);
+	await tools.get("team_manage")!.execute("assign", { action: "assign", to: "alpha", assignmentId: "contract-2", task: "new work", acceptance: ["proof"] }, undefined, undefined, ctx);
 	assert.deepEqual(requests, [
 		{ action: "team.status", payload: {} },
 		{ action: "team.message", payload: { toolCallId: "message", to: "alpha", text: "check transport" } },
-		{ action: "team.assign", payload: { toolCallId: "assign", to: "alpha", assignmentId: "contract-2", task: "new work", acceptance: ["proof"], riskTier: "high" } },
+		{ action: "team.assign", payload: { toolCallId: "assign", to: "alpha", assignmentId: "contract-2", task: "new work", acceptance: ["proof"] } },
 	]);
 	events.get("advisor:team-mode")?.({ enabled: false });
 	assert.deepEqual(activeTools, ["read", "bash"]);

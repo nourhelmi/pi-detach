@@ -89,7 +89,6 @@ export function registerManagedTeamTools(pi: ExtensionAPI, options: { enabled?: 
 			assignmentId: Type.Optional(Type.String({ description: "Unique ID for a distinct new assignment." })),
 			task: Type.Optional(Type.String({ description: "Task for a distinct new assignment." })),
 			acceptance: Type.Optional(Type.Array(Type.String(), { minItems: 1 })),
-			riskTier: Type.Optional(Type.Union([Type.Literal("low"), Type.Literal("standard"), Type.Literal("high")])),
 		}),
 		executionMode: "parallel",
 		async execute(toolCallId, params, _signal, _update, ctx) {
@@ -100,7 +99,7 @@ export function registerManagedTeamTools(pi: ExtensionAPI, options: { enabled?: 
 			else if (params.action === "context") { if (!params.text) throw new Error("TEAM_MANAGE_INPUT: context requires text."); payload.text = params.text; }
 			else if (params.action === "assign") {
 				if (!params.to || !params.assignmentId || !params.task || !params.acceptance?.length) throw new Error("TEAM_MANAGE_INPUT: assign requires to, assignmentId, task, and acceptance.");
-				Object.assign(payload, { to: params.to, assignmentId: params.assignmentId, task: params.task, acceptance: params.acceptance, ...(params.riskTier ? { riskTier: params.riskTier } : {}) });
+				Object.assign(payload, { to: params.to, assignmentId: params.assignmentId, task: params.task, acceptance: params.acceptance });
 			} else { if (!params.to) throw new Error("TEAM_MANAGE_INPUT: retire requires to."); payload.to = params.to; }
 			const details = await teamRequest(ctx, `team.${params.action}`, payload) as Details;
 			return result(`Team ${params.action}: ${String(details.status ?? details.outcome ?? "accepted")}.`, details);
