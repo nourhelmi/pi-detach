@@ -52,6 +52,9 @@ export interface RunRecord {
 }
 
 /** Trusted service-only hooks. Never populated from public tool parameters. */
+/** Verdict for one observed turn. `rearm` keeps observing the same occupant for its next turn instead of finishing the run. */
+export interface SettledOutcome { terminal: boolean; close: boolean; rearm?: boolean }
+
 export interface RuntimeExecutionHooks {
  assertActive(): void;
  recordHandle(handle: { id: string; session: string }): void;
@@ -61,7 +64,7 @@ export interface RuntimeExecutionHooks {
  completed?: boolean;
  expectedProviderSession?: string;
  childrenSettled?(): Promise<boolean>;
- settled(state: AgentSettledState, output: string, generation: number, providerSession?: string): { terminal: boolean; close: boolean };
+ settled(state: AgentSettledState, output: string, generation: number, providerSession?: string): SettledOutcome | Promise<SettledOutcome>;
  recoveryRequired(cause?: string): void;
  environment: Record<string, string>;
 }

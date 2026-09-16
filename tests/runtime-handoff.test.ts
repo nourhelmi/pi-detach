@@ -102,3 +102,29 @@ export function createPiDetachClient() { return { async request(session, action)
   assert.equal(global.__teamRetry.acks, 3); assert.equal(sent[0].details.rootSession, 'owner');
   assert.equal(sent[0].details.read, null); assert.equal(sent[0].details.done, null);
 });
+
+test('root delivery consumer records a held child checkpoint without waking the advisor', async t => {
+  const dir = await mkdtemp('/tmp/detach-progress-delivery-'); const modulePath = join(dir, 'client.mjs');
+  await writeFile(modulePath, `export const PI_DETACH_CLIENT_VERSION = 1; let sent=false;
+export function createPiDetachClient() { return { async request(session, action, payload) {
+ if(action==='list') return [{runId:'pib-child',node:{}}];
+ if(action==='wait' && !sent) { sent=true; return [{id:3,kind:'progress',note:'Turn settled done with report status IN PROGRESS; descendants are still active, so this attempt stays open and settles on the final turn.'}]; }
+ if(action==='wait') return []; if(action==='ack') { globalThis.__progressAck=payload; return {}; } throw Error(action);
+} }; }`);
+  const previous = { bridge: process.env.PI_DETACH_RUNTIME_BRIDGE, descriptor: process.env.ADVISOR_RUNTIME_DESCRIPTOR };
+  process.env.PI_DETACH_RUNTIME_BRIDGE = modulePath; process.env.ADVISOR_RUNTIME_DESCRIPTOR = join(dir, 'descriptor');
+  const record = globalThis as typeof globalThis & { __progressAck?: unknown };
+  t.after(async () => { if (previous.bridge === undefined) delete process.env.PI_DETACH_RUNTIME_BRIDGE; else process.env.PI_DETACH_RUNTIME_BRIDGE = previous.bridge; if (previous.descriptor === undefined) delete process.env.ADVISOR_RUNTIME_DESCRIPTOR; else process.env.ADVISOR_RUNTIME_DESCRIPTOR = previous.descriptor; delete record.__progressAck; resetBridgeClients(); await rm(dir, { recursive: true, force: true }); });
+  const handlers: Record<string, any> = {}; let delivered!: (value: any) => void;
+  const received = new Promise<any>(resolve => { delivered = resolve; });
+  registerBridgeDelivery({ on(name: string, fn: any) { handlers[name] = fn; }, registerCommand() {}, sendMessage(message: any, options: any) { delivered({ message, options }); } } as unknown as ExtensionAPI);
+  const ctx = { cwd: dir, sessionManager: { getSessionId: () => 'owner', getEntries: () => [] }, isIdle: () => true, ui: { notify() {} } } as unknown as ExtensionContext;
+  await handlers.session_start({}, ctx); const delivery = await received;
+  assert.equal(delivery.message.customType, 'pi-detach-runtime-progress');
+  assert.match(delivery.message.content, /^pib-child: Turn settled done with report status IN PROGRESS/);
+  assert.deepEqual(delivery.options, { triggerTurn: false }, 'a checkpoint is recorded for the next turn, never a wake');
+  assert.deepEqual(delivery.message.details, { rootSession: 'owner', runId: 'pib-child', deliveryId: 3 });
+  for (let i = 0; i < 50 && !record.__progressAck; i++) await new Promise(resolve => setTimeout(resolve, 5));
+  assert.deepEqual(record.__progressAck, { runId: 'pib-child', deliveryId: 3 });
+  handlers.session_shutdown();
+});

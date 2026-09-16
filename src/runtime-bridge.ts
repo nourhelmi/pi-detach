@@ -193,7 +193,7 @@ export function registerBridgeDelivery(pi: ExtensionAPI): void {
    return details?.rootSession === ctx.sessionManager.getSessionId() && details.runId && details.messageId ? [`${details.runId}/${details.messageId}`] : [];
   }));
   const deliveredCompletions = new Set(entries.flatMap(entry => {
-   if (entry.type !== 'custom_message' || entry.customType !== 'pi-detach-runtime') return [];
+   if (entry.type !== 'custom_message' || !['pi-detach-runtime', 'pi-detach-runtime-progress'].includes(entry.customType)) return [];
    const details = entry.details as { rootSession?: string; runId?: string; deliveryId?: number } | undefined;
    return details?.rootSession === ctx.sessionManager.getSessionId() && details.runId && details.deliveryId ? [`${details.runId}/${details.deliveryId}`] : [];
   }));
@@ -212,7 +212,7 @@ export function registerBridgeDelivery(pi: ExtensionAPI): void {
      for (const run of runs) {
       if (own !== generation) return;
       if (!run.node) continue;
-      const deliveries = await request(ctx, "wait", { runId: run.runId, timeoutMs: 0 }) as Array<{ id: number; kind: string; status?: string; reason?: string; attempt?: number; result?: ResultHandoff["result"]; handoff?: ResultHandoff; message?: { id: string; from: string; fromName: string; text: string; status: string } }>;
+      const deliveries = await request(ctx, "wait", { runId: run.runId, timeoutMs: 0 }) as Array<{ id: number; kind: string; status?: string; reason?: string; note?: string; attempt?: number; result?: ResultHandoff["result"]; handoff?: ResultHandoff; message?: { id: string; from: string; fromName: string; text: string; status: string } }>;
       for (const delivery of deliveries) {
        if (own !== generation) return;
        if (delivery.kind === "team.message" && delivery.message) {
@@ -226,7 +226,8 @@ export function registerBridgeDelivery(pi: ExtensionAPI): void {
        }
        const completionKey = `${run.runId}/${delivery.id}`;
        if (["settled", "recovery-required"].includes(delivery.kind) && !deliveredCompletions.has(completionKey)) {
-        let content = `${run.runId}: ${delivery.status ?? delivery.kind}. ${delivery.reason ?? ""}`;
+        const reportStatus = delivery.kind === "settled" ? delivery.result?.status : undefined;
+        let content = reportStatus ? `${run.runId}: turn ${delivery.status ?? "settled"}; report status ${reportStatus}. ${delivery.reason ?? ""}` : `${run.runId}: ${delivery.status ?? delivery.kind}. ${delivery.reason ?? ""}`;
         if (delivery.result) content += `\nHistorical settlement report: ${delivery.result.path} (attempt ${delivery.attempt ?? "unknown"}); integrity: ${delivery.result.integrity}; historical report, not current proof.`;
         if (delivery.handoff) content += `\n${formatHandoff(delivery.handoff)}`;
         if (delivery.kind === "recovery-required") {
@@ -234,6 +235,12 @@ export function registerBridgeDelivery(pi: ExtensionAPI): void {
          content += `\n${recoveryGuidance(delivery, node.handle)}`;
         }
         pi.sendMessage({ customType: "pi-detach-runtime", content, display: true, details: { rootSession: ctx.sessionManager.getSessionId(), runId: run.runId, deliveryId: delivery.id, result: delivery.result, handoff: delivery.handoff } }, ctx.isIdle() ? { triggerTurn: true } : { deliverAs: "steer" });
+        deliveredCompletions.add(completionKey);
+       }
+       if (delivery.kind === "progress" && !deliveredCompletions.has(completionKey)) {
+        // A held child checkpoint is information for the next turn, never a wake.
+        pi.sendMessage({ customType: "pi-detach-runtime-progress", content: `${run.runId}: ${delivery.note ?? "progress"}`, display: true,
+         details: { rootSession: ctx.sessionManager.getSessionId(), runId: run.runId, deliveryId: delivery.id } }, ctx.isIdle() ? { triggerTurn: false } : { deliverAs: "steer" });
         deliveredCompletions.add(completionKey);
        }
        if (own !== generation) return;

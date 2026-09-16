@@ -1435,37 +1435,63 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
         if (!prompted.ok) throw new Error("BRIDGE_PROMPT_AMBIGUOUS"); // A lifecycle change cannot prove receipt of this input.
         const detach = () => { detached = true; for (const waiter of waiters) waiter.kill(); };
         naturallySettled = bridge.completed === true && ["done", "idle"].includes(acquired.occupant.status);
+        const armSettledWaiters = () => new Promise<AgentSettledState>((resolve, reject) => {
+            let failed = 0; let resolved = false;
+            const round: Waiter[] = [];
+            for (const state of ["done", "idle", "blocked"] as const) {
+                const waiter = cli.spawnWaiter(["agent", "wait", paneId, "--until", state, "--timeout", String(WAIT_FOREVER_MS)]);
+                waiters.push(waiter); round.push(waiter);
+                void waiter.promise.then(result => {
+                    if (detached || resolved) return;
+                    if (result.ok) { resolved = true; for (const sibling of round) if (sibling !== waiter) sibling.kill(); resolve(state); }
+                    else if (++failed === 3) reject(new Error("BRIDGE_OBSERVATION_AMBIGUOUS"));
+                });
+            }
+        });
+        const awaitWorking = async () => {
+            const waiter = cli.spawnWaiter(["agent", "wait", paneId, "--until", "working", "--timeout", String(WAIT_FOREVER_MS)]);
+            waiters.push(waiter);
+            const result = await waiter.promise;
+            if (!detached && !result.ok) throw new Error("BRIDGE_OBSERVATION_AMBIGUOUS");
+        };
         if (!naturallySettled) void (async () => {
             try {
-                let settled = await new Promise<AgentSettledState>((resolve, reject) => {
-                    let failed = 0;
-                    for (const state of ["done", "idle", "blocked"] as const) {
-                        const waiter = cli.spawnWaiter(["agent", "wait", paneId, "--until", state, "--timeout", String(WAIT_FOREVER_MS)]);
-                        waiters.push(waiter);
-                        void waiter.promise.then(result => {
-                            if (detached) return;
-                            if (result.ok) resolve(state);
-                            else if (++failed === 3) reject(new Error("BRIDGE_OBSERVATION_AMBIGUOUS"));
-                        });
+                let baseline = bridge.observeOnly ? (bridge.expectedGeneration ?? identity[3]) : acquired.seq;
+                let rearmed = false;
+                for (;;) {
+                    let settled: AgentSettledState | undefined;
+                    if (rearmed) {
+                        // A held turn parks the occupant at its composer, and Herdr's
+                        // `agent wait --until done` returns at once for a state already
+                        // reached. Wait for the next lifecycle change first, unless the
+                        // occupant has already moved on since the held observation.
+                        const now = await checkIdentity(true);
+                        if (detached || cancelled) return;
+                        if (now.seq > baseline && RUNTIME_SETTLED_STATES.includes(now.occupant.status)) settled = now.occupant.status as AgentSettledState;
+                        else if (now.seq <= baseline) await awaitWorking();
+                        if (detached || cancelled) return;
                     }
-                });
-                if (detached || cancelled) return;
-                let current = await checkIdentity(true);
-                if ((bridge.observeOnly ? current.seq <= (bridge.expectedGeneration ?? identity[3]) : current.seq <= acquired.seq) || current.occupant.status !== settled) throw new Error("BRIDGE_STALE_SETTLEMENT");
-                const output = await readPane(paneId);
-                if (detached || cancelled) return;
-                // Only canonical terminal settlement supersedes cancellation. Artifact
-                // BLOCKED report text is separate from an actual blocked UI.
-                const outcome = bridge.settled(settled, output, current.seq, current.provider);
-                naturallySettled = outcome.terminal;
-                if (!bridge.observeOnly && outcome.close && options.closeOnSettle && (!bridge.childrenSettled || await bridge.childrenSettled())) {
-                    const confirmed = await checkIdentity();
-                    if (confirmed.seq !== current.seq || confirmed.occupant.status !== current.occupant.status) throw new Error("BRIDGE_CLOSE_IDENTITY_CHANGED");
-                    await cli.exec(["pane", "close", paneId]);
-                    panes.forgetTarget(paneId);
+                    settled ??= await armSettledWaiters();
+                    if (detached || cancelled) return;
+                    const current = await checkIdentity(true);
+                    if (current.seq <= baseline || current.occupant.status !== settled) throw new Error("BRIDGE_STALE_SETTLEMENT");
+                    const output = await readPane(paneId);
+                    if (detached || cancelled) return;
+                    // Only canonical terminal settlement supersedes cancellation. Artifact
+                    // BLOCKED report text is separate from an actual blocked UI.
+                    const outcome = await bridge.settled(settled, output, current.seq, current.provider);
+                    if (outcome.rearm) { baseline = current.seq; rearmed = true; continue; }
+                    naturallySettled = outcome.terminal;
+                    if (!bridge.observeOnly && outcome.close && options.closeOnSettle && (!bridge.childrenSettled || await bridge.childrenSettled())) {
+                        const confirmed = await checkIdentity();
+                        if (confirmed.seq !== current.seq || confirmed.occupant.status !== current.occupant.status) throw new Error("BRIDGE_CLOSE_IDENTITY_CHANGED");
+                        await cli.exec(["pane", "close", paneId]);
+                        panes.forgetTarget(paneId);
+                    }
+                    // Observed turn completion and descendant quiescence govern cleanup.
+                    detach();
+                    return;
                 }
-                // Observed turn completion and descendant quiescence govern cleanup.
-                detach();
             } catch (error) { if (!detached) { detach(); bridge.recoveryRequired(error instanceof Error ? error.message : undefined); } }
         })();
         controller.record.paneId = paneId;
