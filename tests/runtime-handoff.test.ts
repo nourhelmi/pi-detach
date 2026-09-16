@@ -128,3 +128,16 @@ export function createPiDetachClient() { return { async request(session, action,
   assert.deepEqual(record.__progressAck, { runId: 'pib-child', deliveryId: 3 });
   handlers.session_shutdown();
 });
+
+test('bg_agent rejects an unconfigured role before any runtime call and names the configured roles', async t => {
+  const dir = await mkdtemp('/tmp/detach-role-guard-'); const modulePath = join(dir, 'client.mjs'); const profiles = join(dir, 'profiles.json');
+  await writeFile(profiles, JSON.stringify({ defaultAgent: 'pi', profiles: { advisor: { agent: 'pi' }, builder: { agent: 'pi' }, checker: { agent: 'pi' } } }));
+  await writeFile(modulePath, `export const PI_DETACH_CLIENT_VERSION = 1;
+export function createPiDetachClient() { return { async request(session, action) { throw Error('runtime reached: ' + action); } }; }`);
+  const previous = { bridge: process.env.PI_DETACH_RUNTIME_BRIDGE, descriptor: process.env.ADVISOR_RUNTIME_DESCRIPTOR, profiles: process.env.PI_DETACH_AGENT_PROFILES };
+  process.env.PI_DETACH_RUNTIME_BRIDGE = modulePath; process.env.ADVISOR_RUNTIME_DESCRIPTOR = join(dir, 'descriptor'); process.env.PI_DETACH_AGENT_PROFILES = profiles;
+  t.after(async () => { for (const [key, value] of Object.entries({ PI_DETACH_RUNTIME_BRIDGE: previous.bridge, ADVISOR_RUNTIME_DESCRIPTOR: previous.descriptor, PI_DETACH_AGENT_PROFILES: previous.profiles })) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } resetBridgeClients(); await rm(dir, { recursive: true, force: true }); });
+  const ctx = { cwd: dir, sessionManager: { getSessionId: () => 'owner', getEntries: () => [] }, isIdle: () => true, ui: { notify() {} } } as unknown as ExtensionContext;
+  await assert.rejects(bridgeAgent(ctx, 'reviewer-call', { role: 'reviewer', prompt: 'Read-only review.' }), /BRIDGE_UNKNOWN_ROLE: bg_agent role reviewer is not configured\. Configured roles: advisor, builder, checker\. This call was rejected; no worker launched/);
+  await assert.rejects(bridgeAgent(ctx, 'checker-call', { role: 'checker', prompt: 'Review.' }), /runtime reached: call/, 'a configured role reaches the runtime');
+});

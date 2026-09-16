@@ -3,7 +3,7 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { resolveAgentLaunch } from "../src/agent-profiles.ts";
+import { configuredRoles, configuredRolesSync, resolveAgentLaunch } from "../src/agent-profiles.ts";
 
 async function configFile(value: unknown): Promise<string> {
 	const directory = await mkdtemp(join(tmpdir(), "pi-detach-profiles-"));
@@ -490,4 +490,21 @@ test("Pi role profiles round-trip resultDiscovery into the resolved launch", asy
 		configPath: path,
 	});
 	assert.equal(launch.resultDiscovery, "advisor-worker");
+});
+
+test("an unknown role carries a bounded code and the configured role list", async () => {
+	const path = await configFile({ defaultAgent: "pi", profiles: { checker: { agent: "pi" }, advisor: { agent: "pi" }, builder: { agent: "pi" } } });
+	await assert.rejects(
+		resolveAgentLaunch({ role: "reviewer", prompt: "Review.", label: "reviewer", configPath: path }),
+		(error: Error & { code?: string; roles?: string[] }) => {
+			assert.match(error.message, /Unknown bg_agent role reviewer\. Available roles: advisor, builder, checker/);
+			assert.equal(error.code, "BRIDGE_UNKNOWN_ROLE");
+			assert.deepEqual(error.roles, ["advisor", "builder", "checker"]);
+			return true;
+		},
+	);
+	assert.deepEqual(await configuredRoles(path), ["advisor", "builder", "checker"]);
+	assert.deepEqual(configuredRolesSync(path), ["advisor", "builder", "checker"]);
+	assert.deepEqual(configuredRolesSync(join(path, "missing.json")), [], "an unreadable config yields no roles, not a failed tool registration");
+	assert.deepEqual(await configuredRoles(join(path, "..", "absent.json")), [], "an absent config has no configured roles");
 });

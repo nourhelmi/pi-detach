@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -161,6 +162,21 @@ function defaultConfigPath(): string {
 		process.env.PI_DETACH_AGENT_PROFILES ??
 		join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "bg-agent-profiles.json")
 	);
+}
+
+/** Sorted role names from the configured profiles; an absent config has none. */
+export async function configuredRoles(configPath = defaultConfigPath()): Promise<string[]> {
+	const config = await loadConfig(configPath);
+	return Object.keys(config.profiles).toSorted((left, right) => left.localeCompare(right));
+}
+
+/** Synchronous variant for tool-schema text at registration; unreadable config yields no roles rather than a failed registration. */
+export function configuredRolesSync(configPath = defaultConfigPath()): string[] {
+	try {
+		return Object.keys(parseConfig(readFileSync(configPath, "utf8"), configPath).profiles).toSorted((left, right) => left.localeCompare(right));
+	} catch {
+		return [];
+	}
 }
 
 function commandArgument(value: string, field: string): string {
@@ -358,7 +374,10 @@ function resolveProfileLaunch(
 	const role = options.role ?? "";
 	const profile = config.profiles[role];
 	if (!profile) {
-		throw new Error(`Unknown bg_agent role ${role}. Available roles: ${availableRoles(config)}`);
+		const error = new Error(`Unknown bg_agent role ${role}. Available roles: ${availableRoles(config)}`) as Error & { code: string; roles: string[] };
+		error.code = "BRIDGE_UNKNOWN_ROLE";
+		error.roles = Object.keys(config.profiles).toSorted((left, right) => left.localeCompare(right));
+		throw error;
 	}
 	const identity = selectIdentity(options, profile);
 	const harness = profile.harness ?? options.harness;

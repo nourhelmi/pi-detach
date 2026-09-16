@@ -5,6 +5,8 @@ import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { BgAgentParams } from "./tools/bg-agent.ts";
 
+import { configuredRoles } from "./agent-profiles.ts";
+
 type Client = { request(sessionId: string, action: string, payload: Record<string, unknown>): Promise<unknown> };
 interface NodeView {
  status: string; runtimeState: string; requestDetail?: { id: string; kind: string; text: string };
@@ -94,6 +96,7 @@ export function assertBackend(ctx: ExtensionContext): void {
  const entries = ctx.sessionManager.getEntries?.() ?? [];
  if (entries.some(entry => entry.type === "message" && entry.message.role === "toolResult" && entry.message.toolName === "bg_agent" && String((entry.message.details as { runId?: string } | undefined)?.runId ?? "").startsWith("pib-"))) throw new Error("PI_DETACH_BACKEND_CHANGE_REQUIRES_NEW_ROOT");
 }
+const unknownRoleCorrection = (role: string | undefined, roles: string[]) => `bg_agent role ${role ?? ""} is not configured. Configured roles: ${roles.join(", ") || "none"}.`;
 const LAUNCH_CORRECTIONS: Record<string, string> = {
  BRIDGE_CUSTOM_ARTIFACT_UNSUPPORTED: "Omit resultPath: the runtime owns and returns the result artifact path.",
  BRIDGE_EXPLICIT_COMMAND_UNSUPPORTED: "Omit agent: select the worker using role, harness, and model instead.",
@@ -104,8 +107,15 @@ const LAUNCH_CORRECTIONS: Record<string, string> = {
 };
 export async function bridgeAgent(ctx: ExtensionContext, toolCallId: string, params: BgAgentParams, signal?: AbortSignal): Promise<AgentToolResult<BridgeAgentDetails>> {
  let accepted: { runId: string; status: string };
+ if (params.role && !params.name) {
+  // Reject an invented role here, with the real list, instead of letting the runtime
+  // collapse it into an opaque preparation rejection the model cannot correct.
+  const roles = await configuredRoles().catch(() => undefined);
+  if (roles && !roles.includes(params.role)) throw new Error(`BRIDGE_UNKNOWN_ROLE: ${unknownRoleCorrection(params.role, roles)} This call was rejected; no worker launched. Submit corrected arguments as a new tool call.`);
+ }
  try { accepted = await request(ctx, "call", { tool: "bg_agent", toolCallId, params, cwd: ctx.cwd }) as typeof accepted; }
  catch (error) {
+  if (error instanceof Error && error.message === "BRIDGE_UNKNOWN_ROLE") throw new Error(`BRIDGE_UNKNOWN_ROLE: ${unknownRoleCorrection(params.role, await configuredRoles().catch(() => []))} This call was rejected; no worker launched. Submit corrected arguments as a new tool call.`);
   const correction = error instanceof Error && Object.hasOwn(LAUNCH_CORRECTIONS, error.message) ? LAUNCH_CORRECTIONS[error.message] : undefined;
   if (correction) throw new Error(`${(error as Error).message}: ${correction} This call was rejected; no worker launched. Submit corrected arguments as a new tool call.`);
   throw error;

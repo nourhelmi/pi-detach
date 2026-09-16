@@ -46,7 +46,10 @@ export function createAgentExecutionPort(deps: HerdrDriverDeps): AgentExecutionP
    const requiredSkills = params.requiredSkills ?? [];
    if (requiredSkills.some(skill => !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(skill))) throw new Error("BRIDGE_INVALID_SKILL");
    const label = agentLabel(params);
-   const launch = await prepareLaunch({ ...params, resultPath: `${sourceDirectory}/result.md` }, label, scope?.workerHarness, "optional");
+   // An invented role is a bounded validation code the runtime may expose, not opaque preparation text.
+   const launch = await prepareLaunch({ ...params, resultPath: `${sourceDirectory}/result.md` }, label, scope?.workerHarness, "optional").catch((error: unknown) => {
+    throw (error as { code?: string } | null)?.code === "BRIDGE_UNKNOWN_ROLE" ? new Error("BRIDGE_UNKNOWN_ROLE") : error;
+   });
    return {
     v: 1, command: launch.command,
     prompt: launch.prompt + (!launch.role ? `${requiredSkills.length ? "\nREQUIRED SKILLS:\nLoad and follow: " + requiredSkills.join(", ") : ""}${params.maxTurns ? "\nTURN CAP: " + params.maxTurns : ""}` : "") + `\n\nRESULT ARTIFACT:\nOptionally write a handoff report to ${sourceDirectory}/result.md. Include Status, Claims, Evidence, Files, Decisions, Remaining Risk.`,

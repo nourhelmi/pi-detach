@@ -16,6 +16,7 @@ import type {
 import { Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 import {
+	configuredRolesSync,
 	resolveAgentLaunch,
 	type ResolvedAgentLaunch,
 	type ThinkingLevel,
@@ -62,7 +63,7 @@ export const BgAgentParameters = Type.Object({
 	role: Type.Optional(
 		Type.String({
 			description:
-				"Configured semantic role contract (role skill, anchor, and instructional turn cap). The selected harness determines runtime. Cannot be combined with agent.",
+				`Configured semantic role contract (role skill, anchor, and instructional turn cap). Configured roles: ${configuredRolesSync().join(", ") || "none configured"}. An unknown role is rejected before launch. The selected harness determines runtime. Cannot be combined with agent.`,
 		}),
 	),
 	harness: Type.Optional(
@@ -470,7 +471,7 @@ export function registerBgAgentTool(pi: ExtensionAPI, registry: Registry): void 
 			"follow-up. Requires Pi to run inside Herdr.",
 		promptSnippet: "bg_agent — run a visible role agent in Herdr; wakes you when it settles.",
 		promptGuidelines: [
-			"Use a configured `role` when delegated work needs a role skill, anchor policy, or turn cap.",
+			"Use a configured `role` when delegated work needs a role skill, anchor policy, or turn cap; the role parameter description lists the configured roles, and an unknown role is rejected before launch.",
 			"Omit `model` and `thinking` to use Pi's default runtime identity; when supplied, they pass through to Pi.",
 			"State what done looks like with `anchor` (one line) or a few `acceptance` lines; roles that require one accept either.",
 			"Prompts must be self-contained — the helper agent shares no context with this session.",

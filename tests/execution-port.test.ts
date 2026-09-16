@@ -38,6 +38,7 @@ test('recursive delegation uses trusted per-launch child scope, never ambient pa
     await assert.rejects(port.prepare({ role: 'specialist', prompt: 'forbidden', harness: 'pi' }, '/worker/source', scope), /harness pi conflicts with the parent session harness native/);
     assert.equal((await port.prepare({ role: 'advisor', prompt: 'no trusted reservation' }, '/worker/source')).environment.ADVISOR_BRIDGE_CHILD_STATE, '');
     await assert.rejects(port.prepare({ role: 'advisor', prompt: 'untrusted extra field', childState: '/foreign' }, '/worker/source', scope), /BRIDGE_INVALID_INPUT/);
+    await assert.rejects(port.prepare({ role: 'reviewer', prompt: 'invented role' }, '/worker/source', scope), error => { assert.equal((error as Error).message, 'BRIDGE_UNKNOWN_ROLE', 'an unknown role is a bounded code, never opaque preparation text'); return true; });
   } finally {
     for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
     Object.assign(process.env, saved); rmSync(directory, { recursive: true, force: true });
