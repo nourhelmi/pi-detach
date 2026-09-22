@@ -1401,7 +1401,11 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
         const inspect = async () => {
             bridge.assertActive();
             const got = await cli.exec(["agent", "get", paneId]);
-            if (!got.ok && got.errorCode === "not_found") throw new Error("BRIDGE_SESSION_UNAVAILABLE");
+            if (!got.ok && ["not_found", "pane_not_found"].includes(got.errorCode ?? "")) throw new Error("BRIDGE_SESSION_UNAVAILABLE");
+            if (!got.ok && got.errorCode === "agent_not_found") {
+                const pane = await cli.exec(["pane", "get", paneId]);
+                if (!pane.ok && ["not_found", "pane_not_found"].includes(pane.errorCode ?? "")) throw new Error("BRIDGE_SESSION_UNAVAILABLE");
+            }
             const occupant = got.ok ? occupantFrom(got.json) : undefined;
             const provider = runtimeAgentSession(got.json);
             let session = provider;

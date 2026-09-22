@@ -15,6 +15,7 @@ function fixture(environment: Record<string, string> = {}) {
     let bound: { id: string; session: string } | undefined;
     let onGet = () => {};
     let promptFails = false;
+    let missingAgent: string | undefined, missingPane: string | undefined;
     const provider = (value = "thread-1") => { agent.agent_session = { source: "herdr:codex", agent: "codex", kind: "id", value }; };
     const cli: HerdrCli = {
         async exec(args) {
@@ -22,7 +23,12 @@ function fixture(environment: Record<string, string> = {}) {
             if (args[0] === "pane" && args[1] === "split") return ok({ pane_id: agent.pane_id });
             if (args[1] === "process-info") return ok({ result: { process_info: started ? process : { foreground_processes: [{ name: "zsh", argv0: "zsh" }] } } });
             if (args[1] === "start") { started = true; agent.name = args[2]; return ok({ result: { agent } }); }
-            if (args[1] === "get") { onGet(); return ok({ result: { agent } }); }
+            if (args[1] === "get" && args[0] === "pane") return missingPane
+                ? { ...ok(), ok: false, code: 1, errorCode: missingPane }
+                : ok({ result: { pane: { pane_id: agent.pane_id } } });
+            if (args[1] === "get") { onGet(); return missingAgent
+                ? { ...ok(), ok: false, code: 1, errorCode: missingAgent }
+                : ok({ result: { agent } }); }
             if (args[1] === "prompt") {
                 assert.ok(bound, "persist qualified transport handle BEFORE prompt");
                 assert.ok(bound.session.includes("herdr-codex-process"));
@@ -58,6 +64,7 @@ function fixture(environment: Record<string, string> = {}) {
     return {
         agent, process, calls, provider, launch, newDriver: () => createHerdrDriver(deps),
         onGet(fn: () => void) { onGet = fn; }, failPrompt() { promptFails = true; },
+        disappear(agentCode: string, paneCode?: string) { missingAgent = agentCode; missingPane = paneCode; },
         counts: () => ({ prompts, recovered, settled }),
         async finish() {
             agent.state_change_seq++; agent.agent_status = "done";
@@ -78,6 +85,25 @@ test("Codex binds without a thread, pins its arriving session, and reuses the sa
     assert.deepEqual(f.counts(), { prompts: 3, recovered: 0, settled: 3 });
     assert.equal(f.calls.filter(c => c[1] === "start").length, 1);
     first.detach?.();
+});
+
+for (const [agentCode, paneCode, unavailable] of [
+    ["not_found", undefined, true],
+    ["pane_not_found", undefined, true],
+    ["agent_not_found", "pane_not_found", true],
+    ["agent_not_found", "not_found", true],
+    ["agent_not_found", undefined, false],
+    ["agent_not_found", "server_unavailable", false],
+] as const) test(`closed-pane reconciliation: ${agentCode}/${paneCode ?? 'present'} stays ${unavailable ? 'unavailable' : 'uncertain'}`, async () => {
+    const f = fixture(); const handle = await f.launch(); f.provider(); await f.finish();
+    f.disappear(agentCode, paneCode);
+    const expected = unavailable ? /BRIDGE_SESSION_UNAVAILABLE/ : /BRIDGE_IDENTITY_UNAVAILABLE/;
+    await assert.rejects(handle.runtimeObservation!(), expected);
+    await assert.rejects(f.launch(true, f.newDriver(), true), expected);
+    assert.equal(f.counts().prompts, 1, "observation must never replay input");
+    assert.equal(f.calls.filter(call => call[1] === "start").length, 1, "observation must never replace a worker");
+    assert.equal(f.calls.some(call => ["send-keys", "close"].includes(call[1] ?? "")), false);
+    handle.detach?.();
 });
 
 test("Codex managed launch appends agent_message MCP flags after configured command arguments", async () => {
