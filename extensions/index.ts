@@ -29,6 +29,7 @@ import { createSafeReap, isProcessAlive, reapOrphanAgentPanes } from "../src/her
 import { createViewerManager } from "../src/herdr/viewer.ts";
 import { createNotifier } from "../src/notify.ts";
 import { createRegistry } from "../src/registry.ts";
+import { registerAgentMessageTool } from "../src/tools/agent-message.ts";
 import { registerBgAgentTool } from "../src/tools/bg-agent.ts";
 import { registerBgAwaitTool } from "../src/tools/bg-await.ts";
 import { registerBgListTool } from "../src/tools/bg-list.ts";
@@ -111,8 +112,9 @@ export default function registerDetachExtension(pi: ExtensionAPI): void {
 	registerBgOutputTool(pi, registry);
 	registerBgListTool(pi, registry);
 	registerBgStopTool(pi, registry);
-    registerBridgeDelivery(pi);
-    registerManagedTeamTools(pi);
+	registerBridgeDelivery(pi);
+	registerManagedTeamTools(pi);
+	registerAgentMessageTool(pi);
 
 	const track = (_event: unknown, ctx: ExtensionContext): void => {
 		currentCtx = ctx;

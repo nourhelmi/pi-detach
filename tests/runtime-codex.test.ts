@@ -6,7 +6,7 @@ import type { CliResult, HerdrCli, Waiter } from "../src/herdr/cli.ts";
 import type { RunController, RuntimeExecutionHooks } from "../src/types.ts";
 
 const ok = (json: unknown = {}): CliResult => ({ ok: true, code: 0, stdout: "", stderr: "", json });
-function fixture() {
+function fixture(environment: Record<string, string> = {}) {
     const calls: string[][] = [];
     const waiters: Array<Waiter & { resolve: (result: CliResult) => void; args: string[] }> = [];
     const agent: any = { pane_id: "w1:p2", name: "", agent: "codex", terminal_id: "terminal-1", state_change_seq: 1, agent_status: "idle" };
@@ -43,7 +43,7 @@ function fixture() {
     const driver = createHerdrDriver(deps);
     const launch = (followup = false, useDriver = driver, observeOnly = false) => {
         const hooks: RuntimeExecutionHooks = {
-            environment: {}, assertActive() {},
+            environment, assertActive() {},
             ...(observeOnly ? { observeOnly: true, completed: true, expectedProviderSession: JSON.stringify(["herdr:codex", "codex", "id", "thread-1"]) } : {}),
             ...(followup ? { expectedHandle: bound!, expectedGeneration: agent.state_change_seq } : {}),
             recordHandle(handle) { if (bound) assert.deepEqual(handle, bound); bound = handle; },
@@ -78,6 +78,24 @@ test("Codex binds without a thread, pins its arriving session, and reuses the sa
     assert.deepEqual(f.counts(), { prompts: 3, recovered: 0, settled: 3 });
     assert.equal(f.calls.filter(c => c[1] === "start").length, 1);
     first.detach?.();
+});
+
+test("Codex managed launch appends agent_message MCP flags after configured command arguments", async () => {
+    const f = fixture({
+        AGENT_MESSAGE_NODE: "/usr/bin/node",
+        AGENT_MESSAGE_CLI: "/opt/runtime/messaging-cli.mjs",
+        AGENT_MESSAGE_DESCRIPTOR: "/tmp/messenger.json",
+    });
+    const handle = await f.launch();
+    const started = f.calls.find(call => call[0] === "agent" && call[1] === "start");
+    assert.ok(started);
+    const separator = started.indexOf("--");
+    assert.deepEqual(started.slice(separator + 1), [
+        "-c", 'mcp_servers.agent_message.command="/usr/bin/node"',
+        "-c", 'mcp_servers.agent_message.args=["/opt/runtime/messaging-cli.mjs","mcp"]',
+        "-c", 'mcp_servers.agent_message.env={AGENT_MESSAGE_DESCRIPTOR="/tmp/messenger.json"}',
+    ]);
+    handle.detach?.();
 });
 
 for (const [name, mutate] of Object.entries({

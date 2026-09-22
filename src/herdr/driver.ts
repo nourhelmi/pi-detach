@@ -16,7 +16,7 @@
 
 import { type CliResult, findString, type HerdrCli, type Waiter } from "./cli.ts";
 import { open, readFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, isAbsolute, join } from "node:path";
 
 import { type HerdrContext, toastsEnabled } from "./context.ts";
 import { DEFAULT_LEDGER_DIR, type AgentPaneLedger, ledgerFilePath, readLedgerFile } from "./ledger.ts";
@@ -81,6 +81,28 @@ function tokenize(input: string): string[] {
 		tokens.push(match[1] ?? match[2] ?? match[3] ?? "");
 	}
 	return tokens;
+}
+
+const tomlString = (value: string) => JSON.stringify(value);
+
+/** Append process-local native MCP configuration after command tokenization. */
+export function appendAgentMessageMcpArgs(argv: string[], environment: Record<string, string>): string[] {
+	const runtime = basename(argv[0] ?? "");
+	if (!environment.AGENT_MESSAGE_DESCRIPTOR || !["codex", "claude"].includes(runtime)) return argv;
+	const node = environment.AGENT_MESSAGE_NODE;
+	const cli = environment.AGENT_MESSAGE_CLI;
+	const descriptor = environment.AGENT_MESSAGE_DESCRIPTOR;
+	if (!node || !cli || !descriptor || !isAbsolute(node) || !isAbsolute(cli) || !isAbsolute(descriptor)) throw new Error("AGENT_MESSAGE_MCP_CONFIGURATION");
+	if (runtime === "codex") {
+		return [...argv,
+			"-c", `mcp_servers.agent_message.command=${tomlString(node)}`,
+			"-c", `mcp_servers.agent_message.args=[${tomlString(cli)},"mcp"]`,
+			"-c", `mcp_servers.agent_message.env={AGENT_MESSAGE_DESCRIPTOR=${tomlString(descriptor)}}`,
+		];
+	}
+	return [...argv, "--mcp-config", JSON.stringify({
+		mcpServers: { agent_message: { command: node, args: [cli, "mcp"], env: { AGENT_MESSAGE_DESCRIPTOR: descriptor } } },
+	})];
 }
 
 function agentName(label: string, id: string): string {
@@ -1369,8 +1391,9 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
         bridge.assertActive();
         const prior = bridge.expectedHandle ? JSON.parse(bridge.expectedHandle.id) as [string, string, string, number] : undefined;
         const name = prior?.[1] ?? agentName(controller.record.label, controller.record.id.slice(-12));
-        const codex = basename(tokenize(options.command)[0] ?? "") === "codex";
-        const paneId = prior?.[0] ?? await startAgentPane(name, controller.record.label, options.cwd, tokenize(options.command), bridge);
+        const commandArgv = tokenize(options.command);
+        const codex = basename(commandArgv[0] ?? "") === "codex";
+        const paneId = prior?.[0] ?? await startAgentPane(name, controller.record.label, options.cwd, appendAgentMessageMcpArgs(commandArgv, bridge.environment), bridge);
         let detached = false;
         let cancelled = false;
         let naturallySettled = false;

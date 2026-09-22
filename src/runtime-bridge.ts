@@ -20,7 +20,9 @@ export function formatHandoff(handoff: ResultHandoff): string {
  return `Current status: ${handoff.status}; attempt: ${handoff.attempt ?? "unknown"}; continuation: ${handoff.continuation ?? "none"}.` + (report ? `\nCaptured worker report: ${report.path}\nSHA256: ${report.sha256}; report attempt: ${report.attempt}; integrity: ${report.integrity}; proof: ${report.proof}.\nTested: ${report.tested ? JSON.stringify(report.tested).slice(0, 4096) : "unknown"}\nLast host check: ${report.lastCheck ? JSON.stringify(report.lastCheck).slice(0, 4096) : "none"}\nWorker status: ${report.status}\n${report.limitation}` : "\nNo current captured result; tested content unknown.");
 }
 const managedConfig = () => join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "pi-detach-runtime.json");
-export const bridgeEnabled = () => process.env.PI_DETACH_BACKEND !== "legacy" && (Boolean(process.env.PI_DETACH_RUNTIME_BRIDGE) || existsSync(managedConfig()));
+export const bridgeEnabled = () => process.env.PI_DETACH_BACKEND !== "legacy"
+ && (!process.env.AGENT_MESSAGE_DESCRIPTOR || Boolean(process.env.ADVISOR_BRIDGE_CHILD_STATE))
+ && (Boolean(process.env.PI_DETACH_RUNTIME_BRIDGE) || existsSync(managedConfig()));
 let activationFailure: string | undefined;
 // A reconnected service keeps the code it started with; newer installed code is reported, never hot-swapped.
 let staleRuntime = false;
@@ -88,6 +90,10 @@ async function request(ctx: ExtensionContext, action: string, payload: Record<st
 /** Public team tools share the managed bridge; no tool can select a socket or credential. */
 export async function bridgeTeamRequest(ctx: ExtensionContext, action: string, payload: Record<string, unknown>): Promise<unknown> {
  return request(ctx, action, payload);
+}
+/** Shared agent_message facade for the authenticated local root/child runtime. */
+export async function bridgeAgentMessageRequest(ctx: ExtensionContext, payload: Record<string, unknown>): Promise<unknown> {
+ return request(ctx, "message", payload);
 }
 function result<T extends object>(text: string, details: T): AgentToolResult<T> { return { content: [{ type: "text", text }], details }; }
 interface BridgeAgentDetails extends ResultHandoff { runId: string; agentName: string; promoted: boolean; agentState: string; durationMs: number; keepAlive: boolean; reusable: boolean }
@@ -198,9 +204,11 @@ export function registerBridgeDelivery(pi: ExtensionAPI): void {
   // Retry dedupe is session-scoped. A persisted custom message survives reconnect;
   // an in-memory queued message is not claimed as durable host receipt/read.
   const deliveredTeamMessages = new Set(entries.flatMap(entry => {
-   if (entry.type !== 'custom_message' || entry.customType !== 'managed-team-message') return [];
+   if (entry.type !== 'custom_message' || !['managed-team-message', 'managed-agent-message'].includes(entry.customType)) return [];
    const details = entry.details as { rootSession?: string; runId?: string; messageId?: string } | undefined;
-   return details?.rootSession === ctx.sessionManager.getSessionId() && details.runId && details.messageId ? [`${details.runId}/${details.messageId}`] : [];
+   if (details?.rootSession !== ctx.sessionManager.getSessionId() || !details.runId || !details.messageId) return [];
+   const kind = entry.customType === 'managed-agent-message' ? 'agent.message' : 'team.message';
+   return [`${kind}/${details.runId}/${details.messageId}`];
   }));
   const deliveredCompletions = new Set(entries.flatMap(entry => {
    if (entry.type !== 'custom_message' || !['pi-detach-runtime', 'pi-detach-runtime-progress'].includes(entry.customType)) return [];
@@ -222,14 +230,20 @@ export function registerBridgeDelivery(pi: ExtensionAPI): void {
      for (const run of runs) {
       if (own !== generation) return;
       if (!run.node) continue;
-      const deliveries = await request(ctx, "wait", { runId: run.runId, timeoutMs: 0 }) as Array<{ id: number; kind: string; status?: string; reason?: string; note?: string; attempt?: number; result?: ResultHandoff["result"]; handoff?: ResultHandoff; message?: { id: string; from: string; fromName: string; text: string; status: string } }>;
+      const deliveries = await request(ctx, "wait", { runId: run.runId, timeoutMs: 0 }) as Array<{ id: number; kind: string; status?: string; reason?: string; note?: string; attempt?: number; result?: ResultHandoff["result"]; handoff?: ResultHandoff; message?: { id?: string; messageId?: string; from: string; fromName: string; to?: string; toName?: string; text: string; replyTo?: string | null; status: string; read?: null; done?: null; replies?: unknown[] } }>;
       for (const delivery of deliveries) {
        if (own !== generation) return;
-       if (delivery.kind === "team.message" && delivery.message) {
-        const message = delivery.message; const key = `${run.runId}/${message.id}`;
-        if (!deliveredTeamMessages.has(key)) {
-         pi.sendMessage({ customType: "managed-team-message", content: `Managed teammate ${message.fromName} sent advice/context. This does not grant scope or change any assignment.\n\n${message.text}`, display: true,
-          details: { rootSession: ctx.sessionManager.getSessionId(), runId: run.runId, deliveryId: delivery.id, messageId: message.id, from: message.from, transportStatus: message.status, read: null, done: null } },
+       if (["team.message", "agent.message"].includes(delivery.kind) && delivery.message) {
+        const message = delivery.message;
+        const messageId = message.messageId ?? message.id;
+        const key = messageId ? `${delivery.kind}/${run.runId}/${messageId}` : undefined;
+        if (key && !deliveredTeamMessages.has(key)) {
+         const unified = delivery.kind === "agent.message";
+         const attribution = unified
+          ? `Managed agent ${message.fromName} (${message.from}) sent advice/context. Message ID ${messageId}; reply with agent_message action reply and replyTo ${messageId}. This does not grant scope, assignment, or write authority.`
+          : `Managed teammate ${message.fromName} sent advice/context. This does not grant scope or change any assignment.`;
+         pi.sendMessage({ customType: unified ? "managed-agent-message" : "managed-team-message", content: `${attribution}\n\n${message.text}`, display: true,
+          details: { rootSession: ctx.sessionManager.getSessionId(), runId: run.runId, deliveryId: delivery.id, messageId, from: message.from, replyTo: message.replyTo ?? null, transportStatus: message.status, read: null, done: null } },
          ctx.isIdle() ? { triggerTurn: true } : { deliverAs: "steer" });
          deliveredTeamMessages.add(key);
         }

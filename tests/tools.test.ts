@@ -49,14 +49,18 @@ function host(options: { idle?: boolean; cwd?: string } = {}) {
 			sent.push({ content: message.content, options: opts }),
 	} as unknown as ExtensionAPI;
 
-	// Unit tests must never inherit a developer's live Herdr session and create real panes.
+	// Unit tests must never inherit a developer's live Herdr session or managed runtime.
 	const previousNoHerdr = process.env.PI_DETACH_NO_HERDR;
+	const previousBackend = process.env.PI_DETACH_BACKEND;
 	process.env.PI_DETACH_NO_HERDR = "1";
+	process.env.PI_DETACH_BACKEND = "legacy";
 	try {
 		registerDetachExtension(pi);
 	} finally {
 		if (previousNoHerdr === undefined) delete process.env.PI_DETACH_NO_HERDR;
 		else process.env.PI_DETACH_NO_HERDR = previousNoHerdr;
+		if (previousBackend === undefined) delete process.env.PI_DETACH_BACKEND;
+		else process.env.PI_DETACH_BACKEND = previousBackend;
 	}
 
 	const ctx = {
