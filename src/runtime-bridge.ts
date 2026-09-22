@@ -164,13 +164,22 @@ export async function bridgeOutput(ctx: ExtensionContext, runId: string, options
 export function registerBridgeDelivery(pi: ExtensionAPI): void {
  let generation = 0;
  let currentContext: ExtensionContext | undefined;
+ let earlyContext: ExtensionContext | undefined;
+ // Pi creates fresh hook/command wrappers; the SDK session manager and cwd are the scope.
+ const sameScope = (a: ExtensionContext, b: ExtensionContext) => a.sessionManager === b.sessionManager && realpathSync(a.cwd) === realpathSync(b.cwd);
  pi.events?.on("pi-detach:request", (value: unknown) => {
   const requestValue = value as { sessionId: string; action: string; payload: Record<string, unknown>; context?: ExtensionContext; response?: Promise<unknown> };
-  // Root restoration may bind before this extension's session_start handler.
-  // This private event carries the host context, never public tool parameters.
-  if (requestValue.action === "advisor.bind" && bridgeEnabled()) {
+  // Root restoration and router UI may precede this extension's session_start.
+  // Only these private events accept a host context, never public tool parameters.
+  if (["advisor.bind", "router.status", "router.set"].includes(requestValue.action) && bridgeEnabled()) {
    const ctx = requestValue.context;
-   if (ctx && requestValue.sessionId === ctx.sessionManager.getSessionId()) requestValue.response = request(ctx, requestValue.action, requestValue.payload);
+   try {
+    if (!ctx || requestValue.sessionId !== ctx.sessionManager.getSessionId()) return;
+    const authority = currentContext ?? earlyContext;
+    if (authority && (!sameScope(ctx, authority) || !currentContext && ctx !== earlyContext)) return;
+    if (!authority) earlyContext = ctx;
+    requestValue.response = request(authority ?? ctx, requestValue.action, requestValue.payload);
+   } catch { /* stale SDK getters or an invalid cwd cannot authorize a request */ }
    return;
   }
   if (!currentContext || requestValue.sessionId !== currentContext.sessionManager.getSessionId() || !["graph.evidence", "team.status"].includes(requestValue.action)) return;
@@ -194,10 +203,19 @@ export function registerBridgeDelivery(pi: ExtensionAPI): void {
   try { await request(ctx, "shutdown", {}); generation += 1; ctx.ui.notify("Runtime closed safely. Use a new Pi session for subsequent work.", "info"); }
   catch (error) { const code = error instanceof Error ? error.message : "unknown failure"; ctx.ui.notify(`Runtime close refused: ${code}${CLOSE_REFUSALS[code] ? ` (${CLOSE_REFUSALS[code]})` : ""}`, "error"); }
  } });
- pi.on("session_shutdown", () => { currentContext = undefined; generation += 1; resetBridgeClients(); });
+ pi.on("session_shutdown", (_event, ctx) => {
+  const authority = currentContext ?? earlyContext;
+  if (ctx && authority && !sameScope(ctx, authority)) return;
+  currentContext = earlyContext = undefined; generation += 1; resetBridgeClients();
+ });
  pi.on("session_start", async (_event, ctx) => {
   if (!bridgeEnabled()) return;
-  currentContext = ctx;
+  if (earlyContext && ctx !== earlyContext) {
+   activationFailure = "PI_DETACH_CONTEXT_MISMATCH";
+   ctx.ui.notify("pi-detach early context does not match session_start; requests remain fenced.", "error");
+   return;
+  }
+  currentContext = ctx; earlyContext = undefined;
   const own = ++generation;
   // A newly installed backend may not adopt agents launched by the old registry.
   const entries = ctx.sessionManager.getEntries?.() ?? [];
