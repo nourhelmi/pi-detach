@@ -40,6 +40,13 @@ const STOP_SETTLE_MS = 1_500;
 const COMMAND_WAITER_RETRY_BASE_MS = 250;
 const COMMAND_WAITER_RETRY_MAX_MS = 15_000;
 const AGENT_START_TIMEOUT_MS = 45_000;
+// herdr 0.9 answers `agent start` while the pane still reports `launch_pending`;
+// the occupant publishes its agent kind and session a moment later. Under load
+// (many Pi sessions booting at once) that gap is seconds, so a fresh runtime
+// launch polls for the identity instead of failing on the first read.
+const AGENT_IDENTITY_READY_TIMEOUT_MS = 45_000;
+const AGENT_IDENTITY_POLL_MS = 250;
+const IDENTITY_PENDING = "BRIDGE_IDENTITY_PENDING";
 const AGENT_WORKING_TIMEOUT_MS = 20_000;
 const AGENT_PROMPT_WAIT_TIMEOUT_MS = 20_000;
 const AGENT_PROMPT_PROCESS_TIMEOUT_MS = AGENT_PROMPT_WAIT_TIMEOUT_MS + 5_000;
@@ -373,6 +380,12 @@ function runtimeAgentSession(value: unknown): string | undefined {
     }
     for (const child of Object.values(record)) { const found = runtimeAgentSession(child); if (found) return found; }
     return undefined;
+}
+
+/** True while herdr still reports the pane's occupant as launching: no detected agent kind yet. */
+function isLaunchPending(json: unknown): boolean {
+    const agent = (json as { result?: { agent?: Record<string, unknown> } } | undefined)?.result?.agent;
+    return agent?.launch_pending === true || typeof agent?.agent !== "string" || agent.agent.length === 0;
 }
 
 function agentSessionIdFromPath(path: string): string | undefined {
@@ -1398,7 +1411,9 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
         let cancelled = false;
         let naturallySettled = false;
         const waiters: Waiter[] = [];
-        const inspect = async () => {
+        // `acquiring` marks the first read of a freshly started pane. Only that read
+        // may report IDENTITY_PENDING; every later identity check stays strict.
+        const inspect = async (acquiring = false) => {
             bridge.assertActive();
             const got = await cli.exec(["agent", "get", paneId]);
             if (!got.ok && ["not_found", "pane_not_found"].includes(got.errorCode ?? "")) throw new Error("BRIDGE_SESSION_UNAVAILABLE");
@@ -1408,6 +1423,10 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
             }
             const occupant = got.ok ? occupantFrom(got.json) : undefined;
             const provider = runtimeAgentSession(got.json);
+            // Our own occupant (same pane + name) that has not yet published its kind,
+            // or a Pi occupant without its session yet, is still starting — not drift.
+            if (acquiring && got.ok && occupant?.paneId === paneId && occupant.agentName === name &&
+                (isLaunchPending(got.json) || (!codex && !provider))) throw new Error(IDENTITY_PENDING);
             let session = provider;
             if (codex) {
                 // Codex's thread hook arrives only after submission. Bind the
@@ -1430,7 +1449,20 @@ export function createHerdrDriver(deps: HerdrDriverDeps): DriverStart {
             if (!occupant || occupant.paneId !== paneId || occupant.agentName !== name || !session || !Number.isSafeInteger(occupant.stateChangeSeq) || occupant.stateChangeSeq! < 0) throw new Error("BRIDGE_IDENTITY_UNAVAILABLE");
             return { occupant, session, provider, seq: occupant.stateChangeSeq! };
         };
-        const acquired = await inspect();
+        // A reattachment (`prior`) must already be ready; only a fresh pane may wait.
+        // Past the deadline the launch fails exactly as before: identity unavailable.
+        const acquire = async () => {
+            const deadline = Date.now() + AGENT_IDENTITY_READY_TIMEOUT_MS;
+            for (;;) {
+                try { return await inspect(!prior); }
+                catch (error) {
+                    if (!(error instanceof Error) || error.message !== IDENTITY_PENDING) throw error;
+                    if (Date.now() >= deadline) throw new Error("BRIDGE_IDENTITY_UNAVAILABLE");
+                }
+                await new Promise(resolvePromise => setTimeout(resolvePromise, AGENT_IDENTITY_POLL_MS));
+            }
+        };
+        const acquired = await acquire();
         if (bridge.expectedProviderSession && acquired.provider !== bridge.expectedProviderSession) throw new Error("BRIDGE_HANDLE_MISMATCH");
         if (prior && (acquired.session !== prior[2] || acquired.seq < prior[3] || (!bridge.observeOnly && acquired.seq !== bridge.expectedGeneration))) throw new Error("BRIDGE_HANDLE_MISMATCH");
         // An actual UI prompt is not a typed runtime question. Do not type into it.
